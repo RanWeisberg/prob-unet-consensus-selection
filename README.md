@@ -37,7 +37,14 @@ python -m probunet.data.splits            # -> data/splits/split.json
 series. The split is grouped by `series_uid` so no series spans two splits, and
 stratified over the number of non-empty grader masks per patch so the splits are
 comparable in ambiguity. It is generated **once**, seeded, and committed to the
-repository; `load_split()` never regenerates.
+repository; `load_split()` never regenerates. Known limitations of the split —
+uneven series density and lesion size across splits — are recorded in
+`data/splits/SPLIT_NOTES.md`.
+
+Training pairs each image with **one randomly chosen** grader mask, redrawn every
+epoch and reproducible from the run seed; evaluation keeps all four masks. Empty
+masks are never filtered: they are a grader's judgment that no lesion is present.
+No normalization is applied — the images are already in [0, 1].
 
 ## Layout
 
