@@ -1,1 +1,13 @@
 data_lidc.pickle
+CLAUDE.md
+
+# scratch: isolated one-off scripts, never imported by the package
+scratch/
+
+# datasets (raw pickle + converted npz) are never committed
+data/
+
+__pycache__/
+*.py[cod]
+.DS_Store
+.idea/
