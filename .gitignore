@@ -4,10 +4,22 @@ CLAUDE.md
 # scratch: isolated one-off scripts, never imported by the package
 scratch/
 
-# datasets (raw pickle + converted npz) are never committed
-data/
+# datasets (raw pickle + converted npz) are never committed...
+data/raw/
+data/processed/*
+!data/processed/lidc.json
+
+# ...but data/splits/split.json MUST be tracked: every baseline comparison in the
+# report depends on the split being identical across machines and Colab runs.
+# data/processed/lidc.json is tracked too, as provenance for the converted .npz.
 
 __pycache__/
 *.py[cod]
 .DS_Store
 .idea/
+
+# packaging / test artifacts
+*.egg-info/
+build/
+dist/
+.pytest_cache/

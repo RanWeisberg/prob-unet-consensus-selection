@@ -1,0 +1,195 @@
+{
+  "description": "Preprocessed LIDC-IDRI 128x128 crops with four independent expert annotation masks per image, converted once from a pickle. All arrays are row-aligned: row i of every array refers to the same patch.",
+  "source": {
+    "path": "data/raw/data_lidc.pickle",
+    "sha256": "327025e97c296a9e02841bb7e9968521147039e9c5474ba3b214c1f8056c177e",
+    "size_bytes": 3413798199,
+    "pickle_protocol": [
+      3
+    ],
+    "classes_substituted_not_imported": [
+      "pydicom.multival.MultiValue",
+      "pydicom.uid.UID",
+      "pydicom.valuerep.DSfloat"
+    ]
+  },
+  "row_order": "Original pickle dict keys sorted lexicographically; see the 'keys' array.",
+  "arrays": {
+    "images": {
+      "shape": [
+        15096,
+        128,
+        128
+      ],
+      "dtype": "float32",
+      "sha256": "42b39df1c4a0233d6233388583bae8f573821041f846278a0e73a4f2aa739c92"
+    },
+    "masks": {
+      "shape": [
+        15096,
+        4,
+        128,
+        128
+      ],
+      "dtype": "uint8",
+      "sha256": "dae6e787c5272b75402c5fbc373daf2e7b18d07b930036b5ae506a180ced1b1a"
+    },
+    "series_uid": {
+      "shape": [
+        15096
+      ],
+      "dtype": "<U64",
+      "sha256": "0f4726751c4434005806b98f2b33b2a5b02a490666f0c069f4ad4014aed37fe6"
+    },
+    "keys": {
+      "shape": [
+        15096
+      ],
+      "dtype": "<U45",
+      "sha256": "8ccffba7681bca66b24c818a5b8327e318255e71dff602def049fc400bcda3ea"
+    },
+    "pixel_spacing": {
+      "shape": [
+        15096,
+        2
+      ],
+      "dtype": "float32",
+      "sha256": "79b8e888b7f26c618e4f90097743f8ada728c471752d8159fd2c9aaa948835ac"
+    }
+  },
+  "array_semantics": {
+    "images": "CT intensity crop, already normalized to [0, 1].",
+    "masks": "Binary {0,1} masks, axis 1 is the grader slot (4 independent graders). An all-zero mask means that grader saw no lesion; this is meaningful signal and must not be filtered away.",
+    "series_uid": "DICOM SeriesInstanceUID. Group on this to split by scan.",
+    "keys": "Original pickle key, '<scan-id>_slice<N>[lesion<M>]'.",
+    "pixel_spacing": "In-plane spacing in mm, (row, col)."
+  },
+  "statistics": {
+    "n_patches": 15096,
+    "n_graders": 4,
+    "image_shape": [
+      128,
+      128
+    ],
+    "image_value_range": [
+      0.0,
+      1.0
+    ],
+    "mask_unique_values": [
+      0,
+      1
+    ],
+    "n_unique_series_uid": 875,
+    "patches_per_series": {
+      "min": 1,
+      "median": 12.0,
+      "mean": 17.25257142857143,
+      "max": 108
+    },
+    "nonempty_masks_per_image": {
+      "0": 0,
+      "1": 4963,
+      "2": 2756,
+      "3": 2626,
+      "4": 4751
+    },
+    "empty_masks_total": 23027,
+    "empty_masks_by_grader_slot": {
+      "0": 5568,
+      "1": 5767,
+      "2": 5690,
+      "3": 6002
+    },
+    "pixel_spacing_range": [
+      0.4609375,
+      0.9765625
+    ]
+  },
+  "conversion": {
+    "images_source_dtype": "float64",
+    "images_stored_dtype": "float32",
+    "images_max_abs_downcast_error": 2.9796486833433278e-08,
+    "comment": "The downcast is not bit-exact, but the largest error is ~4 orders of magnitude below the data's own intensity quantization step (~1/4095), so it is numerically irrelevant here."
+  },
+  "verification": {
+    "arrays_hash_checked": [
+      "images",
+      "keys",
+      "masks",
+      "pixel_spacing",
+      "series_uid"
+    ],
+    "rows_compared_against_source": [
+      721,
+      870,
+      1213,
+      1780,
+      2054,
+      2411,
+      2519,
+      2932,
+      2943,
+      3615,
+      3890,
+      3923,
+      4235,
+      4384,
+      4448,
+      4492,
+      4813,
+      5169,
+      5185,
+      5202,
+      5378,
+      5466,
+      5717,
+      6134,
+      6188,
+      6192,
+      6482,
+      6584,
+      6877,
+      6941,
+      7179,
+      7419,
+      7422,
+      7517,
+      7611,
+      7615,
+      7728,
+      7779,
+      7946,
+      8050,
+      8270,
+      8607,
+      8608,
+      8764,
+      9141,
+      9302,
+      9682,
+      9693,
+      10363,
+      10580,
+      10718,
+      10790,
+      11422,
+      11712,
+      12422,
+      13209,
+      13402,
+      13580,
+      13609,
+      13903,
+      14220,
+      14411,
+      14448,
+      14751
+    ],
+    "n_rows_compared": 64
+  },
+  "notes": [
+    "Images were float64 in the pickle and are stored as float32 here; see 'conversion' for the measured downcast error. MPS does not support float64, so float32 is the target dtype anyway.",
+    "In the pickle 3833 of 60384 masks were float64 and the rest uint8; every float64 mask was empty. All masks are uint8 here.",
+    "No patient ID and no nodule ID field exist in the source. series_uid is the only grouping identifier; it is 1:1 with the key prefix."
+  ]
+}
