@@ -1,0 +1,7 @@
+numpy==2.5.1
+scipy==1.15.2
+pyyaml==6.0.2
+tensorboard==2.19.0
+
+# dev / tests
+pytest==8.3.5

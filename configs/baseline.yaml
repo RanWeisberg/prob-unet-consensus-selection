@@ -1,0 +1,104 @@
+# Baseline: faithful reimplementation of the Probabilistic U-Net
+# (Kohl et al., NeurIPS 2018, arXiv:1806.05034) on preprocessed LIDC-IDRI.
+#
+# NO modernization and NO extension settings appear here. Those are separate,
+# flag-gated phases with their own configs, so that every comparison isolates
+# exactly one variable.
+
+run:
+  name: baseline
+  seed: 2018            # also the data pairing seed; the SPLIT seed is frozen at 1806
+  device: auto          # cuda -> mps -> cpu, logged at startup
+  out_dir: runs
+  deterministic: true
+
+model:
+  latent_dim: 6         # N = 6, Appendix H.1
+  base_channels: 32
+  num_downs: 4          # 4 down- and 4 up-sampling operations
+  convs_per_scale: 3    # three 3x3 convs per scale, each followed by ReLU
+  num_classes: 2        # binary segmentation with softmax cross-entropy
+  image_channels: 1
+  mask_channels: 1      # posterior input is image + one 0/1 mask channel
+  fcomb_convs: 3        # three successive 1x1 convolutions
+  fcomb_channels: null  # null -> base_channels, as in the authors' released code
+
+  # PAPER: strict channel doubling, [32, 64, 128, 256, 512] over 4 down-samplings.
+  # THIS IS THE BASELINE and it must stay null. A non-null value CAPS channel growth
+  # -- a memory optimization from the authors' released code, not the paper -- which
+  # cuts the model from 27,499,098 to 5,513,946 parameters at max_channels=128.
+  # Any capped run is a DIFFERENT configuration and its numbers are not comparable
+  # to baseline numbers. Label it as such in the report. See DEVIATIONS.md entry 3.
+  max_channels: null
+
+  align_corners: false  # reference uses true; see DEVIATIONS.md entry 4
+  bias_init_std: 0.001  # truncated normal, truncated at +-2 sigma
+
+loss:
+  beta: 1.0             # paper value. Meaningful ONLY under the reduction convention
+                        # in src/probunet/losses/elbo.py: CE summed over pixels and
+                        # meaned over batch, KL summed over latent dims and meaned
+                        # over batch. Do not change either reduction.
+
+data:
+  npz_path: data/processed/lidc.npz
+  split_path: data/splits/split.json
+  batch_size: 32        # Appendix H.1
+  num_workers: 0        # arrays are already resident; spawn platforms would copy ~1.9 GiB per worker
+  pin_memory: false     # CUDA-only optimization; set true on the RTX 3070 if it helps
+  normalization: none   # images are already in [0, 1]; the paper specifies none
+  augment: false        # baseline phase has no augmentation (the paper used it heavily)
+
+optim:
+  name: adam            # plain Adam, NOT AdamW. The reference applies L2 as
+  lr: 1.0e-4            # 1e-5 * sum(w^2)/2 over weights AND biases, which
+  weight_decay: 1.0e-5  # torch.optim.Adam(weight_decay=1e-5) reproduces exactly.
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+schedule:
+  # Constant learning rate. The paper decays 1e-4 -> 1e-6 in five steps across
+  # 240,000 iterations; our budget is ~11.8% of that, which puts the decay outside
+  # its design regime, and a constant rate gives a clean read on where validation
+  # plateaus. See DEVIATIONS.md entry 6.
+  #
+  # To use the paper's shape instead, milestones are FRACTIONS of total steps so the
+  # schedule keeps its form at any budget, e.g.:
+  #   name: piecewise
+  #   milestones: [0.2, 0.4, 0.6, 0.8]
+  #   values: [1.0e-4, 5.0e-5, 1.0e-5, 5.0e-6, 1.0e-6]
+  name: constant
+  milestones: []
+  values: []
+
+train:
+  # 100 epochs = 28,300 steps at batch 32 = 0.91M sample presentations, about 11.8%
+  # of the paper's 240,000 iterations (7.68M presentations at batch 32). Chosen
+  # because 27.5M parameters on 9,056 patches with no augmentation will plateau on
+  # validation well before the paper's budget, and because resuming from last.pt
+  # makes the choice extendable rather than final. ~3.4 h on MPS, faster on the 3070.
+  epochs: 100
+  amp: false            # CUDA only; raises on MPS/CPU rather than silently no-op
+  grad_clip: null
+  val_every_n_epochs: 1 # 16 s per validation, so there is no reason to skip
+  limit_train_batches: null
+  limit_val_batches: null
+
+log:
+  tensorboard: true
+  log_every_n_steps: 20
+  # The latent diagnostics matter more than the loss curve: with KL at ~0.0006% of
+  # the objective the risk is an unconstrained latent whose prior never covers the
+  # grader variants, which the training loss cannot show.
+  diagnostics_every_n_epochs: 5
+  prior_samples_for_ce: 4
+  diversity_samples: 16
+  diversity_images: 64  # fixed, stratified across ambiguity buckets
+  panel_images: 8       # fixed, stratified; indices recorded to diagnostic_indices.json
+  panel_samples: 6
+
+checkpoint:
+  save_best: true
+  save_last: true
+  monitor: val/total    # NEVER a test metric. One public reimplementation selects on
+  mode: min             # test and that biases every number it reports.

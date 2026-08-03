@@ -33,11 +33,33 @@ python scratch/convert_data.py            # -> data/processed/lidc.npz + lidc.js
 python -m probunet.data.splits            # -> data/splits/split.json
 ```
 
+## Train and evaluate
+
+```bash
+python scripts/train.py --config configs/smoke.yaml       # verify the loop, <1 min
+python scripts/train.py --config configs/baseline.yaml    # the real run
+python scripts/evaluate.py --checkpoint runs/baseline/checkpoints/best.pt --split val
+```
+
+`--split` is required and has no default: development happens on `val`, and `test` is
+evaluated once for the final report numbers. Metrics are GED at 1/4/8/16 samples,
+oracle / random / Hungarian-matched single-sample quality, and two degenerate baselines
+(all-empty predictor, emptiest-sample selection) — all reported aggregate and per
+ambiguity bucket, because an all-empty predictor scores Dice 0.75 on the 33% of patches
+where three of four graders are empty.
+
 15,096 patches of 128x128, four independent grader masks each, drawn from 875 CT
 series. The split is grouped by `series_uid` so no series spans two splits, and
 stratified over the number of non-empty grader masks per patch so the splits are
 comparable in ambiguity. It is generated **once**, seeded, and committed to the
-repository; `load_split()` never regenerates.
+repository; `load_split()` never regenerates. Known limitations of the split —
+uneven series density and lesion size across splits — are recorded in
+`data/splits/SPLIT_NOTES.md`.
+
+Training pairs each image with **one randomly chosen** grader mask, redrawn every
+epoch and reproducible from the run seed; evaluation keeps all four masks. Empty
+masks are never filtered: they are a grader's judgment that no lesion is present.
+No normalization is applied — the images are already in [0, 1].
 
 ## Layout
 
