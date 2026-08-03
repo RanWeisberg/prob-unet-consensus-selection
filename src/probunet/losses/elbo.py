@@ -38,11 +38,15 @@ how ``beta`` comes to mean something other than the paper's ``beta``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.distributions import Distribution, kl_divergence
+
+if TYPE_CHECKING:  # import only for type checking: losses must not import model at runtime
+    from probunet.model.prob_unet import ProbUNetOutput
 
 DEFAULT_BETA: float = 1.0
 """The paper's value (``prob_unet_config.py``), valid under the reduction above."""
@@ -180,7 +184,7 @@ def elbo_loss(
 
 
 def elbo_from_output(
-    output: "ProbUNetOutput",  # noqa: F821 - imported lazily to avoid a cycle
+    output: ProbUNetOutput,
     target: Tensor,
     beta: float = DEFAULT_BETA,
 ) -> dict[str, Tensor]:
