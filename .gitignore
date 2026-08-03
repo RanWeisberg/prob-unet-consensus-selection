@@ -4,10 +4,11 @@ CLAUDE.md
 # scratch: isolated one-off scripts, never imported by the package
 scratch/
 
-# datasets (raw pickle + converted npz) are never committed...
+# datasets: the raw pickle and the full converted npz are never committed...
 data/raw/
 data/processed/*
 !data/processed/lidc.json
+!data/processed/lidc_subset.npz
 
 # ...but data/splits/split.json MUST be tracked: every baseline comparison in the
 # report depends on the split being identical across machines and Colab runs.
@@ -24,5 +25,7 @@ build/
 dist/
 .pytest_cache/
 
-# training runs (checkpoints, tensorboard logs)
+# training artifacts: checkpoints and TensorBoard events. Large, machine-specific,
+# and never needed to read a result. results/ is the tracked counterpart.
 runs/
+experiments/

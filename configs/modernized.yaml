@@ -1,0 +1,91 @@
+# Modernized variant -- SCAFFOLD, not yet runnable as a distinct variant.
+#
+# Phase 2 adds a small set of well-motivated post-2018 improvements, each behind its
+# OWN flag so its effect can be isolated. None of those flags exist yet, so running
+# this config today trains exactly the baseline. That is deliberate: an empty scaffold
+# that silently reproduces the baseline is safer than one that half-implements a change.
+#
+# The variant is the SAME model class as the baseline with different config values.
+# There is no separate model implementation and there must never be one: duplicated
+# code drifts, and a drifted copy invalidates the claim that a comparison isolates a
+# single variable.
+#
+# Candidate improvements (CLAUDE.md), each to arrive as one flag plus one ablation run:
+#   - Dice / focal / Tversky loss instead of plain cross-entropy.
+#     Motivation is on record: the foreground:background ratio is 1:176 under uniform
+#     grader pairing (see data/splits/SPLIT_NOTES.md and DEVIATIONS.md).
+#   - GroupNorm or InstanceNorm in place of no normalization.
+#   - KL annealing / free bits against posterior collapse.
+#
+# Everything below is identical to configs/baseline.yaml. Diff the two files: the only
+# lines that should ever differ are the flags under test.
+
+run:
+  name: modernized
+  seed: 2018
+  device: auto
+  out_dir: runs
+  deterministic: true
+
+model:
+  latent_dim: 6
+  base_channels: 32
+  num_downs: 4
+  convs_per_scale: 3
+  num_classes: 2
+  image_channels: 1
+  mask_channels: 1
+  fcomb_convs: 3
+  fcomb_channels: null
+  max_channels: null      # still the paper's schedule; capping is not a variant
+  align_corners: false
+  bias_init_std: 0.001
+
+loss:
+  beta: 1.0
+
+data:
+  npz_path: data/processed/lidc.npz
+  split_path: data/splits/split.json
+  batch_size: 32
+  num_workers: 0
+  pin_memory: false
+  normalization: none     # PHASE 2 candidate; raises today if changed
+  augment: false          # PHASE 2 candidate; raises today if changed
+
+optim:
+  name: adam
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+schedule:
+  name: constant
+  milestones: []
+  values: []
+
+train:
+  mode: elbo
+  epochs: 100             # same budget as baseline, or the comparison is confounded
+  amp: false
+  grad_clip: null
+  val_every_n_epochs: 1
+  limit_train_batches: null
+  limit_val_batches: null
+
+log:
+  tensorboard: true
+  log_every_n_steps: 20
+  diagnostics_every_n_epochs: 5
+  prior_samples_for_ce: 4
+  diversity_samples: 16
+  diversity_images: 64
+  panel_images: 8
+  panel_samples: 6
+
+checkpoint:
+  save_best: true
+  save_last: true
+  monitor: val/total
+  mode: min

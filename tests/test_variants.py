@@ -1,0 +1,484 @@
+"""Tests for the variant interface, train.mode dispatch, the freeze contract and exports.
+
+These cover the scaffolding that Phases 2 and 3 will build on: the protocol every variant
+satisfies, the assertion that a base model really is frozen, and the weights-only export.
+No Phase 2 improvement or Phase 3 head logic exists yet, and two tests assert exactly
+that -- a scaffold must fail loudly rather than quietly behave like the baseline.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+import yaml
+
+from probunet.data.lidc import DataConfig, LidcArrays, panel_batch
+from probunet.data.splits import generate_split
+from probunet.evaluation.sampling import SamplingConfig, collect_per_patch_metrics
+from probunet.model.prob_unet import ProbUNet, ProbUNetConfig
+from probunet.training.checkpoint import (
+    export_weights,
+    is_weights_only,
+    load_checkpoint,
+    save_checkpoint,
+)
+from probunet.training.config import TRAIN_MODES, ExperimentConfig, RunConfig, TrainConfig
+from probunet.training.freeze import assert_frozen, freeze_module
+from probunet.training.trainer import Trainer
+from probunet.variants import ProbUNetVariant, SegmentationVariant
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CONFIGS = REPO_ROOT / "configs"
+SIZE = 16
+N_GRADERS = 4
+
+
+def write_npz(path: Path, n_patches: int = 24, seed: int = 0) -> None:
+    """Write a synthetic dataset spanning all four ambiguity buckets."""
+    rng = np.random.default_rng(seed)
+    series = np.array([f"s{i // 4:03d}" for i in range(n_patches)], dtype=np.str_)
+    images = rng.random((n_patches, SIZE, SIZE), dtype=np.float32)
+    masks = np.zeros((n_patches, N_GRADERS, SIZE, SIZE), dtype=np.uint8)
+    for row in range(n_patches):
+        for slot in range((row % N_GRADERS) + 1):
+            masks[row, slot, : 2 + slot, : 2 + (row % 3)] = 1
+    np.savez_compressed(path, images=images, masks=masks, series_uid=series)
+
+
+@pytest.fixture
+def tiny_experiment(tmp_path: Path) -> ExperimentConfig:
+    """A small but complete experiment config over synthetic data."""
+    npz = tmp_path / "lidc.npz"
+    write_npz(npz)
+    split = tmp_path / "split.json"
+    generate_split(npz_path=npz, out_path=split)
+    return ExperimentConfig(
+        run=RunConfig(name="test", seed=123, device="cpu", out_dir=tmp_path / "runs"),
+        model=ProbUNetConfig(latent_dim=2, base_channels=4, num_downs=2, convs_per_scale=1),
+        data=DataConfig(npz_path=npz, split_path=split, batch_size=4),
+        train=TrainConfig(epochs=1, limit_train_batches=2, limit_val_batches=1),
+    )
+
+
+@pytest.fixture
+def tiny_model() -> ProbUNet:
+    """A small model with reproducible weights."""
+    torch.manual_seed(0)
+    return ProbUNet(ProbUNetConfig(latent_dim=2, base_channels=4, num_downs=2, convs_per_scale=1))
+
+
+# --------------------------------------------------------------------------- #
+# The variant protocol
+# --------------------------------------------------------------------------- #
+def test_probunet_variant_satisfies_the_protocol(tiny_model: ProbUNet) -> None:
+    """The adapter is a SegmentationVariant at runtime."""
+    variant = ProbUNetVariant(tiny_model, name="baseline")
+    assert isinstance(variant, SegmentationVariant)
+    assert variant.name == "baseline"
+
+
+def test_variant_sample_shapes_are_batched(tiny_model: ProbUNet) -> None:
+    """sample() returns (B, n, H, W): batched, so one U-Net pass serves the batch."""
+    variant = ProbUNetVariant(tiny_model)
+    image = torch.rand(3, 1, SIZE, SIZE)
+    samples = variant.sample(image, 5)
+    assert samples.shape == (3, 5, SIZE, SIZE)
+    assert samples.dtype == torch.uint8
+    assert set(torch.unique(samples).tolist()) <= {0, 1}
+
+
+def test_variant_sample_is_reproducible_with_a_generator(tiny_model: ProbUNet) -> None:
+    """A seeded generator makes sampling repeatable."""
+    image = torch.rand(2, 1, SIZE, SIZE)
+    first = ProbUNetVariant(tiny_model, generator=torch.Generator().manual_seed(1)).sample(image, 4)
+    second = ProbUNetVariant(tiny_model, generator=torch.Generator().manual_seed(1)).sample(image, 4)
+    third = ProbUNetVariant(tiny_model, generator=torch.Generator().manual_seed(2)).sample(image, 4)
+    assert torch.equal(first, second)
+    assert not torch.equal(first, third)
+
+
+def test_variant_runs_the_unet_once_per_sample_call(tiny_model: ProbUNet) -> None:
+    """Drawing n samples must not re-run the U-Net: that is the architecture's point."""
+    variant = ProbUNetVariant(tiny_model)
+    calls = {"n": 0}
+    handle = tiny_model.unet.register_forward_hook(lambda *_: calls.__setitem__("n", calls["n"] + 1))
+    try:
+        variant.sample(torch.rand(2, 1, SIZE, SIZE), 8)
+    finally:
+        handle.remove()
+    assert calls["n"] == 1
+
+
+def test_probunet_variant_does_not_select(tiny_model: ProbUNet) -> None:
+    """A plain Probabilistic U-Net has no principled way to choose one sample."""
+    variant = ProbUNetVariant(tiny_model)
+    image = torch.rand(2, 1, SIZE, SIZE)
+    assert variant.select(variant.sample(image, 4), image) is None
+
+
+def test_variant_rejects_nonpositive_sample_counts(tiny_model: ProbUNet) -> None:
+    """Zero samples is an error."""
+    with pytest.raises(ValueError, match="n_samples"):
+        ProbUNetVariant(tiny_model).sample(torch.rand(1, 1, SIZE, SIZE), 0)
+
+
+def test_evaluation_accepts_a_variant(tiny_experiment: ExperimentConfig, tiny_model: ProbUNet) -> None:
+    """collect_per_patch_metrics is driven by the protocol, not by a model type."""
+    from probunet.data.lidc import build_data
+
+    data = build_data(tiny_experiment.data)
+    variant = ProbUNetVariant(tiny_model, generator=torch.Generator().manual_seed(0))
+    per_patch = collect_per_patch_metrics(
+        variant, data.loaders["val"], SamplingConfig(sample_counts=(1, 2)), torch.device("cpu")
+    )
+    assert "ged@2" in per_patch
+    # No selection, so no selected_* metrics appear.
+    assert not [key for key in per_patch if key.startswith("selected_")]
+
+
+def test_selecting_variant_adds_selected_metrics(
+    tiny_experiment: ExperimentConfig, tiny_model: ProbUNet
+) -> None:
+    """A variant that selects gets selected_dice and selected_ged, with no other change.
+
+    Stands in for the Phase 3 head: any object satisfying the protocol and returning an
+    index gets scored, so the evaluation code needs no per-variant branching.
+    """
+    from probunet.data.lidc import build_data
+
+    class AlwaysFirst(ProbUNetVariant):
+        """A stand-in selector that always picks sample 0."""
+
+        def select(self, samples: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
+            """Pick the first sample for every patch."""
+            return torch.zeros(samples.shape[0], dtype=torch.int64)
+
+    data = build_data(tiny_experiment.data)
+    variant = AlwaysFirst(tiny_model, name="stub", generator=torch.Generator().manual_seed(0))
+    assert isinstance(variant, SegmentationVariant)
+    per_patch = collect_per_patch_metrics(
+        variant, data.loaders["val"], SamplingConfig(sample_counts=(2,)), torch.device("cpu")
+    )
+    assert "selected_dice@2" in per_patch
+    assert "selected_ged@2" in per_patch
+    assert per_patch["selected_dice@2"].shape == per_patch["ged@2"].shape
+
+
+# --------------------------------------------------------------------------- #
+# The freeze contract
+# --------------------------------------------------------------------------- #
+def test_freeze_module_freezes_and_reports(tiny_model: ProbUNet) -> None:
+    """Freezing zeroes the trainable count, switches to eval, and returns a record."""
+    assert any(p.requires_grad for p in tiny_model.parameters())
+    record = freeze_module(tiny_model, name="base")
+    assert record["trainable_parameters"] == 0
+    assert record["frozen_parameters"] == sum(p.numel() for p in tiny_model.parameters())
+    assert record["training_mode"] is False
+    assert not any(p.requires_grad for p in tiny_model.parameters())
+    assert_frozen(tiny_model)
+
+
+def test_assert_frozen_catches_a_thawed_model(tiny_model: ProbUNet) -> None:
+    """The check is independent of the freeze, so a later thaw is caught."""
+    freeze_module(tiny_model)
+    next(iter(tiny_model.parameters())).requires_grad_(True)
+    with pytest.raises(RuntimeError, match="not frozen"):
+        assert_frozen(tiny_model)
+
+
+def test_assert_frozen_catches_training_mode(tiny_model: ProbUNet) -> None:
+    """A frozen-but-training module would still update norm statistics in later phases."""
+    freeze_module(tiny_model)
+    tiny_model.train()
+    with pytest.raises(RuntimeError, match="training mode"):
+        assert_frozen(tiny_model)
+
+
+# --------------------------------------------------------------------------- #
+# train.mode dispatch
+# --------------------------------------------------------------------------- #
+def test_train_modes_are_validated() -> None:
+    """Only the two documented modes exist."""
+    assert TRAIN_MODES == ("elbo", "selection_head")
+    assert TrainConfig().mode == "elbo"
+    with pytest.raises(ValueError, match="train.mode"):
+        TrainConfig(mode="selection")
+
+
+def test_selection_head_mode_requires_a_base_checkpoint(
+    tiny_experiment: ExperimentConfig
+) -> None:
+    """The head is fitted on top of a trained model, so the base is mandatory."""
+    config = dataclasses.replace(
+        tiny_experiment, train=dataclasses.replace(tiny_experiment.train, mode="selection_head")
+    )
+    with pytest.raises(ValueError, match="requires --base-checkpoint"):
+        Trainer(config)
+
+
+def test_selection_head_mode_freezes_then_reports_not_implemented(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """With a base checkpoint the freeze happens; only the head is missing.
+
+    The freeze contract is what the extension's central claim depends on, so it is real
+    and tested now. The head is Phase 3 and must fail loudly rather than silently train
+    something else.
+    """
+    base = Trainer(tiny_experiment)
+    checkpoint = tmp_path / "base.pt"
+    save_checkpoint(
+        checkpoint,
+        model=base.model,
+        optimizer=base.optimizer,
+        scheduler=base.scheduler,
+        epoch=1,
+        global_step=1,
+        config=tiny_experiment.to_dict(),
+        seed=tiny_experiment.run.seed,
+        device="cpu",
+        monitor="val/total",
+        best_metric=1.0,
+        metrics={},
+    )
+
+    config = dataclasses.replace(
+        tiny_experiment,
+        run=dataclasses.replace(tiny_experiment.run, name="head"),
+        train=dataclasses.replace(tiny_experiment.train, mode="selection_head"),
+    )
+    with pytest.raises(NotImplementedError, match="Phase 3"):
+        Trainer(config, base_checkpoint=checkpoint)
+
+
+def test_elbo_mode_is_unaffected(tiny_experiment: ExperimentConfig) -> None:
+    """The default mode still trains normally."""
+    trainer = Trainer(tiny_experiment)
+    assert trainer.base_record is None
+    assert "mode          : elbo" in trainer.describe()
+    metrics = trainer.train_epoch(0)
+    assert np.isfinite(metrics["total"])
+
+
+# --------------------------------------------------------------------------- #
+# Weights-only export
+# --------------------------------------------------------------------------- #
+def test_export_weights_is_smaller_and_traceable(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """The export drops optimizer state but keeps provenance."""
+    trainer = Trainer(tiny_experiment)
+    trainer.train_epoch(0)  # populate Adam moment buffers
+    full = tmp_path / "full.pt"
+    save_checkpoint(
+        full,
+        model=trainer.model,
+        optimizer=trainer.optimizer,
+        scheduler=trainer.scheduler,
+        epoch=7,
+        global_step=42,
+        config=tiny_experiment.to_dict(),
+        seed=tiny_experiment.run.seed,
+        device="cpu",
+        monitor="val/total",
+        best_metric=0.5,
+        metrics={"val/total": 0.5},
+    )
+
+    export = tmp_path / "weights.pt"
+    summary = export_weights(full, export)
+    assert summary["destination_bytes"] < summary["source_bytes"]
+    assert is_weights_only(export)
+    assert not is_weights_only(full)
+
+    payload = torch.load(export, map_location="cpu", weights_only=False)
+    assert "optimizer" not in payload
+    assert "scheduler" not in payload
+    assert "rng" not in payload
+    # Still traceable to the run that produced it.
+    assert payload["epoch"] == 7
+    assert payload["git_revision"]
+    assert json.loads(payload["config_json"])["model"]["latent_dim"] == 2
+
+
+def test_export_can_be_loaded_for_evaluation(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """An export is enough to rebuild and evaluate a model."""
+    trainer = Trainer(tiny_experiment)
+    full = tmp_path / "full.pt"
+    save_checkpoint(
+        full,
+        model=trainer.model,
+        optimizer=trainer.optimizer,
+        scheduler=trainer.scheduler,
+        epoch=3,
+        global_step=9,
+        config=tiny_experiment.to_dict(),
+        seed=123,
+        device="cpu",
+        monitor="val/total",
+        best_metric=1.0,
+        metrics={},
+    )
+    export = tmp_path / "weights.pt"
+    export_weights(full, export)
+
+    from probunet.evaluation.runner import load_variant
+
+    variant, config, state = load_variant(export, torch.device("cpu"))
+    assert state.epoch == 3
+    assert config.model.latent_dim == 2
+    samples = variant.sample(torch.rand(2, 1, SIZE, SIZE), 3)
+    assert samples.shape == (2, 3, SIZE, SIZE)
+    for saved, loaded in zip(trainer.model.parameters(), variant.model.parameters(), strict=True):
+        assert torch.equal(saved.detach(), loaded.detach())
+
+
+def test_export_missing_source(tmp_path: Path) -> None:
+    """Exporting a checkpoint that is not there fails clearly."""
+    with pytest.raises(FileNotFoundError, match="checkpoint not found"):
+        export_weights(tmp_path / "absent.pt", tmp_path / "out.pt")
+
+
+# --------------------------------------------------------------------------- #
+# The subset export path
+# --------------------------------------------------------------------------- #
+def test_subset_resolves_global_indices(tmp_path: Path) -> None:
+    """A subset addresses the same patches by their full-dataset indices."""
+    npz = tmp_path / "lidc.npz"
+    write_npz(npz, n_patches=20)
+    full = LidcArrays.load(npz)
+    assert not full.is_subset
+
+    rows = np.array([3, 11, 17], dtype=np.int64)
+    subset_path = tmp_path / "subset.npz"
+    np.savez_compressed(
+        subset_path,
+        images=full.images[rows],
+        masks=full.masks[rows],
+        series_uid=full.series_uid[rows],
+        source_index=rows,
+    )
+    subset = LidcArrays.load(subset_path)
+    assert subset.is_subset
+    assert len(subset) == 3
+    assert subset.resolve_indices(np.array([17, 3])).tolist() == [2, 0]
+
+
+def test_panel_batch_is_identical_from_full_and_subset(tmp_path: Path) -> None:
+    """The panel has ONE code path: same indices, same output, either source file.
+
+    This is what lets the notebook run on Colab from the tracked few-MB subset while the
+    training loop uses the full dataset, without a notebook-specific branch.
+    """
+    npz = tmp_path / "lidc.npz"
+    write_npz(npz, n_patches=20)
+    full = LidcArrays.load(npz)
+
+    rows = np.array([2, 9, 14], dtype=np.int64)
+    subset_path = tmp_path / "subset.npz"
+    np.savez_compressed(
+        subset_path,
+        images=full.images[rows],
+        masks=full.masks[rows],
+        series_uid=full.series_uid[rows],
+        source_index=rows,
+    )
+    subset = LidcArrays.load(subset_path)
+
+    from_full = panel_batch(full, rows)
+    from_subset = panel_batch(subset, rows)
+    assert torch.equal(from_full[0], from_subset[0])
+    assert torch.equal(from_full[1], from_subset[1])
+    assert from_full[0].shape == (3, 1, SIZE, SIZE)
+    assert from_full[1].shape == (3, N_GRADERS, SIZE, SIZE)
+
+
+def test_subset_rejects_absent_patches(tmp_path: Path) -> None:
+    """Asking a subset for a patch it does not hold is an error, not a wrong image."""
+    npz = tmp_path / "lidc.npz"
+    write_npz(npz, n_patches=20)
+    full = LidcArrays.load(npz)
+    rows = np.array([1, 2], dtype=np.int64)
+    subset_path = tmp_path / "subset.npz"
+    np.savez_compressed(
+        subset_path,
+        images=full.images[rows],
+        masks=full.masks[rows],
+        series_uid=full.series_uid[rows],
+        source_index=rows,
+    )
+    with pytest.raises(KeyError, match="not in this subset"):
+        LidcArrays.load(subset_path).resolve_indices(np.array([19]))
+
+
+# --------------------------------------------------------------------------- #
+# The three shipped configs
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("name", ["baseline", "modernized", "extension"])
+def test_shipped_configs_parse(name: str) -> None:
+    """All three variant configs load."""
+    config = ExperimentConfig.from_yaml(CONFIGS / f"{name}.yaml")
+    assert config.run.name == name
+
+
+@pytest.mark.parametrize("name", ["baseline", "modernized", "extension", "smoke"])
+def test_no_shipped_config_enables_amp(name: str) -> None:
+    """AMP is CUDA-only and raises elsewhere, so it must never ship enabled.
+
+    Otherwise a config that works on the CUDA machine would fail immediately on macOS.
+    """
+    raw = yaml.safe_load((CONFIGS / f"{name}.yaml").read_text())
+    assert raw.get("train", {}).get("amp", False) is False
+
+
+@pytest.mark.parametrize("name", ["baseline", "modernized", "extension"])
+def test_no_shipped_config_caps_channels(name: str) -> None:
+    """Capping is a memory optimization, never a variant under test."""
+    raw = yaml.safe_load((CONFIGS / f"{name}.yaml").read_text())
+    assert raw["model"]["max_channels"] is None
+
+
+def test_variants_differ_only_by_intended_flags() -> None:
+    """baseline and modernized share every architecture value.
+
+    The three variants are one model implementation with different flags. If this ever
+    fails, the configs have drifted apart in a way that would confound the comparison.
+    """
+    baseline = ExperimentConfig.from_yaml(CONFIGS / "baseline.yaml")
+    modernized = ExperimentConfig.from_yaml(CONFIGS / "modernized.yaml")
+    assert baseline.model == modernized.model
+    assert baseline.optim == modernized.optim
+    assert baseline.train.epochs == modernized.train.epochs, "budgets must match"
+    assert baseline.data.batch_size == modernized.data.batch_size
+
+
+def test_extension_config_uses_selection_head_mode() -> None:
+    """The extension config is the only one in selection_head mode."""
+    extension = ExperimentConfig.from_yaml(CONFIGS / "extension.yaml")
+    assert extension.train.mode == "selection_head"
+    for other in ("baseline", "modernized"):
+        assert ExperimentConfig.from_yaml(CONFIGS / f"{other}.yaml").train.mode == "elbo"
+
+
+def test_notebook_is_valid_and_contains_no_training() -> None:
+    """The notebook is a narrative layer: no training, no model or metric definitions."""
+    notebook = json.loads((REPO_ROOT / "notebooks" / "submission.ipynb").read_text())
+    assert notebook["nbformat"] == 4
+    sources = [
+        "".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code"
+    ]
+    joined = "\n".join(sources)
+    assert "Trainer(" not in joined, "the notebook must not train"
+    assert ".train()" not in joined, "the notebook must not train"
+    assert "class " not in joined, "model/metric definitions belong in the package"
+    assert "def " not in joined, "logic belongs in the package, not in cells"
+    # It must read the tracked artifacts rather than recompute them.
+    assert "COMPARISON_JSON" in joined
+    assert "SUBSET_NPZ" in joined

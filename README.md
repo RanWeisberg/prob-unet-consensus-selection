@@ -61,13 +61,79 @@ epoch and reproducible from the run seed; evaluation keeps all four masks. Empty
 masks are never filtered: they are a grader's judgment that no lesion is present.
 No normalization is applied — the images are already in [0, 1].
 
-## Layout
+## Train and evaluate
 
+Three variants, **one model implementation**, selected by config:
+
+```bash
+python scripts/train.py --config configs/smoke.yaml        # verify the loop, <1 min
+python scripts/train.py --config configs/baseline.yaml     # phase 1
+python scripts/train.py --config configs/modernized.yaml   # phase 2 (scaffold)
+python scripts/train.py --config configs/extension.yaml \
+    --base-checkpoint runs/modernized/checkpoints/best.pt  # phase 3 (scaffold)
+
+python scripts/evaluate.py --checkpoint runs/baseline/checkpoints/best.pt --split val
+python scripts/compare.py --split val \
+    --checkpoint baseline=runs/baseline/checkpoints/best.pt \
+    --checkpoint modernized=runs/modernized/checkpoints/best.pt
 ```
-src/probunet/          the package (all real logic lives here)
-scratch/               isolated one-off scripts, gitignored, never imported
-tests/                 pytest suite
-data/raw/              the source pickle (gitignored)
-data/processed/        converted .npz (gitignored) + lidc.json schema sidecar
-data/splits/split.json the fixed split (tracked)
+
+`configs/modernized.yaml` and `configs/extension.yaml` are scaffolds: the phase-2 flags
+do not exist yet, and `extension.yaml` loads and freezes its base model and then raises,
+because the head is phase 3. Diff the configs — the only lines that differ between
+variants are the flags under test.
+
+`--split` is required and has no default: development happens on `val`, and `test` is
+evaluated once for the final numbers. Metrics are GED at 1/4/8/16 samples, oracle /
+random / Hungarian-matched single-sample quality, and two degenerate baselines
+(all-empty predictor, emptiest-sample selection) — reported aggregate and per ambiguity
+bucket, because an all-empty predictor scores Dice 0.75 on the 33% of patches where
+three of four graders are empty.
+
+Device selection is automatic (cuda → mps → cpu) and logged at startup. Seeds do not
+reproduce across backends, so every run in one comparison must come from the same
+device; checkpoints and results both record the device, torch version and git SHA.
+
+## Where everything lives
+
+The distinction that trips people up on a fresh clone: **training output is ignored,
+results are tracked.**
+
+| path | git | contents |
+|---|---|---|
+| `src/probunet/` | tracked | the package — all real logic |
+| `configs/` | tracked | the three variant configs + smoke |
+| `scripts/` | tracked | CLI entry points |
+| `tests/` | tracked | pytest suite |
+| `results/` | **tracked** | evaluation + comparison JSON/CSV — what the notebook reads |
+| `data/splits/split.json` | **tracked** | the frozen split (+ `SPLIT_NOTES.md`) |
+| `data/processed/lidc.json` | **tracked** | conversion provenance |
+| `data/processed/lidc_subset.npz` | **tracked** | ~2 MB, panel patches for the notebook |
+| `notebooks/` | tracked | thin narrative layer, no logic |
+| `DEVIATIONS.md` | tracked | every departure from the paper/reference |
+| `runs/`, `experiments/` | **ignored** | checkpoints (~315 MB each), TensorBoard events |
+| `data/raw/` | **ignored** | the source pickle (3.2 GiB) |
+| `data/processed/lidc.npz` | **ignored** | the full converted dataset (~450 MB) |
+| `scratch/` | **ignored** | one-off scripts, never imported |
+
+`src/probunet/paths.py` is the single source of truth for that table, and
+`tests/test_paths.py` asserts it against `git check-ignore` — so a stray `.gitignore`
+edit cannot silently make `results/` unreachable from Colab.
+
+Large artifacts are shared out of band:
+
+```bash
+python scripts/export_weights.py runs/baseline/checkpoints/best.pt   # ~315 MB -> ~105 MB
+python scripts/export_subset.py                                      # -> lidc_subset.npz
 ```
+
+A weights-only export drops the optimizer state (Adam keeps two moment buffers per
+parameter) but keeps the config, epoch and git SHA, so it stays traceable. Full
+checkpoints remain the authoritative resumable artifact.
+
+## The notebook
+
+`notebooks/submission.ipynb` runs **on CPU, without training and without the full
+dataset**: it needs only the repo (tracked `comparison.json` + `lidc_subset.npz`) plus
+three weights-only files. Three training runs exceed a Colab session, and a different
+device would produce numbers that are not comparable with the reported ones.

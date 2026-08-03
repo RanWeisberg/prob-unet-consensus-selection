@@ -21,7 +21,7 @@ import torch
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 
-from probunet.data.lidc import LidcDataset, build_data
+from probunet.data.lidc import LidcDataset, build_data, panel_batch
 from probunet.losses.elbo import elbo_loss
 from probunet.model.prob_unet import ProbUNet
 from probunet.training.checkpoint import (
@@ -32,6 +32,7 @@ from probunet.training.checkpoint import (
     save_checkpoint,
 )
 from probunet.training.config import ExperimentConfig
+from probunet.training.freeze import freeze_module
 from probunet.training.diagnostics import (
     build_diagnostic_sets,
     logits_to_mask,
@@ -59,19 +60,31 @@ DIAGNOSTIC_SEED_OFFSET = 7919
 class Trainer:
     """Owns the model, data, optimizer and logging for one run."""
 
-    def __init__(self, config: ExperimentConfig, device: torch.device | None = None) -> None:
+    def __init__(
+        self,
+        config: ExperimentConfig,
+        device: torch.device | None = None,
+        base_checkpoint: Path | None = None,
+    ) -> None:
         """Build everything a run needs.
 
         Args:
             config: The resolved experiment configuration.
             device: Override for the device; normally selected from the config.
+            base_checkpoint: Required when ``config.train.mode == "selection_head"``:
+                the trained Probabilistic U-Net the head is fitted on top of. It is
+                frozen, and the freeze is asserted and logged.
 
         Raises:
-            NotImplementedError: If AMP is requested on a non-CUDA device. Autocast on
-                MPS is not exercised by this project and ``GradScaler`` is CUDA-centric,
-                so silently ignoring the flag would be worse than refusing it.
+            NotImplementedError: If AMP is requested on a non-CUDA device (autocast on
+                MPS is not exercised here and ``GradScaler`` is CUDA-centric, so
+                silently ignoring the flag would be worse than refusing it), or if
+                ``selection_head`` mode is requested -- the head is Phase 3.
+            ValueError: If ``selection_head`` mode is requested without a base
+                checkpoint.
         """
         self.config = config
+        self.base_checkpoint = base_checkpoint
         seed_everything(config.run.seed, deterministic=config.run.deterministic)
         self.device = device or select_device(config.run.device)
 
@@ -84,6 +97,9 @@ class Trainer:
 
         self.data = build_data(config.data)
         self.model = ProbUNet(config.model).to(self.device)
+        self.base_record: dict[str, object] | None = None
+        if config.train.mode == "selection_head":
+            self._prepare_selection_head()
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=config.optim.lr,
@@ -116,16 +132,10 @@ class Trainer:
         self._diversity_dataset = LidcDataset(
             self.data.arrays, self.diagnostic_sets.diversity, mode="eval"
         )
-        self._panel_dataset = LidcDataset(
-            self.data.arrays, self.diagnostic_sets.panel, mode="eval"
-        )
         # Deterministic order, built once: the diagnostics must compare the same images
         # in the same order at every epoch and across runs.
         self._diagnostic_loader = torch.utils.data.DataLoader(
             self._diversity_dataset, batch_size=config.data.batch_size, shuffle=False
-        )
-        self._panel_loader = torch.utils.data.DataLoader(
-            self._panel_dataset, batch_size=len(self._panel_dataset), shuffle=False
         )
 
         self.epoch = 0
@@ -163,11 +173,44 @@ class Trainer:
 
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, factor_at)
 
+    def _prepare_selection_head(self) -> None:
+        """Load and freeze the base model for selection-head training.
+
+        The head is Phase 3, so this stops after the part that is defined now: the base
+        checkpoint is loaded, frozen, and the freeze is asserted and logged. Doing the
+        freeze here rather than inside a future head implementation means the contract
+        the extension depends on is already covered by tests.
+
+        Raises:
+            ValueError: If no base checkpoint was supplied.
+            NotImplementedError: Always, once the base is frozen -- the head itself does
+                not exist yet.
+        """
+        if self.base_checkpoint is None:
+            raise ValueError(
+                "train.mode='selection_head' requires --base-checkpoint: the head is "
+                "trained on top of an already-trained, frozen Probabilistic U-Net."
+            )
+        load_checkpoint(
+            self.base_checkpoint,
+            model=self.model,
+            map_location=self.device,
+            restore_rng=False,
+        )
+        self.base_record = freeze_module(self.model, name="base Probabilistic U-Net")
+        LOGGER.info("base model frozen: %s", self.base_record)
+        raise NotImplementedError(
+            "the consensus-selection head is Phase 3 and is not implemented yet. The "
+            "base model loads and freezes correctly (see the log line above); what is "
+            "missing is the head module, its scoring target and its training step."
+        )
+
     def describe(self) -> str:
         """Return a startup banner: config, device, seed and provenance."""
         parameters = sum(p.numel() for p in self.model.parameters())
         lines = [
             f"run           : {self.config.run.name}",
+            f"mode          : {self.config.train.mode}",
             f"device        : {describe_device(self.device)}",
             f"seed          : {self.config.run.seed}",
             f"parameters    : {parameters:,}",
@@ -399,9 +442,13 @@ class Trainer:
             epoch: Epoch index, used as the image step.
             generator: Generator supplying reproducible sample noise.
         """
-        batch = next(iter(self._panel_loader))
-        image = batch["image"].to(self.device)
-        masks = batch["masks"].to(self.device)
+        # Same path the notebook uses, so a panel works from the full dataset or from
+        # the tracked subset export without a second code path.
+        panel_images, panel_masks = panel_batch(
+            self.data.arrays, self.diagnostic_sets.panel
+        )
+        image = panel_images.to(self.device)
+        masks = panel_masks.to(self.device)
         encoded = self.model.encode(image)
         samples = prior_samples_for_images(
             self.model, encoded, self.config.log.panel_samples, generator

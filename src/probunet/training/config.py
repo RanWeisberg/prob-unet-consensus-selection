@@ -25,6 +25,7 @@ from probunet.model.prob_unet import ProbUNetConfig
 
 SCHEDULE_NAMES = ("constant", "piecewise")
 OPTIMIZER_NAMES = ("adam",)
+TRAIN_MODES = ("elbo", "selection_head")
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,10 @@ class TrainConfig:
     """Training loop settings.
 
     Attributes:
+        mode: ``"elbo"`` trains the Probabilistic U-Net itself. ``"selection_head"``
+            trains the consensus-selection head on top of a **frozen** base model and
+            requires ``--base-checkpoint``; the head itself is Phase 3 and not
+            implemented yet.
         epochs: Number of epochs. 100 is the proof-of-concept budget: 28,300 steps at
             batch 32, about 11.8% of the paper's 240,000 iterations. Extendable by
             resuming from ``last.pt``.
@@ -157,6 +162,7 @@ class TrainConfig:
         ValueError: If a value is out of range.
     """
 
+    mode: str = "elbo"
     epochs: int = 100
     amp: bool = False
     grad_clip: float | None = None
@@ -166,6 +172,8 @@ class TrainConfig:
 
     def __post_init__(self) -> None:
         """Validate the training settings."""
+        if self.mode not in TRAIN_MODES:
+            raise ValueError(f"train.mode must be one of {TRAIN_MODES}, got {self.mode!r}")
         if self.epochs <= 0:
             raise ValueError(f"epochs must be positive, got {self.epochs}")
         if self.val_every_n_epochs <= 0:

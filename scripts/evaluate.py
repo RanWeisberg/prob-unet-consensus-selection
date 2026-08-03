@@ -28,18 +28,14 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if SRC.exists() and str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from probunet.data.lidc import build_data  # noqa: E402
+from probunet.evaluation.runner import evaluate_variant, load_variant  # noqa: E402
 from probunet.evaluation.sampling import (  # noqa: E402
     DEFAULT_EVAL_SEED,
     DEFAULT_SAMPLE_COUNTS,
     SamplingConfig,
-    build_report,
-    collect_per_patch_metrics,
 )
-from probunet.model.prob_unet import ProbUNet  # noqa: E402
-from probunet.training.checkpoint import load_checkpoint  # noqa: E402
-from probunet.training.config import ExperimentConfig  # noqa: E402
-from probunet.utils.runtime import describe_device, git_revision, select_device  # noqa: E402
+from probunet.paths import results_path  # noqa: E402
+from probunet.utils.runtime import describe_device, select_device  # noqa: E402
 
 LOGGER = logging.getLogger("probunet.evaluate")
 
@@ -79,7 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--aggregate", default="mean", help="grader aggregation for Dice")
     parser.add_argument("--batch-size", type=int, default=None, help="override batch size")
     parser.add_argument("--device", default=None, help="override device")
-    parser.add_argument("--out", type=Path, default=None, help="results JSON path")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="results JSON path (default: results/evaluation_<split>.json, which is TRACKED)",
+    )
     parser.add_argument("--log-level", default="INFO", help="Python logging level")
     return parser
 
@@ -193,47 +194,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.split == "test":
         LOGGER.warning(TEST_WARNING)
 
-    # Two loads of the checkpoint: the first to recover the configuration the model was
-    # built with, the second to fill the weights once that model exists.
-    state = load_checkpoint(args.checkpoint, restore_rng=False)
-    config = ExperimentConfig.from_dict(state.config)
-    if args.batch_size is not None:
-        config = dataclasses.replace(
-            config, data=dataclasses.replace(config.data, batch_size=args.batch_size)
-        )
-
-    device = select_device(args.device or config.run.device)
-    model = ProbUNet(config.model).to(device)
-    load_checkpoint(args.checkpoint, model=model, map_location=device, restore_rng=False)
+    device = select_device(args.device or "auto")
+    variant, config, state = load_variant(
+        args.checkpoint, device, batch_size=args.batch_size, seed=args.seed
+    )
 
     LOGGER.info("checkpoint    : %s", args.checkpoint)
-    LOGGER.info("trained on    : %s (epoch %d, git %s)", state.device, state.epoch, state.git_revision)
+    LOGGER.info(
+        "trained on    : %s (epoch %d, git %s)", state.device, state.epoch, state.git_revision
+    )
     LOGGER.info("monitor       : %s = %s", state.monitor, state.best_metric)
     LOGGER.info("device        : %s", describe_device(device))
     LOGGER.info("split         : %s", args.split)
 
-    data = build_data(config.data)
     sampling = SamplingConfig(
         sample_counts=tuple(args.samples), seed=args.seed, aggregate=args.aggregate
     )
-    per_patch = collect_per_patch_metrics(model, data.loaders[args.split], sampling, device)
-    report = build_report(per_patch, sampling)
-
-    report["provenance"] = {
-        "checkpoint": str(args.checkpoint),
-        "split": args.split,
-        "checkpoint_epoch": state.epoch,
-        "checkpoint_git_revision": state.git_revision,
-        "checkpoint_monitor": state.monitor,
-        "checkpoint_best_metric": state.best_metric,
-        "evaluation_git_revision": git_revision(),
-        "device": str(device),
-        "seed": args.seed,
-        "aggregate": args.aggregate,
-    }
+    report = evaluate_variant(
+        variant, config, args.split, sampling, device, state=state, checkpoint=args.checkpoint
+    )
 
     print(format_report(report, args.split))
-    out = args.out or (config.run.run_dir / f"evaluation_{args.split}.json")
+    # Results go to the TRACKED results/ tree, not the ignored run directory: the
+    # notebook and the report read these files, so they have to ship with the repo.
+    out = args.out or results_path(f"evaluation_{args.split}_{variant.name}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, default=float) + "\n")
     LOGGER.info("wrote %s", out)

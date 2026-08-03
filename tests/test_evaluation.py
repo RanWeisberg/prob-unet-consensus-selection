@@ -36,6 +36,7 @@ from probunet.evaluation.sampling import (
     collect_per_patch_metrics,
     draw_prior_samples,
 )
+from probunet.variants import ProbUNetVariant
 
 SIZE = 8
 
@@ -423,7 +424,10 @@ def test_collect_and_report_end_to_end(tiny_model_and_loader) -> None:
     """The whole evaluation path runs and produces the documented keys."""
     model, data = tiny_model_and_loader
     config = SamplingConfig(sample_counts=(1, 2, 4), seed=7)
-    per_patch = collect_per_patch_metrics(model, data.loaders["val"], config, torch.device("cpu"))
+    variant = ProbUNetVariant(model, generator=torch.Generator().manual_seed(config.seed))
+    per_patch = collect_per_patch_metrics(
+        variant, data.loaders["val"], config, torch.device("cpu")
+    )
 
     expected = len(data.datasets["val"])
     for key, values in per_patch.items():
@@ -449,12 +453,14 @@ def test_evaluation_is_reproducible(tiny_model_and_loader) -> None:
     """Same seed gives identical metrics; a different seed does not."""
     model, data = tiny_model_and_loader
     device = torch.device("cpu")
-    base = SamplingConfig(sample_counts=(4,), seed=11)
-    first = collect_per_patch_metrics(model, data.loaders["val"], base, device)
-    second = collect_per_patch_metrics(model, data.loaders["val"], base, device)
-    other = collect_per_patch_metrics(
-        model, data.loaders["val"], SamplingConfig(sample_counts=(4,), seed=12), device
-    )
+
+    def run(seed: int) -> dict:
+        """Evaluate with a variant seeded by ``seed``."""
+        config = SamplingConfig(sample_counts=(4,), seed=seed)
+        variant = ProbUNetVariant(model, generator=torch.Generator().manual_seed(seed))
+        return collect_per_patch_metrics(variant, data.loaders["val"], config, device)
+
+    first, second, other = run(11), run(11), run(12)
 
     assert np.array_equal(first["ged@4"], second["ged@4"])
     assert not np.array_equal(first["ged@4"], other["ged@4"])
@@ -464,7 +470,10 @@ def test_oracle_is_never_below_random_in_practice(tiny_model_and_loader) -> None
     """Oracle selection is by construction at least as good as an unselected sample."""
     model, data = tiny_model_and_loader
     config = SamplingConfig(sample_counts=(4,), seed=3)
-    per_patch = collect_per_patch_metrics(model, data.loaders["val"], config, torch.device("cpu"))
+    variant = ProbUNetVariant(model, generator=torch.Generator().manual_seed(config.seed))
+    per_patch = collect_per_patch_metrics(
+        variant, data.loaders["val"], config, torch.device("cpu")
+    )
     assert np.all(per_patch["oracle_dice@4"] >= per_patch["random_sample_dice@4"] - 1e-6)
 
 
@@ -476,3 +485,17 @@ def test_sampling_config_validation() -> None:
         SamplingConfig(sample_counts=(0, 4))
     with pytest.raises(ValueError, match="increasing"):
         SamplingConfig(sample_counts=(8, 4))
+
+
+def test_collect_rejects_a_raw_model(tiny_model_and_loader) -> None:
+    """Passing a model instead of a variant fails with an actionable message.
+
+    ``ProbUNet`` also has a ``sample`` method, but its signature is
+    ``sample(encoded, n_samples)``. Without this guard the mistake surfaced as
+    "'Tensor' object has no attribute 'prior'" from deep inside the model.
+    """
+    model, data = tiny_model_and_loader
+    with pytest.raises(TypeError, match="ProbUNetVariant"):
+        collect_per_patch_metrics(
+            model, data.loaders["val"], SamplingConfig(sample_counts=(1,)), torch.device("cpu")
+        )

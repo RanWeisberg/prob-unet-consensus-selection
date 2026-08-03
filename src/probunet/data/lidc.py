@@ -185,12 +185,16 @@ class LidcArrays:
         masks: ``(N, 4, H, W)`` uint8 in {0, 1}.
         series_uid: ``(N,)`` DICOM series UIDs.
         keys: ``(N,)`` original pickle keys, if the file carried them.
+        source_index: ``(N,)`` row index each patch had in the FULL dataset, present
+            only in a subset export. Its presence is what lets the same code address a
+            subset and the full dataset by the same global indices.
     """
 
     images: np.ndarray
     masks: np.ndarray
     series_uid: np.ndarray
     keys: np.ndarray | None = None
+    source_index: np.ndarray | None = None
     _nonempty_counts: np.ndarray | None = field(default=None, repr=False)
 
     def __len__(self) -> int:
@@ -235,6 +239,9 @@ class LidcArrays:
                 masks=handle["masks"],
                 series_uid=handle["series_uid"],
                 keys=handle["keys"] if "keys" in handle.files else None,
+                source_index=(
+                    handle["source_index"] if "source_index" in handle.files else None
+                ),
             )
         if validate:
             arrays.validate()
@@ -293,6 +300,40 @@ class LidcArrays:
                 f"masks must be strictly binary {{0, 1}}, found values in "
                 f"[{mask_min}, {mask_max}] (0/255 encoding?)"
             )
+
+    @property
+    def is_subset(self) -> bool:
+        """Whether this file is a subset export rather than the full dataset."""
+        return self.source_index is not None
+
+    def resolve_indices(self, global_indices: np.ndarray) -> np.ndarray:
+        """Translate full-dataset row indices into rows of this file.
+
+        For the full dataset this is the identity. For a subset export it maps through
+        ``source_index``, so a caller holding indices from ``diagnostic_indices.json``
+        addresses the same patches whichever file is loaded -- which is what keeps the
+        qualitative panel free of a notebook-specific code path.
+
+        Args:
+            global_indices: Row indices in the full dataset.
+
+        Returns:
+            Row indices into this file's arrays.
+
+        Raises:
+            KeyError: If a requested patch is absent from this subset.
+        """
+        global_indices = np.asarray(global_indices, dtype=np.int64)
+        if self.source_index is None:
+            return global_indices
+        lookup = {int(source): row for row, source in enumerate(self.source_index)}
+        missing = [int(i) for i in global_indices if int(i) not in lookup]
+        if missing:
+            raise KeyError(
+                f"patches {missing[:5]} are not in this subset export; load the full "
+                "dataset or re-export the subset with those indices"
+            )
+        return np.array([lookup[int(i)] for i in global_indices], dtype=np.int64)
 
     def nonempty_counts(self, indices: np.ndarray | None = None) -> np.ndarray:
         """Non-empty grader counts, computed once and cached.
@@ -553,3 +594,26 @@ def build_data(config: DataConfig | None = None) -> LidcData:
         )
 
     return LidcData(arrays=arrays, datasets=datasets, loaders=loaders, config=config)
+
+def panel_batch(
+    arrays: LidcArrays, global_indices: np.ndarray
+) -> tuple[Tensor, Tensor]:
+    """Load images and all four grader masks for a set of patches.
+
+    The single path used for qualitative panels, by the training loop and by the
+    notebook alike. It resolves ``global_indices`` through
+    :meth:`LidcArrays.resolve_indices`, so it works unchanged against the full dataset or
+    a subset export -- the choice is made by which ``npz_path`` the config points at,
+    not by a separate code path.
+
+    Args:
+        arrays: The loaded dataset, full or subset.
+        global_indices: Patch indices in the full dataset's numbering.
+
+    Returns:
+        An ``(image, masks)`` pair: float32 ``(B, 1, H, W)`` and uint8 ``(B, 4, H, W)``.
+    """
+    rows = arrays.resolve_indices(global_indices)
+    images = torch.from_numpy(arrays.images[rows].copy()).unsqueeze(1)
+    masks = torch.from_numpy(arrays.masks[rows].copy())
+    return images, masks

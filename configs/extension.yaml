@@ -1,0 +1,95 @@
+# Extension variant: the consensus-selection head -- SCAFFOLD, not yet runnable.
+#
+# train.mode = selection_head trains the head on top of an already-trained, FROZEN
+# Probabilistic U-Net. Running it today loads the base checkpoint, freezes it, logs the
+# freeze record, and then raises NotImplementedError: the freeze contract exists and is
+# tested, the head does not.
+#
+#   python scripts/train.py --config configs/extension.yaml \
+#       --base-checkpoint runs/modernized/checkpoints/best.pt
+#
+# The base must be frozen because the claim is "distribution metrics unchanged,
+# single-sample quality improved". A base that kept training would change GED too, and
+# the result would look like the extension working when it was just more training.
+#
+# Per CLAUDE.md the head attaches to the MODERNIZED model, not the raw baseline.
+#
+# Two things Phase 3 must settle, deliberately absent here rather than guessed:
+#   - The scoring target: mean IoU across the four graders, count of graders satisfied
+#     above a threshold, median, or minimum. Keep it configurable.
+#   - The head must train on PRIOR samples as well as posterior ones. Posterior samples
+#     are almost always good, so a head trained only on those never sees a bad mask and
+#     learns to output a constant high score.
+#
+# The model block must match the base checkpoint's architecture exactly, or the weights
+# will not load. It is repeated here rather than inherited so a mismatch is visible.
+
+run:
+  name: extension
+  seed: 2018
+  device: auto
+  out_dir: runs
+  deterministic: true
+
+model:
+  latent_dim: 6
+  base_channels: 32
+  num_downs: 4
+  convs_per_scale: 3
+  num_classes: 2
+  image_channels: 1
+  mask_channels: 1
+  fcomb_convs: 3
+  fcomb_channels: null
+  max_channels: null
+  align_corners: false
+  bias_init_std: 0.001
+
+loss:
+  beta: 1.0               # unused in selection_head mode; the head has its own objective
+
+data:
+  npz_path: data/processed/lidc.npz
+  split_path: data/splits/split.json
+  batch_size: 32
+  num_workers: 0
+  pin_memory: false
+  normalization: none
+  augment: false
+
+optim:
+  name: adam
+  lr: 1.0e-4              # PHASE 3: the head is small and may want its own rate
+  weight_decay: 1.0e-5
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+schedule:
+  name: constant
+  milestones: []
+  values: []
+
+train:
+  mode: selection_head    # requires --base-checkpoint
+  epochs: 30              # PHASE 3: a small head on frozen features needs far less
+  amp: false
+  grad_clip: null
+  val_every_n_epochs: 1
+  limit_train_batches: null
+  limit_val_batches: null
+
+log:
+  tensorboard: true
+  log_every_n_steps: 20
+  diagnostics_every_n_epochs: 5
+  prior_samples_for_ce: 4
+  diversity_samples: 16
+  diversity_images: 64
+  panel_images: 8
+  panel_samples: 6
+
+checkpoint:
+  save_best: true
+  save_last: true
+  monitor: val/total
+  mode: min

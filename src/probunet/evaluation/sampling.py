@@ -32,6 +32,7 @@ from probunet.evaluation.metrics import (
 )
 from probunet.model.prob_unet import ProbUNet
 from probunet.training.diagnostics import logits_to_mask, reparameterize
+from probunet.variants import SegmentationVariant
 
 LOGGER = logging.getLogger(__name__)
 
@@ -127,19 +128,24 @@ def _grader_areas(graders: Tensor) -> Tensor:
 
 @torch.no_grad()
 def collect_per_patch_metrics(
-    model: ProbUNet,
+    variant: SegmentationVariant,
     loader: DataLoader,
     config: SamplingConfig,
     device: torch.device,
 ) -> dict[str, np.ndarray]:
     """Evaluate every metric for every patch in a loader.
 
+    Takes a :class:`~probunet.variants.SegmentationVariant`, not a model, so the same
+    code serves the baseline, the modernized variant and the extension. There is exactly
+    one variant-dependent branch: if ``variant.select`` returns indices, the metrics of
+    the selected sample are recorded as well.
+
     The all-empty predictor is computed once rather than per sample count, because it is
     genuinely independent of ``n``: every self-distance is 0 and every cross-distance
     repeats, so all three GED components are unchanged by drawing more empty masks.
 
     Args:
-        model: The trained model, already on ``device``.
+        variant: The variant to evaluate, already on ``device``.
         loader: A deterministic, non-shuffled evaluation loader.
         config: Sampling configuration.
         device: Device to run on.
@@ -147,10 +153,18 @@ def collect_per_patch_metrics(
     Returns:
         A dict of flat per-patch arrays. Keys are ``index``, ``nonempty_count``,
         ``lesion_area_median``, the all-empty baseline (``empty_*``) and, for each
-        requested count ``n``, entries suffixed ``@n``.
+        requested count ``n``, entries suffixed ``@n``. When the variant selects,
+        ``selected_dice@n`` and ``selected_ged@n`` appear too.
     """
-    model.eval()
-    generator = torch.Generator().manual_seed(config.seed)
+    # A raw ProbUNet has a sample() too, but its signature is sample(encoded, n) --
+    # passing one here would fail deep inside with an unhelpful message.
+    if not (hasattr(variant, "sample") and hasattr(variant, "select")):
+        raise TypeError(
+            f"expected a SegmentationVariant with sample() and select(), got "
+            f"{type(variant).__name__}. Wrap a model: ProbUNetVariant(model)."
+        )
+    if isinstance(getattr(variant, "model", None), torch.nn.Module):
+        variant.model.eval()
     columns: dict[str, list[np.ndarray]] = {}
 
     def append(key: str, values: Tensor) -> None:
@@ -163,7 +177,7 @@ def collect_per_patch_metrics(
         append("nonempty_count", (graders != 0).flatten(start_dim=2).any(dim=2).sum(dim=1))
         append("lesion_area_median", _grader_areas(graders))
 
-        samples = draw_prior_samples(model, image, config.max_samples, generator)
+        samples = variant.sample(image, config.max_samples)
 
         for count in config.sample_counts:
             subset = samples[:, :count]
@@ -185,6 +199,24 @@ def collect_per_patch_metrics(
                     subset, graders, emptiest_sample_index(subset), config.aggregate
                 ),
             )
+
+            # The one variant-dependent branch in the whole evaluation path.
+            chosen = variant.select(subset, image)
+            if chosen is not None:
+                append(
+                    f"selected_dice@{count}",
+                    selected_sample_dice(subset, graders, chosen, config.aggregate),
+                )
+                picked = subset.gather(
+                    1,
+                    chosen.to(torch.int64)
+                    .view(-1, 1, 1, 1)
+                    .expand(-1, 1, subset.shape[-2], subset.shape[-1]),
+                )
+                append(
+                    f"selected_ged@{count}",
+                    generalized_energy_distance(picked, graders)["d_squared"],
+                )
 
         # Degenerate all-empty predictor, n-independent (see the docstring).
         empty = torch.zeros_like(graders[:, :1])
