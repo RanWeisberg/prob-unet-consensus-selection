@@ -209,6 +209,54 @@ the released config is not the paper's LIDC setup.
 
 ---
 
+## 7. IoU is foreground-only, not class-averaged
+
+| | |
+|---|---|
+| **Ours** | A single **foreground** IoU per mask pair, with two empty masks defined as IoU 1.0 |
+| **Reference** | Per-class IoU, then `nanmean` over the class axis (`evaluation/eval_cityscapes.py`, via `metrics_from_conf_matrix`) |
+| **Paper** | `d(x, y) = 1 - IoU(x, y)`, speaking of "masks of the lesion", with an explicit rule that both-empty gives `d = 0` |
+
+**Why this matters numerically.** The two routes agree on the both-empty case and
+diverge sharply everywhere else. For an empty prediction against a 150-pixel lesion:
+
+| convention | IoU | `d = 1 - IoU` |
+|---|---|---|
+| foreground-only (ours) | 0.000 | **1.000** |
+| class-averaged (reference, binary case) | (0.991 + 0.000)/2 = 0.495 | **0.505** |
+
+Class averaging drags in a background IoU of ~0.99, because background is ~99% of every
+128×128 crop. It is a far more forgiving metric and would roughly halve every reported
+distance.
+
+**Why foreground-only.** Three reasons, strongest first:
+
+1. **The paper's own both-empty rule is evidence for it.** Under class averaging that
+   case needs no rule at all: `metrics_from_conf_matrix` returns `NaN` for a class absent
+   from both masks, and `nanmean([1.0, NaN]) = 1.0` gives `d = 0` automatically. The rule
+   is only *necessary* when a single foreground IoU has to resolve 0/0. The paper stating
+   it explicitly implies the single-IoU reading.
+2. The paper describes the quantity as the overlap of "masks of the lesion", not a
+   class-averaged score.
+3. Follow-up work on this same preprocessed LIDC data reports foreground IoU, and
+   CLAUDE.md names those papers as the external anchor. Class averaging would match
+   neither them nor any number in the paper — the paper reports **no** LIDC GED value.
+
+**Expected impact: large on absolute values, none on internal comparisons.** Every GED
+and IoU figure would be roughly halved under class averaging. Since the primary
+comparison is internal — baseline vs modernized vs extension under one convention — and
+the external anchor uses foreground IoU, this is the choice that makes our numbers mean
+something. A `--iou-mode class_averaged` switch was considered and deliberately **not**
+added: two coexisting conventions is how a report ends up quoting one number under the
+other's interpretation.
+
+Verified consequence, from an actual evaluation run: the all-empty predictor reaches
+Dice **0.75** on bucket 1 (three of four graders empty, 33% of the data) and GED 0.846
+overall. Those degenerate baselines are reported alongside every model number precisely
+because the metric is this sensitive to the convention.
+
+---
+
 ## Non-deviations worth recording
 
 Things that *look* like they could differ but were checked and match:

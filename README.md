@@ -33,6 +33,21 @@ python scratch/convert_data.py            # -> data/processed/lidc.npz + lidc.js
 python -m probunet.data.splits            # -> data/splits/split.json
 ```
 
+## Train and evaluate
+
+```bash
+python scripts/train.py --config configs/smoke.yaml       # verify the loop, <1 min
+python scripts/train.py --config configs/baseline.yaml    # the real run
+python scripts/evaluate.py --checkpoint runs/baseline/checkpoints/best.pt --split val
+```
+
+`--split` is required and has no default: development happens on `val`, and `test` is
+evaluated once for the final report numbers. Metrics are GED at 1/4/8/16 samples,
+oracle / random / Hungarian-matched single-sample quality, and two degenerate baselines
+(all-empty predictor, emptiest-sample selection) — all reported aggregate and per
+ambiguity bucket, because an all-empty predictor scores Dice 0.75 on the 33% of patches
+where three of four graders are empty.
+
 15,096 patches of 128x128, four independent grader masks each, drawn from 875 CT
 series. The split is grouped by `series_uid` so no series spans two splits, and
 stratified over the number of non-empty grader masks per patch so the splits are

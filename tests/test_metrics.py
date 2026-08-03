@@ -144,3 +144,45 @@ def test_rank_too_low_rejected() -> None:
     """A 1-D input has no spatial dims to reduce."""
     with pytest.raises(ValueError, match="at least 2 dims"):
         binary_iou(torch.zeros(4), torch.zeros(4))
+
+
+# --------------------------------------------------------------------------- #
+# One-pixel masks: the small-lesion tail
+# --------------------------------------------------------------------------- #
+def test_single_pixel_masks() -> None:
+    """The smallest non-empty mask in the dataset is one pixel.
+
+    IoU there is brutally sensitive: two adjacent single pixels score 0, and a single
+    pixel inside a 150-pixel lesion scores 1/150. Any per-bucket number from the
+    small-lesion tail has to be read with this in mind.
+    """
+    one = torch.zeros(16, 16, dtype=torch.uint8)
+    one[0, 0] = 1
+    neighbour = torch.zeros(16, 16, dtype=torch.uint8)
+    neighbour[0, 1] = 1
+
+    assert binary_iou(one, one).item() == 1.0
+    assert binary_iou(one, neighbour).item() == 0.0
+    assert dice(one, neighbour).item() == 0.0
+
+    lesion = torch.zeros(16, 16, dtype=torch.uint8)
+    lesion[:10, :15] = 1  # 150 pixels, containing the single pixel
+    assert int(lesion.sum()) == 150
+    assert binary_iou(one, lesion).item() == pytest.approx(1.0 / 150.0)
+    assert dice(one, lesion).item() == pytest.approx(2.0 / 151.0)
+
+
+def test_one_pixel_disagreement_dominates_iou() -> None:
+    """Adding one pixel to a one-pixel mask halves its IoU."""
+    one = torch.zeros(8, 8, dtype=torch.uint8)
+    one[0, 0] = 1
+    two = torch.zeros(8, 8, dtype=torch.uint8)
+    two[0, 0] = 1
+    two[0, 1] = 1
+    assert binary_iou(one, two).item() == pytest.approx(0.5)
+    # The same absolute error on a large mask barely registers.
+    big = torch.zeros(8, 8, dtype=torch.uint8)
+    big[:5, :8] = 1
+    bigger = big.clone()
+    bigger[5, 0] = 1
+    assert binary_iou(big, bigger).item() == pytest.approx(40.0 / 41.0)

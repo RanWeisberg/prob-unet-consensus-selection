@@ -11,9 +11,11 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.26",
     "torch>=2.2",
-    # Required at runtime: training logs to TensorBoard, configs are YAML.
+    # Required at runtime: training logs to TensorBoard, configs are YAML,
+    # and Hungarian matching in evaluation uses scipy.optimize.
     "tensorboard>=2.16",
     "pyyaml>=6.0",
+    "scipy>=1.11",
 ]
 
 [project.optional-dependencies]
