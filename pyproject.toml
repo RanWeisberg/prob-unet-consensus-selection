@@ -11,15 +11,18 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.26",
     "torch>=2.2",
+    # Required at runtime: training logs to TensorBoard, configs are YAML.
+    "tensorboard>=2.16",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "tensorboard>=2.16",
 ]
 
 [project.scripts]
+# scripts/ is not a package, so train.py is run directly: python scripts/train.py
 probunet-split = "probunet.data.splits:main"
 
 [tool.setuptools.packages.find]

@@ -23,3 +23,6 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+
+# training runs (checkpoints, tensorboard logs)
+runs/

@@ -157,6 +157,58 @@ same nodule on both sides of the boundary.
 
 ---
 
+## 6. Training budget and learning-rate schedule
+
+| | |
+|---|---|
+| **Ours** | 100 epochs = 28,300 steps at batch 32 = **0.91 M sample presentations**. Constant lr 1e-4 |
+| **Paper** | 240,000 iterations at batch 32 (Appendix H.1) = **7.68 M sample presentations**. lr decays **1e-4 → 1e-6 in five steps** |
+
+Our budget is **11.8%** of the paper's. Because our batch size matches the paper's,
+matching its iteration count would mean 240,000 steps = **848 epochs** ≈ 29 h on the
+MacBook's MPS backend.
+
+**Why the budget.** Three reasons, in order of weight:
+
+1. The paper trained with heavy augmentation; we have none in the baseline phase. With
+   27.5 M parameters on 9,056 patches — whose effective diversity is lower still, since
+   train averages 24.4 near-duplicate slices per series — validation loss will plateau
+   well before the paper's budget. Past that point extra epochs buy overfitting, not
+   generalization, so the sensible stopping criterion is *where val stops improving*,
+   not a step count borrowed from a differently-regularized run.
+2. Phases 2 and 3 need several flag-isolated runs before 20.08.2026.
+3. Resume support makes the choice non-binding: if validation is still improving at
+   epoch 100, continue from `last.pt`.
+
+**Why a constant learning rate.** The paper's five-step decay to 1e-6 is tuned for a
+240,000-iteration run. Compressed into ~12% of that budget it would spend most of
+training at a learning rate chosen for a regime we never reach, and it would obscure
+exactly the thing we want to read off the curve: where validation plateaus. A constant
+rate gives that read cleanly.
+
+`piecewise` is available and its milestones are **fractions of total steps**, not
+absolute step counts, so a schedule keeps its shape at any budget:
+
+```yaml
+schedule:
+  name: piecewise
+  milestones: [0.2, 0.4, 0.6, 0.8]
+  values: [1.0e-4, 5.0e-5, 1.0e-5, 5.0e-6, 1.0e-6]
+```
+
+**Expected impact: moderate on final numbers, small on conclusions.** A decayed run
+would likely end at a slightly better validation loss. Since the primary comparison is
+internal — baseline vs modernized vs extension under identical budget and schedule —
+the absolute offset is held constant across every comparison that carries a claim.
+
+**Note on where the wrong numbers came from.** An earlier draft of this file used batch
+10 and a three-boundary decay. Both came from the authors' released
+`prob_unet_config.py`, which is the **Cityscapes** configuration (H.2), not the LIDC one
+(H.1). Recorded here because it is the same trap as the channel schedule in entry 3:
+the released config is not the paper's LIDC setup.
+
+---
+
 ## Non-deviations worth recording
 
 Things that *look* like they could differ but were checked and match:
