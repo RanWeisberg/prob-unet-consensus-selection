@@ -131,6 +131,17 @@ def git_revision(repo: Path | None = None) -> str:
 def rng_state() -> dict[str, object]:
     """Capture the RNG state of every generator a run depends on.
 
+    ``torch.get_rng_state()`` is the **CPU** generator only. A tensor operation on an
+    accelerator draws from that device's own generator, so a checkpoint that saves the CPU
+    state alone does not let an accelerated run replay its sequence -- and this model
+    samples ``z`` on the training device every step. Both accelerator generators are
+    therefore captured as well:
+
+    * **CUDA** -- where the long 240k-iteration run happens, and the reason this matters:
+      a ~33-hour job will very likely be resumed at least once.
+    * **MPS** -- where development happens. Verified directly: restoring only the CPU
+      state does not reproduce a subsequent ``torch.randn(..., device="mps")``.
+
     Returns:
         A dict suitable for storing in a checkpoint and passing to
         :func:`set_rng_state`.
@@ -142,6 +153,8 @@ def rng_state() -> dict[str, object]:
     }
     if torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state_all()
+    if torch.backends.mps.is_available():
+        state["mps"] = torch.mps.get_rng_state()
     return state
 
 
@@ -149,16 +162,50 @@ def set_rng_state(state: dict[str, object]) -> None:
     """Restore RNG state captured by :func:`rng_state`.
 
     Missing entries are skipped, so a checkpoint taken on one backend can still be
-    resumed on another -- with the caveat that the sequence will not match.
+    resumed on another -- with the caveat that the sequence will not match. That caveat is
+    why every checkpoint records the device it was written on.
 
     Args:
         state: The captured state.
     """
     if "torch" in state:
-        torch.set_rng_state(state["torch"])  # type: ignore[arg-type]
+        torch.set_rng_state(_as_byte_tensor(state["torch"]))
     if "numpy" in state:
         np.random.set_state(state["numpy"])  # type: ignore[arg-type]
     if "python" in state:
         random.setstate(state["python"])  # type: ignore[arg-type]
     if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])  # type: ignore[arg-type]
+        saved = state["cuda"]
+        # set_rng_state_all requires one state per visible device, so a resume on a
+        # machine with a different GPU count would raise deep inside torch. Skip loudly
+        # instead: the run continues, it just does not replay the exact sequence.
+        if isinstance(saved, (list, tuple)) and len(saved) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all([_as_byte_tensor(item) for item in saved])
+        else:
+            LOGGER.warning(
+                "checkpoint holds %s CUDA RNG state(s) but this machine has %d device(s); "
+                "skipping CUDA RNG restore, so the sampling sequence will not match",
+                len(saved) if isinstance(saved, (list, tuple)) else "unreadable",
+                torch.cuda.device_count(),
+            )
+    if "mps" in state and torch.backends.mps.is_available():
+        torch.mps.set_rng_state(_as_byte_tensor(state["mps"]))
+
+
+def _as_byte_tensor(value: object) -> torch.Tensor:
+    """Coerce a saved RNG state back into the CPU ``ByteTensor`` torch demands.
+
+    Necessary because checkpoints are loaded with ``map_location=<training device>``, and
+    that moves **every** storage in the payload -- including the RNG state tensors -- onto
+    the accelerator. ``torch.set_rng_state`` then rejects them:
+    ``TypeError: RNG state must be a torch.ByteTensor``. So resuming any run on MPS or
+    CUDA raised, while resuming on CPU worked; a CPU-only test cannot see the difference.
+
+    Args:
+        value: A saved RNG state, possibly living on an accelerator.
+
+    Returns:
+        The same state as a contiguous CPU ``uint8`` tensor.
+    """
+    tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+    return tensor.detach().to(device="cpu", dtype=torch.uint8).contiguous()

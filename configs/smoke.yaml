@@ -35,7 +35,9 @@ data:
   batch_size: 4
   num_workers: 0
   normalization: none
-  augment: false
+  augmentation:
+    enabled: false      # deliberately OFF: the smoke run must stay a fast check of the
+                        # loop's plumbing. tests/test_transforms.py covers augmentation.
 
 optim:
   name: adam
@@ -46,7 +48,8 @@ schedule:
   name: constant
 
 train:
-  epochs: 2
+  epochs: 2             # an epoch count, not an iteration budget, is the natural unit here
+  iterations: null
   amp: false
   val_every_n_epochs: 1
   limit_train_batches: 5    # 5 steps per epoch

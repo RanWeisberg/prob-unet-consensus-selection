@@ -39,7 +39,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, required=True, help="YAML config file")
     parser.add_argument("--resume", type=Path, default=None, help="checkpoint to continue from")
     parser.add_argument("--device", default=None, help="override run.device")
-    parser.add_argument("--epochs", type=int, default=None, help="override train.epochs")
+    budget = parser.add_mutually_exclusive_group()
+    budget.add_argument(
+        "--epochs", type=int, default=None, help="override the budget with an epoch count"
+    )
+    budget.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help="override the budget with an optimizer-step count (paper: 240000)",
+    )
     parser.add_argument("--name", default=None, help="override run.name")
     parser.add_argument("--out-dir", type=Path, default=None, help="override run.out_dir")
     parser.add_argument(
@@ -69,9 +78,18 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         run_changes["out_dir"] = args.out_dir
     if run_changes:
         config = dataclasses.replace(config, run=dataclasses.replace(config.run, **run_changes))
+    # The budget is exactly one of iterations/epochs, so an override must clear the other
+    # rather than set both -- TrainConfig rejects having both, and the point of a CLI
+    # override is to replace the configured budget, not to conflict with it.
     if args.epochs is not None:
         config = dataclasses.replace(
-            config, train=dataclasses.replace(config.train, epochs=args.epochs)
+            config,
+            train=dataclasses.replace(config.train, epochs=args.epochs, iterations=None),
+        )
+    elif args.iterations is not None:
+        config = dataclasses.replace(
+            config,
+            train=dataclasses.replace(config.train, iterations=args.iterations, epochs=None),
         )
     return config
 

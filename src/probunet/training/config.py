@@ -20,6 +20,7 @@ from typing import Any, get_args, get_origin
 import yaml
 
 from probunet.data.lidc import DataConfig
+from probunet.data.transforms import AugmentationConfig
 from probunet.losses.elbo import ElboConfig
 from probunet.model.prob_unet import ProbUNetConfig
 
@@ -144,14 +145,21 @@ class ScheduleConfig:
 class TrainConfig:
     """Training loop settings.
 
+    The budget is expressed **either** in iterations or in epochs, never both. The paper
+    states its budget in iterations (240k at batch 32, Appendix H.1), and an iteration
+    count is the quantity that is actually comparable across datasets and batch sizes --
+    an epoch count silently means something different the moment the split size changes.
+    :class:`Trainer` derives the epoch count from ``iterations`` and the train split size.
+
     Attributes:
         mode: ``"elbo"`` trains the Probabilistic U-Net itself. ``"selection_head"``
             trains the consensus-selection head on top of a **frozen** base model and
             requires ``--base-checkpoint``; the head itself is Phase 3 and not
             implemented yet.
-        epochs: Number of epochs. 100 is the proof-of-concept budget: 28,300 steps at
-            batch 32, about 11.8% of the paper's 240,000 iterations. Extendable by
-            resuming from ``last.pt``.
+        iterations: Optimizer steps to train for. The paper's LIDC budget is 240,000.
+            Mutually exclusive with ``epochs``.
+        epochs: Number of epochs, for runs where an iteration count is not the natural
+            unit (the smoke config). Mutually exclusive with ``iterations``.
         amp: Mixed precision. **CUDA only** -- see :class:`Trainer`.
         grad_clip: Optional gradient-norm clip.
         val_every_n_epochs: Validation cadence.
@@ -159,11 +167,13 @@ class TrainConfig:
         limit_val_batches: Cap on validation batches, for smoke runs.
 
     Raises:
-        ValueError: If a value is out of range.
+        ValueError: If a value is out of range, or if the budget is not given by exactly
+            one of ``iterations`` and ``epochs``.
     """
 
     mode: str = "elbo"
-    epochs: int = 100
+    iterations: int | None = None
+    epochs: int | None = 100
     amp: bool = False
     grad_clip: float | None = None
     val_every_n_epochs: int = 1
@@ -174,7 +184,16 @@ class TrainConfig:
         """Validate the training settings."""
         if self.mode not in TRAIN_MODES:
             raise ValueError(f"train.mode must be one of {TRAIN_MODES}, got {self.mode!r}")
-        if self.epochs <= 0:
+        if (self.iterations is None) == (self.epochs is None):
+            raise ValueError(
+                "set exactly one of train.iterations and train.epochs, got "
+                f"iterations={self.iterations!r} and epochs={self.epochs!r}. Expressing "
+                "the budget twice invites the two from drifting apart; a config using "
+                "iterations must set 'epochs: null' explicitly."
+            )
+        if self.iterations is not None and self.iterations <= 0:
+            raise ValueError(f"iterations must be positive, got {self.iterations}")
+        if self.epochs is not None and self.epochs <= 0:
             raise ValueError(f"epochs must be positive, got {self.epochs}")
         if self.val_every_n_epochs <= 0:
             raise ValueError(
@@ -389,6 +408,7 @@ def _build(target: Any, provided: dict[str, Any], source: str) -> Any:
 
 
 _CONFIG_TYPES = {
+    "AugmentationConfig": AugmentationConfig,
     "RunConfig": RunConfig,
     "ProbUNetConfig": ProbUNetConfig,
     "ElboConfig": ElboConfig,
@@ -426,8 +446,9 @@ def _resolve(target: Any) -> Any:
 def _coerce(annotation: Any, value: Any, source: str) -> Any:
     """Coerce a YAML scalar into the type a dataclass field expects.
 
-    Handles the cases this project actually uses: ``Path``, tuples of floats, and
-    optional ints. Anything else is passed through and validated by the dataclass.
+    Handles the cases this project actually uses: nested config dataclasses, ``Path``,
+    tuples of floats, and optional ints. Anything else is passed through and validated by
+    the dataclass.
 
     Args:
         annotation: The field's type annotation, possibly a string.
@@ -438,9 +459,15 @@ def _coerce(annotation: Any, value: Any, source: str) -> Any:
         The coerced value.
 
     Raises:
-        ValueError: If a Path or tuple field cannot be coerced.
+        ValueError: If a Path, tuple or nested section cannot be coerced.
     """
     text = annotation if isinstance(annotation, str) else getattr(annotation, "__name__", "")
+
+    # A nested config section, e.g. data.augmentation. Recursing through _build keeps
+    # unknown-key rejection working at every depth: without this the mapping would reach
+    # the dataclass as a plain dict and a typo inside it would never be caught.
+    if text in _CONFIG_TYPES and isinstance(value, dict):
+        return _build(_CONFIG_TYPES[text], value, source)
 
     if "Path" in text and value is not None:
         return Path(value)

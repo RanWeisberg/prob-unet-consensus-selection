@@ -12,6 +12,14 @@ authors' TF1 + Sonnet code. Note that its shipped `training/prob_unet_config.py`
 down-sampling steps), *not* the paper's LIDC configuration — so "what the reference
 does" sometimes means its code path rather than its config values.
 
+The same caveat applies with more force to augmentation: the repository's **only**
+augmentation code lives in `data/cityscapes/data_loader.py`, and it contains **no LIDC
+data loader at all**. Entries 8 and 12 are where that matters most.
+
+Phase 1 is a **faithful reproduction**: the architecture, the augmentation, the
+240k-iteration budget and the five-step LR decay all follow Appendix H.1. The entries
+below are what could not be matched exactly, plus the values the paper leaves unspecified.
+
 ---
 
 ## 1. Latent parameterization: log-variance instead of log-sigma
@@ -157,55 +165,59 @@ same nodule on both sides of the boundary.
 
 ---
 
-## 6. Training budget and learning-rate schedule
+## 6. Learning-rate decay: the shape is the paper's, the intermediate values are ours
+
+The budget and the schedule *shape* are no longer deviations. Phase 1 trains for the
+paper's **240,000 iterations at batch 32** and decays **1e-4 → 1e-6 in five steps**, as
+Appendix H.1 states. What remains undocumented by the paper is narrower but real.
 
 | | |
 |---|---|
-| **Ours** | 100 epochs = 28,300 steps at batch 32 = **0.91 M sample presentations**. Constant lr 1e-4 |
-| **Paper** | 240,000 iterations at batch 32 (Appendix H.1) = **7.68 M sample presentations**. lr decays **1e-4 → 1e-6 in five steps** |
-
-Our budget is **11.8%** of the paper's. Because our batch size matches the paper's,
-matching its iteration count would mean 240,000 steps = **848 epochs** ≈ 29 h on the
-MacBook's MPS backend.
-
-**Why the budget.** Three reasons, in order of weight:
-
-1. The paper trained with heavy augmentation; we have none in the baseline phase. With
-   27.5 M parameters on 9,056 patches — whose effective diversity is lower still, since
-   train averages 24.4 near-duplicate slices per series — validation loss will plateau
-   well before the paper's budget. Past that point extra epochs buy overfitting, not
-   generalization, so the sensible stopping criterion is *where val stops improving*,
-   not a step count borrowed from a differently-regularized run.
-2. Phases 2 and 3 need several flag-isolated runs before 20.08.2026.
-3. Resume support makes the choice non-binding: if validation is still improving at
-   epoch 100, continue from `last.pt`.
-
-**Why a constant learning rate.** The paper's five-step decay to 1e-6 is tuned for a
-240,000-iteration run. Compressed into ~12% of that budget it would spend most of
-training at a learning rate chosen for a regime we never reach, and it would obscure
-exactly the thing we want to read off the curve: where validation plateaus. A constant
-rate gives that read cleanly.
-
-`piecewise` is available and its milestones are **fractions of total steps**, not
-absolute step counts, so a schedule keeps its shape at any budget:
+| **Ours** | Six levels on a geometric ladder (ratio `10^(-2/5) = 0.3981` per step), equal-length plateaus at fractions `k/6` |
+| **Paper** | "an initial learning rate of 1e−4 that is lowered to 1e−6 in 5 steps" — endpoints and step count only |
+| **Reference** | `values [1e-4, 0.5e-4, 1e-5, 0.5e-6]`, `boundaries [80000, 160000, 240000]` (`training/prob_unet_config.py:112-115`) — a **Cityscapes** schedule: four levels, not five steps, and it ends *below* 1e-6 |
 
 ```yaml
-schedule:
-  name: piecewise
-  milestones: [0.2, 0.4, 0.6, 0.8]
-  values: [1.0e-4, 5.0e-5, 1.0e-5, 5.0e-6, 1.0e-6]
+milestones: [0.1666667, 0.3333333, 0.5, 0.6666667, 0.8333333]
+values: [1.0e-4, 3.9810717e-5, 1.5848932e-5, 6.3095734e-6, 2.5118864e-6, 1.0e-6]
 ```
 
-**Expected impact: moderate on final numbers, small on conclusions.** A decayed run
-would likely end at a slightly better validation loss. Since the primary comparison is
-internal — baseline vs modernized vs extension under identical budget and schedule —
-the absolute offset is held constant across every comparison that carries a claim.
+**Two judgment calls, both report content.**
+
+1. *"in 5 steps" = five decay events, hence six levels.* The alternative reading — five
+   distinct values, four decays — is defensible, and lands on a rounder 1e-5 midpoint. We
+   read "lowered … in 5 steps" as five lowering operations.
+2. *Geometric spacing, equal plateaus.* The paper fixes neither. A geometric ladder is the
+   only choice that introduces no arbitrary round numbers, and equal plateaus follow the
+   reference's own habit of evenly spaced boundaries. Note the reference's last boundary
+   (240,000) equals its total step count and so never fires — a detail worth not copying.
+
+**Milestones are fractions of total steps, not absolute step counts**, so the schedule
+keeps its shape at any budget instead of hardcoding boundaries tuned for one.
+
+### Budget rounding
+
+The loop's unit is an epoch, so an iteration budget must land on a whole number of them.
+9,056 train patches at batch 32 give **283 steps/epoch**, and 240,000 / 283 = 848.06:
+
+| rounding | epochs | steps | error |
+|---|---|---|---|
+| **nearest (ours)** | **848** | **239,984** | **−16 (−0.007%)** |
+| ceiling | 849 | 240,267 | +267 (+0.11%) |
+
+We round to nearest, which is 17× closer. The realized 239,984 is what the milestones are
+taken as fractions of, so the schedule spans exactly the run performed. The budget is
+configured as `train.iterations: 240000` and the epoch count is **derived**, so changing
+the split or the batch size cannot silently change the compute.
+
+**Expected impact: none on conclusions.** Every comparison that carries a claim
+(baseline vs ablation vs modernized vs extension) uses the identical budget and schedule.
 
 **Note on where the wrong numbers came from.** An earlier draft of this file used batch
 10 and a three-boundary decay. Both came from the authors' released
 `prob_unet_config.py`, which is the **Cityscapes** configuration (H.2), not the LIDC one
-(H.1). Recorded here because it is the same trap as the channel schedule in entry 3:
-the released config is not the paper's LIDC setup.
+(H.1). Recorded here because it is the same trap as the channel schedule in entry 3, and
+the augmentation parameters in entry 12: the released config is not the paper's LIDC setup.
 
 ---
 
@@ -257,6 +269,195 @@ because the metric is this sensitive to the convention.
 
 ---
 
+## 8. Augmentation: the paper specifies types, not one single value
+
+Appendix H.1 in full: *"We apply augmentations to the image tiles (180×180 pixels size):
+random elastic deformation, rotation, shearing, scaling and a randomly translated crop
+that results in a tile size of 128×128 pixels."* That sentence names five transforms and
+**zero numbers**. Every magnitude below therefore has a source that is *not* the paper,
+and this table is the honest accounting of which is which.
+
+| setting | value | source |
+|---|---|---|
+| transform types | elastic, rotation, shear, scale, translated crop | **Paper H.1** |
+| augment train split only | — | **Paper** ("During training") + **reference** (`do_aug=True` train, `False` val) |
+| augment *after* grader pairing | — | **Paper H.1** ("image-grader pairs are drawn randomly. We apply augmentations…") |
+| tile size for the transform | `pad_to_px: 180` | **Paper H.1** |
+| `rotation_degrees` | 22.5 | **Reference code only** — Cityscapes `angle_x = ±π/8`; rotation is resolution-independent, so it transfers |
+| `scale_range` | (0.8, 1.2) | **Reference code only** — Cityscapes `scale`; likewise resolution-independent |
+| ranges include the identity, applied p=1 | — | **Reference mechanism** (uniform ranges spanning zero, no separate per-sample probability) |
+| crop offset uniform over `[0, 52]²` | — | **Reference mechanism** (`rand_crop_dist = patch_size/2`) |
+| `shear` | 0.1 | **OURS** — absent from the paper *and* from `batchgenerators`, which has no shear parameter at all |
+| `elastic_alpha_px` / `elastic_sigma_px` | 5.0 / 10.0 | **OURS** — see below |
+| `max_redraws` | 3 | **OURS** — see entry 9 |
+| **no mirroring** | — | **Paper H.1** (absent) |
+| **no gamma / intensity** | — | **Paper H.1** (absent), and the paper says Cityscapes *"additionally* impose random color augmentations" |
+
+**Why the elastic parameters could not be transferred.** The reference uses
+`alpha=(0., 800.)`, `sigma=(25., 35.)` (`training/prob_unet_config.py:49-50`), and
+`batchgenerators` normalizes its displacement field by an **L2 norm that scales with the
+array size**. Those numbers are therefore meaningless at a different resolution — they
+are tuned for 256×512. We re-parameterize elastic strength as a **peak displacement in
+pixels**, normalizing by peak absolute value, which is interpretable, testable, and
+resolution-explicit. Strength is drawn from `(0, alpha)` so the range spans the identity,
+mirroring the reference's own mechanism for making transforms stochastic.
+
+**Why mirroring and gamma are excluded.** Both appear in the authors' released code — but
+only in `data/cityscapes/data_loader.py`, and **that repository contains no LIDC loader at
+all**. The paper's word "additionally" for Cityscapes colour augmentation settles it:
+intensity augmentation is a Cityscapes-only addition. Including either would make our
+Phase 1 *harsher* than the paper's while wearing the paper's name. Related detail not
+copied: the reference applies `GammaTransform` **outside** its `if do_aug:` branch
+(`data/cityscapes/data_loader.py:317`), so it augments its validation set too. Ours never
+transforms val or test in any configuration.
+
+**Interpolation.** Image bilinear (`order=1`), mask nearest (`order=0`). The reference
+leaves `batchgenerators`' default `order_data=3` (cubic) for the image. Bilinear is both
+what the mask/image pairing needs and safer: cubic rings outside `[0, 1]` and would break
+the dataset's range invariant, which `LidcArrays.validate` enforces.
+
+**Expected impact: significant and intended.** This is regularization the paper had and
+our earlier draft lacked. The direction to watch is `diag/gap_total`, the val−train gap.
+
+---
+
+## 9. Tiny lesions can vanish under nearest-neighbour resampling
+
+| | |
+|---|---|
+| **Ours** | A transform that empties a **non-empty** mask is redrawn up to 3 times; failing that, the sample is returned untransformed. The rate is logged |
+| **Reference / paper** | No such guard is described or implemented |
+
+**Why.** Masks are resampled with `order=0`, and the smallest non-empty mask in this
+dataset is **one pixel**. A one-pixel region can simply receive no output pixel and
+disappear. That converts a non-empty target into an empty one, which is invisible in the
+loss curve but corrupts the ambiguity buckets — and those buckets are what the extension
+slices its results by. Silence was not an acceptable failure mode, so the event is both
+guarded and counted (`train/aug_lesion_lost_fraction`, `train/aug_redraw_rate`).
+
+**Measured on the real train split** (3 epochs, 27,168 augmented samples, the shipped
+baseline settings):
+
+| quantity | value |
+|---|---|
+| lesion lost, **with** the guard | **0 / 27,168 = 0.000000** |
+| lesion lost, without the guard | 6 / 16,815 non-empty = 0.036% |
+| redraws triggered | 0.00022 per sample |
+| median mask area | 71 px before → 70 px after |
+
+So the guard is cheap (it fires on ~1 sample in 4,500, far too rarely to distort the
+transform distribution) and it takes lesion loss to exactly zero. The measurement also
+confirms `elastic_alpha_px: 5.0` and `scale_range: (0.8, 1.2)` are safe for this dataset's
+lesion sizes: no size bucket, including 1–4 px lesions (n=239), lost a single mask.
+
+---
+
+## 10. Initialization: He-normal, where the paper says orthogonal
+
+| | |
+|---|---|
+| **Ours** | `he_normal()` weights; biases from a truncated normal with σ=0.001 |
+| **Reference** | `he_normal()` weights; same bias initialization |
+| **Paper** | Appendix H.1: *"All weights of all models are initialized with **orthogonal initialization** having the gain (multiplicative factor) set to 1"* |
+
+**Why this is listed now.** It was previously filed under "Non-deviations worth
+recording" on the grounds that our code matches the released code. That is true, but it
+made the wrong comparison: the *paper* specifies orthogonal initialization and the
+released code does not implement it. Once Phase 1 is a faithful reproduction, matching the
+reference is not a defence for diverging from the paper.
+
+**Why it is not changed.** Deliberate scope decision, not an oversight. Changing
+initialization changes every run and would have to land before the long run starts;
+CLAUDE.md's rule is to raise such a call rather than fold it in silently. The bias
+initialization does match H.1 exactly.
+
+**Expected impact: small but genuinely unknown.** Orthogonal and He-normal initialization
+have similar variance scaling for these layer shapes, so the difference should wash out
+early in a 240k-iteration run. Unlike the other entries here, this one is a divergence
+from the paper we could close and chose not to — flagged prominently for that reason.
+
+---
+
+## 11. Augmentation randomness is derived, not global
+
+| | |
+|---|---|
+| **Ours** | Every augmentation draw comes from `np.random.default_rng([seed, epoch, position])` |
+| **Reference** | `MultiThreadedAugmenter` with per-worker seeds and global `np.random` inside the transforms |
+
+**Why.** Three properties fall out of deriving the generator instead of consuming a global
+one, and all three matter for a run measured in days:
+
+1. **Resume-safe with nothing stored.** The transform for a sample is a pure function of
+   `(seed, epoch, position)`, and the epoch is restored from the checkpoint, so a resumed
+   run reproduces the transforms it would have applied uninterrupted. No augmentation RNG
+   state needs to be checkpointed.
+2. **Worker-count independent.** The augmentation is identical at `num_workers=0` and
+   `num_workers=8`, so a throughput change cannot alter the data.
+3. **Decoupled from the model's sampling.** The latent `z` is drawn from the global torch
+   RNG. If augmentation shared it, adding or changing an augmentation parameter would
+   silently shift the entire `z` sequence, and two runs meant to differ in one variable
+   would differ in two.
+
+**Expected impact: none on results, large on trustworthiness.** A test asserts that
+augmenting does not advance numpy's global state.
+
+---
+
+## 12. Pre-cropped 128×128 data: the outer ring is mirrored tissue, not real CT
+
+**This is the one substantive augmentation deviation.** The paper augments a *180×180*
+tile and crops to 128×128; our preprocessed source is *already* 128×128, so there is no
+180×180 tile to crop from.
+
+| | |
+|---|---|
+| **Ours** | Reflect-pad 128→180, sample and apply the transform in the padded frame, then take a randomly translated 128 crop back out |
+| **Paper** | Transforms a real 180×180 CT tile, then takes the randomly translated 128 crop |
+
+**Why not just apply the paper's magnitudes to the 128 tile.** Because the 52-pixel margin
+is what makes those magnitudes mild, and without it the *same numbers* describe a *harsher*
+augmentation:
+
+| transform | artifact-free up to | zero-fill on a bare 128 tile |
+|---|---|---|
+| rotation ±22.5° | `180 / (cos+sin) = 137.8 px` | **13.97%** of the frame |
+| scale 0.8 | `180 × 0.8 = 144.0 px` | **36.50%** of the frame |
+| both at once | `110.2 px` | not covered even at 180 |
+
+Both bounds exceed 128, so at the paper's tile size its maximum rotation and its maximum
+shrink each produce **zero** border fill. Applying 22.5° and 0.8 to a bare 128 frame while
+calling it faithful would have been wrong twice over: harsher than the paper, and wearing
+the paper's numbers to say so. (The closed form for the rotation figure is
+`1 − 2/(1+cosθ+sinθ)`.)
+
+**What reflect-padding costs.** Two things, both accepted deliberately:
+
+1. **The outer ring is mirrored tissue rather than real anatomy.** Image *and* mask are
+   reflected through the same coordinates, so a mirrored lesion carries a mirrored label —
+   the pair stays self-consistent and nothing is mislabelled. But mirrored CT is not the
+   real neighbouring anatomy the paper's 180×180 tile contained.
+2. **At `scale < 1`, reflected copies of the lesion enter the frame.** Measured at
+   **2.05%** of non-empty training samples (area growing >1.5×). These duplicates are
+   anatomically implausible in a way real 180×180 context was not. Pinned by a test so it
+   is documented behaviour rather than a surprise.
+
+Note the third row of the table: even the paper's own 180 margin does not cover maximum
+rotation combined with scale 0.8 (110.2 < 128), so residual border fill in that corner is
+something **the paper had too**. Ours is mirrored tissue where theirs was zeros.
+
+**What is recovered.** The paper's *randomly translated crop* is reproduced rather than
+abandoned, and its rotation and scale magnitudes become usable honestly. An earlier plan
+for this project recorded "cannot reproduce the random crop" plus "constant-0 border
+wedges" as two separate deviations; reconstructing the margin replaces both with this one.
+
+**Implementation note.** The padding is never materialized. It is folded into the
+source-coordinate arithmetic and realized by sampling the original array with scipy's
+`mode="mirror"` (equivalent to `numpy.pad(mode="reflect")`), which keeps the whole
+operation to a single interpolation per array.
+
+---
+
 ## Non-deviations worth recording
 
 Things that *look* like they could differ but were checked and match:
@@ -267,10 +468,12 @@ Things that *look* like they could differ but were checked and match:
 - **f_comb hidden width = 32.** The reference passes `num_channels=num_channels[0]` to
   `Conv1x1Decoder` (`model/probabilistic_unet.py:372`), i.e. base channels, with
   `num_1x1_convs=3`. Ours matches, reading the width from `base_channels`.
-- **Initialization.** `he_normal()` weights and `truncated_normal_initializer(stddev=0.001)`
-  biases, on both. We truncate at ±2σ to match TensorFlow's semantics, since torch's
-  `trunc_normal_` bounds are absolute and its defaults would apply no truncation at
-  σ=1e-3.
+- **Bias initialization.** `truncated_normal_initializer(stddev=0.001)` on both, and
+  Appendix H.1 specifies the same. We truncate at ±2σ to match TensorFlow's semantics,
+  since torch's `trunc_normal_` bounds are absolute and its defaults would apply no
+  truncation at σ=1e-3. (**Weight** initialization matches the reference but *not* the
+  paper — moved out of this section to entry 10, because "matches the released code" is
+  not the same claim as "matches the paper".)
 - **Loss reduction.** CE summed over pixels and averaged over batch, KL summed over
   latent dims and averaged over batch, `beta = 1.0`. Matches the reference exactly; see
   `src/probunet/losses/elbo.py` for why the alternative silently redefines beta.

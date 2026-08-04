@@ -23,8 +23,9 @@ import yaml
 
 from probunet.data.lidc import DataConfig, LidcArrays, LidcDataset
 from probunet.data.splits import generate_split
+from probunet.data.transforms import AugmentationConfig
 from probunet.losses.elbo import ElboConfig
-from probunet.model.prob_unet import ProbUNetConfig
+from probunet.model.prob_unet import ProbUNet, ProbUNetConfig
 from probunet.training.checkpoint import (
     is_improvement,
     load_checkpoint,
@@ -48,7 +49,7 @@ from probunet.training.diagnostics import (
     stratified_indices,
 )
 from probunet.training.trainer import Trainer
-from probunet.utils.runtime import git_revision, select_device
+from probunet.utils.runtime import git_revision, rng_state, select_device, set_rng_state
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIGS = REPO_ROOT / "configs"
@@ -128,9 +129,97 @@ def test_shipped_baseline_config_matches_the_paper() -> None:
     assert config.optim.name == "adam"
     assert config.optim.lr == pytest.approx(1e-4)
     assert config.optim.weight_decay == pytest.approx(1e-5)
-    assert config.data.augment is False
     assert config.data.normalization == "none"
     assert config.checkpoint.monitor.startswith("val/")
+
+
+def test_shipped_baseline_config_reproduces_the_papers_augmentation() -> None:
+    """Phase 1 is only a faithful reproduction if the paper's augmentation is on.
+
+    Augmentation is the paper's own technique (Appendix H.1), so omitting it here and
+    reintroducing it later as a "modernization" would misattribute their work to us.
+    """
+    augmentation = ExperimentConfig.from_yaml(CONFIGS / "baseline.yaml").data.augmentation
+    assert augmentation.enabled is True
+    # The paper's tile size, which is what makes its rotation and scale magnitudes safe.
+    assert augmentation.pad_to_px == 180
+    assert augmentation.random_crop is True
+    assert augmentation.rotation_degrees == pytest.approx(22.5)
+    assert augmentation.scale_range == (0.8, 1.2)
+    assert augmentation.elastic_alpha_px > 0
+
+
+def test_shipped_baseline_config_uses_the_papers_budget_and_schedule() -> None:
+    """240k iterations and the five-step decay from 1e-4 to 1e-6."""
+    config = ExperimentConfig.from_yaml(CONFIGS / "baseline.yaml")
+    # The budget is expressed in iterations, as the paper states it; the epoch count is
+    # derived by the Trainer from the train split size.
+    assert config.train.iterations == 240000
+    assert config.train.epochs is None
+
+    schedule = config.schedule
+    assert schedule.name == "piecewise"
+    # "lowered to 1e-6 in 5 steps" -> five decay events, so six levels.
+    assert len(schedule.milestones) == 5
+    assert len(schedule.values) == 6
+    assert schedule.values[0] == pytest.approx(1e-4)
+    assert schedule.values[-1] == pytest.approx(1e-6)
+    # Geometric ladder: a constant ratio per step injects no arbitrary round numbers.
+    ratios = [b / a for a, b in zip(schedule.values, schedule.values[1:], strict=False)]
+    assert ratios == pytest.approx([ratios[0]] * len(ratios), rel=1e-4)
+    assert ratios[0] == pytest.approx(10 ** (-2 / 5), rel=1e-4)
+
+
+def test_shipped_ablation_differs_from_baseline_in_exactly_one_setting() -> None:
+    """The no-augmentation run is a control, so it must isolate augmentation alone."""
+    baseline = ExperimentConfig.from_yaml(CONFIGS / "baseline.yaml")
+    ablation = ExperimentConfig.from_yaml(CONFIGS / "ablation_no_augmentation.yaml")
+    assert ablation.data.augmentation.enabled is False
+    assert baseline.data.augmentation.enabled is True
+    # Everything that would confound the comparison must match.
+    assert ablation.train.iterations == baseline.train.iterations
+    assert ablation.schedule == baseline.schedule
+    assert ablation.optim == baseline.optim
+    assert ablation.model == baseline.model
+    assert ablation.loss == baseline.loss
+    assert ablation.data.batch_size == baseline.data.batch_size
+    assert ablation.run.seed == baseline.run.seed
+    assert ablation.run.name != baseline.run.name, "the run name must say what it is"
+
+
+def test_modernized_config_inherits_the_baseline_data_pipeline() -> None:
+    """Phase 2 must not also change the augmentation or the budget.
+
+    Augmentation is explicitly NOT a Phase 2 candidate: it is the paper's own method and
+    belongs to Phase 1. If modernized.yaml toggled it, a Phase-1-vs-Phase-2 comparison
+    would change more than one variable and support no claim.
+    """
+    baseline = ExperimentConfig.from_yaml(CONFIGS / "baseline.yaml")
+    modernized = ExperimentConfig.from_yaml(CONFIGS / "modernized.yaml")
+    assert modernized.data.augmentation == baseline.data.augmentation
+    assert modernized.train.iterations == baseline.train.iterations
+    assert modernized.schedule == baseline.schedule
+
+
+def test_smoke_config_disables_augmentation() -> None:
+    """The smoke run stays a fast check of the loop's plumbing."""
+    config = ExperimentConfig.from_yaml(CONFIGS / "smoke.yaml")
+    assert config.data.augmentation.enabled is False
+
+
+def test_no_shipped_config_still_uses_the_removed_augment_key() -> None:
+    """The old boolean hook is gone; a stale key must fail loudly, not be ignored."""
+    for path in sorted(CONFIGS.glob("*.yaml")):
+        raw = yaml.safe_load(path.read_text()) or {}
+        assert "augment" not in (raw.get("data") or {}), f"{path.name} uses the old key"
+
+
+def test_nested_augmentation_typos_are_rejected(tmp_path: Path) -> None:
+    """Unknown-key rejection must work at nested depth too, not only top level."""
+    path = tmp_path / "bad.yaml"
+    path.write_text("data:\n  augmentation:\n    enabled: true\n    rotation_degrese: 22.5\n")
+    with pytest.raises(ValueError, match="rotation_degrese"):
+        ExperimentConfig.from_yaml(path)
 
 
 def test_shipped_smoke_config_is_small_and_valid() -> None:
@@ -486,6 +575,333 @@ def test_resume_continues_the_same_trajectory(tiny_experiment: ExperimentConfig)
         assert torch.allclose(expected, actual.detach(), atol=1e-6), (
             "resumed run diverged from the uninterrupted one"
         )
+
+
+def test_budget_in_iterations_derives_the_epoch_count(
+    tiny_experiment: ExperimentConfig,
+) -> None:
+    """Epochs are derived from the split size, never hardcoded."""
+    config = dataclasses.replace(
+        tiny_experiment,
+        run=dataclasses.replace(tiny_experiment.run, name="iters"),
+        train=dataclasses.replace(tiny_experiment.train, epochs=None, iterations=7),
+    )
+    trainer = Trainer(config)
+    # 3 batches per epoch, so 7 iterations rounds to the nearest whole epoch: 2.
+    assert trainer.steps_per_epoch == 3
+    assert trainer.planned_epochs == round(7 / 3) == 2
+    assert trainer.total_steps == 6
+
+
+def test_iteration_budget_rounds_to_the_nearest_epoch() -> None:
+    """Nearest, not ceiling: for the real config that is a 0.007% miss, not 0.11%.
+
+    9,056 train patches at batch 32 give 283 steps/epoch, and 240,000 / 283 = 848.06.
+    Rounding to nearest yields 848 epochs = 239,984 steps (16 short); rounding up would
+    yield 849 = 240,267 (267 over). The learning-rate milestones are fractions of the
+    realized total, so the schedule spans exactly the run performed.
+    """
+    steps_per_epoch, iterations = 283, 240000
+    assert round(iterations / steps_per_epoch) == 848
+    assert 848 * steps_per_epoch == 239984
+    assert abs(239984 - iterations) < abs(849 * steps_per_epoch - iterations)
+
+
+def test_budget_must_be_given_exactly_once() -> None:
+    """Expressing the budget twice invites the two from drifting apart."""
+    with pytest.raises(ValueError, match="exactly one of train.iterations"):
+        TrainConfig(epochs=100, iterations=240000)
+    with pytest.raises(ValueError, match="exactly one of train.iterations"):
+        TrainConfig(epochs=None, iterations=None)
+    # And each on its own is fine.
+    assert TrainConfig(epochs=None, iterations=240000).iterations == 240000
+    assert TrainConfig(epochs=10).epochs == 10
+
+
+def test_five_step_decay_visits_every_level(tiny_experiment: ExperimentConfig) -> None:
+    """The paper's schedule shape: six learning rates separated by five decays."""
+    values = (1.0e-4, 3.9810717e-5, 1.5848932e-5, 6.3095734e-6, 2.5118864e-6, 1.0e-6)
+    milestones = (1 / 6, 2 / 6, 0.5, 4 / 6, 5 / 6)
+    config = dataclasses.replace(
+        tiny_experiment,
+        run=dataclasses.replace(tiny_experiment.run, name="ladder"),
+        train=dataclasses.replace(tiny_experiment.train, epochs=12),
+        optim=dataclasses.replace(tiny_experiment.optim, lr=values[0]),
+        schedule=ScheduleConfig(name="piecewise", milestones=milestones, values=values),
+    )
+    trainer = Trainer(config)
+    assert trainer.total_steps == 36
+
+    seen = []
+    for _ in range(trainer.total_steps):
+        seen.append(trainer.optimizer.param_groups[0]["lr"])
+        trainer.optimizer.step()
+        trainer.scheduler.step()
+
+    # Every configured level is actually visited, in order, and the run ends at 1e-6.
+    assert sorted(set(seen), reverse=True) == pytest.approx(sorted(values, reverse=True))
+    assert seen[0] == pytest.approx(values[0])
+    assert seen[-1] == pytest.approx(values[-1])
+    assert seen == sorted(seen, reverse=True), "the learning rate must never increase"
+    # Decays land on the fractional boundaries, not on absolute step counts.
+    assert seen[5] == pytest.approx(values[0]) and seen[6] == pytest.approx(values[1])
+
+
+def test_history_survives_a_resume(tiny_experiment: ExperimentConfig) -> None:
+    """A multi-day run may resume several times; the loss curve must not be truncated.
+
+    Without this, ``summary.json`` would hold only the epochs since the last resume and
+    the report's curve would silently start partway through.
+    """
+    first = dataclasses.replace(
+        tiny_experiment,
+        run=dataclasses.replace(tiny_experiment.run, name="hist"),
+        train=dataclasses.replace(tiny_experiment.train, epochs=2),
+    )
+    stopped = Trainer(first)
+    stopped.train()
+    assert len(stopped.history) == 2
+
+    resumed = Trainer(
+        dataclasses.replace(
+            tiny_experiment,
+            run=dataclasses.replace(tiny_experiment.run, name="hist2"),
+            train=dataclasses.replace(tiny_experiment.train, epochs=4),
+        )
+    )
+    resumed.resume(stopped.checkpoint_dir / "last.pt")
+    assert len(resumed.history) == 2, "history was not restored from the checkpoint"
+    summary = resumed.train()
+    assert len(summary["history"]) == 4
+    assert [entry["epoch"] for entry in summary["history"]] == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_augmentation_metrics_reach_the_training_record(
+    tiny_experiment: ExperimentConfig,
+) -> None:
+    """The lesion-loss counter must actually be logged, or the guard is unobservable."""
+    config = dataclasses.replace(
+        tiny_experiment,
+        run=dataclasses.replace(tiny_experiment.run, name="augmetrics"),
+        data=dataclasses.replace(
+            tiny_experiment.data,
+            augmentation=AugmentationConfig(
+                enabled=True, pad_to_px=SIZE + 4, elastic_sigma_px=2.0
+            ),
+        ),
+    )
+    trainer = Trainer(config)
+    metrics = trainer.train_epoch(0)
+    assert metrics["aug_samples"] > 0
+    assert "aug_lesion_lost_fraction" in metrics
+    assert "aug_redraw_rate" in metrics
+    # And the banner says augmentation is on, so a run cannot be mislabelled.
+    assert "augmentation  : on" in trainer.describe()
+
+
+def test_banner_flags_a_run_without_augmentation(tiny_experiment: ExperimentConfig) -> None:
+    """An ablation must announce itself; the baseline is the augmented configuration."""
+    assert "OFF - not the paper's configuration" in Trainer(tiny_experiment).describe()
+
+
+def test_banner_reports_the_derived_budget(tiny_experiment: ExperimentConfig) -> None:
+    """A multi-day run must not be a surprise, so the banner states what it will do."""
+    config = dataclasses.replace(
+        tiny_experiment,
+        run=dataclasses.replace(tiny_experiment.run, name="banner"),
+        train=dataclasses.replace(tiny_experiment.train, epochs=None, iterations=7),
+    )
+    banner = Trainer(config).describe()
+    assert "7 iterations" in banner
+    assert "planned epochs: 2" in banner
+
+
+def test_runtime_estimate_does_not_disturb_the_run(
+    tiny_experiment: ExperimentConfig,
+) -> None:
+    """The timing probe must leave the trajectory bit-identical.
+
+    It runs on a deep copy with a throwaway optimizer and restores the RNG state, so a
+    run that printed an estimate must train exactly like one that did not.
+    """
+    reference = Trainer(
+        dataclasses.replace(
+            tiny_experiment, run=dataclasses.replace(tiny_experiment.run, name="noprobe")
+        )
+    )
+    reference.train_epoch(0)
+
+    probed = Trainer(
+        dataclasses.replace(
+            tiny_experiment, run=dataclasses.replace(tiny_experiment.run, name="probe")
+        )
+    )
+    estimate = probed.estimate_seconds_per_epoch(probe_steps=2)
+    if estimate is not None:
+        assert estimate > 0
+    probed.train_epoch(0)
+
+    for expected, actual in zip(
+        reference.model.parameters(), probed.model.parameters(), strict=True
+    ):
+        assert torch.allclose(expected.detach(), actual.detach(), atol=1e-6), (
+            "the timing probe perturbed the training trajectory"
+        )
+
+
+def test_duration_formatting_is_readable() -> None:
+    """A multi-day estimate must read as days, not as 118800 seconds."""
+    assert Trainer.format_duration(45) == "45.0 s"
+    assert Trainer.format_duration(600) == "10.0 min"
+    assert Trainer.format_duration(7200) == "2.0 h"
+    assert Trainer.format_duration(118800) == "1 d 9.0 h"
+
+
+# --------------------------------------------------------------------------- #
+# RNG state: CPU, CUDA and MPS
+# --------------------------------------------------------------------------- #
+def test_rng_state_covers_every_available_backend() -> None:
+    """A resume replays the exact sequence only if every generator is captured.
+
+    ``torch.get_rng_state()`` is the CPU generator alone, but this model samples ``z`` on
+    the training device every step -- CUDA for the long run, MPS in development. Saving
+    only the CPU state silently turns "resumes exactly" into "resumes approximately".
+    """
+    state = rng_state()
+    assert {"torch", "numpy", "python"} <= set(state)
+    assert ("cuda" in state) == torch.cuda.is_available()
+    assert ("mps" in state) == torch.backends.mps.is_available()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda", "mps"])
+def test_rng_state_round_trip_reproduces_draws(device: str) -> None:
+    """Restoring the captured state must reproduce the next draw on each backend."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("no CUDA device available")
+    if device == "mps" and not torch.backends.mps.is_available():
+        pytest.skip("no MPS device available")
+
+    state = rng_state()
+    first = torch.randn(8, device=device)
+    set_rng_state(state)
+    second = torch.randn(8, device=device)
+    assert torch.equal(first, second), f"{device} RNG state was not restored"
+
+
+def accelerator() -> str | None:
+    """Return an available accelerator device string, or None.
+
+    Returns:
+        ``"cuda"``, ``"mps"`` or None.
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return None
+
+
+def test_rng_state_survives_a_device_mapped_checkpoint_load(
+    tmp_path: Path, tiny_experiment: ExperimentConfig
+) -> None:
+    """Restoring RNG state from a checkpoint loaded onto an accelerator must work.
+
+    Regression test. Checkpoints are loaded with ``map_location=<training device>``, which
+    moves *every* storage in the payload -- including the RNG state tensors -- onto the
+    accelerator, and ``torch.set_rng_state`` rejects a non-CPU tensor with
+    ``TypeError: RNG state must be a torch.ByteTensor``. Resuming on CPU worked while
+    resuming on MPS or CUDA raised, and a CPU-only test cannot tell the two apart.
+    """
+    device = accelerator()
+    if device is None:
+        pytest.skip("no accelerator available")
+
+    model = ProbUNet(tiny_experiment.model)
+    optimizer = torch.optim.Adam(model.parameters())
+    path = tmp_path / "rng.pt"
+    save_checkpoint(
+        path,
+        model=model,
+        optimizer=optimizer,
+        scheduler=None,
+        epoch=1,
+        global_step=1,
+        config={},
+        seed=0,
+        device=device,
+        monitor="val/total",
+        best_metric=None,
+        metrics={},
+    )
+    expected = torch.randn(4)
+    # restore_rng=True is the path that used to raise.
+    load_checkpoint(path, map_location=device, restore_rng=True)
+    assert torch.equal(torch.randn(4), expected)
+
+
+def test_resume_matches_uninterrupted_on_the_accelerator(
+    tiny_experiment: ExperimentConfig,
+) -> None:
+    """The exact-replay guarantee must hold on the device the long run actually uses.
+
+    The 240k-iteration run happens on an accelerator and will very likely be resumed, so
+    "resumes exactly" has to be true there and not only on CPU. Augmentation is enabled
+    here because its draws are derived from the restored epoch rather than stored.
+    """
+    device = accelerator()
+    if device is None:
+        pytest.skip("no accelerator available")
+
+    def configure(name: str, epochs: int) -> ExperimentConfig:
+        return dataclasses.replace(
+            tiny_experiment,
+            run=dataclasses.replace(tiny_experiment.run, name=name, device=device),
+            data=dataclasses.replace(
+                tiny_experiment.data,
+                augmentation=AugmentationConfig(
+                    enabled=True, pad_to_px=SIZE + 4, elastic_sigma_px=2.0
+                ),
+            ),
+            train=dataclasses.replace(tiny_experiment.train, epochs=epochs),
+        )
+
+    uninterrupted = Trainer(configure("acc_full", 4))
+    uninterrupted.train()
+    reference = [p.detach().cpu().clone() for p in uninterrupted.model.parameters()]
+
+    stopped = Trainer(configure("acc_half", 2))
+    stopped.train()
+    resumed = Trainer(configure("acc_resumed", 4))
+    resumed.resume(stopped.checkpoint_dir / "last.pt")
+    resumed.train()
+
+    for expected, actual in zip(reference, resumed.model.parameters(), strict=True):
+        assert torch.allclose(expected, actual.detach().cpu(), atol=1e-6), (
+            f"resume diverged from the uninterrupted run on {device}"
+        )
+
+
+def test_checkpoint_is_written_every_epoch(tiny_experiment: ExperimentConfig) -> None:
+    """An interruption must cost at most one epoch, which requires a save per epoch."""
+    config = dataclasses.replace(
+        tiny_experiment,
+        run=dataclasses.replace(tiny_experiment.run, name="cadence"),
+        train=dataclasses.replace(tiny_experiment.train, epochs=3, val_every_n_epochs=2),
+    )
+    trainer = Trainer(config)
+    seen: list[int] = []
+    original = trainer._checkpoint
+
+    def spy(epoch: int, record: dict[str, float]) -> None:
+        seen.append(epoch)
+        original(epoch, record)
+
+    trainer._checkpoint = spy  # type: ignore[method-assign]
+    trainer.train()
+    # Every epoch, even the ones that did not validate: last.pt is what a resume reads.
+    assert seen == [0, 1, 2]
+    state = load_checkpoint(trainer.checkpoint_dir / "last.pt", restore_rng=False)
+    assert state.epoch == 3
 
 
 def test_amp_rejected_off_cuda(tiny_experiment: ExperimentConfig) -> None:

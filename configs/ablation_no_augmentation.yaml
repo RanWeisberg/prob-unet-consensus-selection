@@ -1,0 +1,90 @@
+# ABLATION: the Phase 1 baseline with augmentation switched off.
+#
+# This is NOT the headline baseline. configs/baseline.yaml is, because augmentation is
+# the paper's own technique (Appendix H.1) and omitting it would make our "faithful
+# reproduction" claim false.
+#
+# What this config is for: quantifying what the augmentation bought. It differs from
+# configs/baseline.yaml in EXACTLY ONE setting -- data.augmentation.enabled -- so the
+# comparison isolates augmentation and nothing else. In particular it keeps the paper's
+# 240k-iteration budget and the paper's five-step decay. An earlier draft of this project
+# paired no-augmentation with a 100-epoch constant-LR budget; comparing that against
+# baseline.yaml would have confounded three variables at once and supported no claim.
+#
+#     python scripts/train.py --config configs/ablation_no_augmentation.yaml
+#
+# Expect a LARGER val-train gap than baseline: 27.5M parameters on 9,056 patches, whose
+# effective diversity is lower still (train averages 24.4 near-duplicate slices per
+# series). diag/gap_total is the number to read off.
+
+run:
+  name: ablation_no_augmentation   # the run name says what it is; do not relabel it
+  seed: 2018
+  device: auto
+  out_dir: runs
+  deterministic: true
+
+model:
+  latent_dim: 6
+  base_channels: 32
+  num_downs: 4
+  convs_per_scale: 3
+  num_classes: 2
+  image_channels: 1
+  mask_channels: 1
+  fcomb_convs: 3
+  fcomb_channels: null
+  max_channels: null
+  align_corners: false
+  bias_init_std: 0.001
+
+loss:
+  beta: 1.0
+
+data:
+  npz_path: data/processed/lidc.npz
+  split_path: data/splits/split.json
+  batch_size: 32
+  num_workers: 0
+  pin_memory: false
+  normalization: none
+  augmentation:
+    enabled: false      # <-- THE ONE DIFFERENCE from configs/baseline.yaml
+
+optim:
+  name: adam
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+schedule:
+  # Identical to baseline.yaml, so the schedule is not a second variable.
+  name: piecewise
+  milestones: [0.1666667, 0.3333333, 0.5, 0.6666667, 0.8333333]
+  values: [1.0e-4, 3.9810717e-5, 1.5848932e-5, 6.3095734e-6, 2.5118864e-6, 1.0e-6]
+
+train:
+  iterations: 240000    # identical to baseline.yaml
+  epochs: null
+  amp: false
+  grad_clip: null
+  val_every_n_epochs: 1
+  limit_train_batches: null
+  limit_val_batches: null
+
+log:
+  tensorboard: true
+  log_every_n_steps: 20
+  diagnostics_every_n_epochs: 25
+  prior_samples_for_ce: 4
+  diversity_samples: 16
+  diversity_images: 64
+  panel_images: 8
+  panel_samples: 6
+
+checkpoint:
+  save_best: true
+  save_last: true
+  monitor: val/total
+  mode: min

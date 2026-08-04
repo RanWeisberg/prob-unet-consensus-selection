@@ -1,9 +1,18 @@
-# Baseline: faithful reimplementation of the Probabilistic U-Net
+# PHASE 1 -- faithful reproduction of the Probabilistic U-Net
 # (Kohl et al., NeurIPS 2018, arXiv:1806.05034) on preprocessed LIDC-IDRI.
+#
+# Everything Appendix H.1 specifies is reproduced here: the architecture, the
+# augmentation, the 240k-iteration budget and the five-step learning-rate decay.
+# Augmentation is the PAPER'S OWN technique, so it belongs in Phase 1 -- reintroducing
+# it later as a "modernization" would credit their work to us.
 #
 # NO modernization and NO extension settings appear here. Those are separate,
 # flag-gated phases with their own configs, so that every comparison isolates
 # exactly one variable.
+#
+# This is a MULTI-DAY RUN. The startup banner prints a measured wall-clock estimate,
+# and --resume restores optimizer, scheduler, step count, RNG and history, so an
+# interruption costs at most one epoch.
 
 run:
   name: baseline
@@ -47,7 +56,41 @@ data:
   num_workers: 0        # arrays are already resident; spawn platforms would copy ~1.9 GiB per worker
   pin_memory: false     # CUDA-only optimization; set true on the RTX 3070 if it helps
   normalization: none   # images are already in [0, 1]; the paper specifies none
-  augment: false        # baseline phase has no augmentation (the paper used it heavily)
+
+  # Appendix H.1, verbatim: "We apply augmentations to the image tiles (180x180 pixels
+  # size): random elastic deformation, rotation, shearing, scaling and a randomly
+  # translated crop that results in a tile size of 128x128 pixels."
+  #
+  # The paper gives the transform TYPES but NOT ONE numeric value. Provenance of each
+  # setting below is recorded in DEVIATIONS.md entry 6 and in data/transforms.py.
+  #
+  # Note what is absent: no mirroring, no gamma/intensity. Both appear in the authors'
+  # released code, but only in its CITYSCAPES loader -- there is no LIDC loader in that
+  # repository -- and the paper says Cityscapes "additionally impose random color
+  # augmentations". Adding either would make Phase 1 harsher than the paper.
+  augmentation:
+    enabled: true
+    seed: 5034          # distinct from split (1806) and pairing (2018) seeds
+
+    # THE KEY SETTING. Our data is pre-cropped to 128x128, so there is no 180x180 tile
+    # to crop from. Applying the paper's magnitudes to a bare 128 frame is NOT faithful,
+    # it is harsher: the paper's 52px margin is exactly what absorbs them. Rotating a
+    # bare 128 tile by 22.5 deg fills 13.97% of the frame with border, and scale 0.8
+    # fills 36.50%; at 180 both are artifact-free (137.8px and 144.0px respectively).
+    # So we reflect-pad 128 -> 180, transform in that frame, and take the paper's
+    # randomly translated 128 crop back out. Cost: the outer ring is mirrored tissue
+    # rather than real CT. See DEVIATIONS.md entry 12.
+    pad_to_px: 180
+    random_crop: true
+
+    rotation_degrees: 22.5    # reference da_kwargs angle_x = +-pi/8; resolution-independent
+    scale_range: [0.8, 1.2]   # reference da_kwargs scale; resolution-independent
+    shear: 0.1                # OURS: absent from the paper AND from batchgenerators
+    elastic_alpha_px: 5.0     # OURS: peak displacement in px. The reference's (0, 800)
+    elastic_sigma_px: 10.0    # normalizes by an L2 norm that scales with array size, so
+                              # it does not transfer from 256x512 to 128x128.
+    max_redraws: 3            # a transform that empties a non-empty mask is redrawn;
+                              # watch train/aug_lesion_lost_fraction in TensorBoard
 
 optim:
   name: adam            # plain Adam, NOT AdamW. The reference applies L2 as
@@ -57,30 +100,39 @@ optim:
   eps: 1.0e-8
 
 schedule:
-  # Constant learning rate. The paper decays 1e-4 -> 1e-6 in five steps across
-  # 240,000 iterations; our budget is ~11.8% of that, which puts the decay outside
-  # its design regime, and a constant rate gives a clean read on where validation
-  # plateaus. See DEVIATIONS.md entry 6.
+  # The paper's schedule: "an initial learning rate of 1e-4 that is lowered to 1e-6 in
+  # 5 steps" (Appendix H.1). Read as FIVE lowering events, hence six levels, spaced
+  # geometrically (ratio 10^(-2/5) = 0.3981 per step) over equal-length plateaus.
   #
-  # To use the paper's shape instead, milestones are FRACTIONS of total steps so the
-  # schedule keeps its form at any budget, e.g.:
-  #   name: piecewise
-  #   milestones: [0.2, 0.4, 0.6, 0.8]
-  #   values: [1.0e-4, 5.0e-5, 1.0e-5, 5.0e-6, 1.0e-6]
-  name: constant
-  milestones: []
-  values: []
+  # The paper fixes only the two endpoints and the number of steps. The intermediate
+  # VALUES and the milestone POSITIONS are ours: the authors' released schedule is a
+  # Cityscapes one (values [1e-4, 0.5e-4, 1e-5, 0.5e-6] at boundaries [80k, 160k, 240k])
+  # and is neither five steps nor bounded below by 1e-6. A geometric ladder is the
+  # choice that injects no arbitrary round numbers. See DEVIATIONS.md entry 6.
+  #
+  # Milestones are FRACTIONS of total steps, so the schedule keeps its shape at any
+  # budget rather than hardcoding boundaries tuned for one.
+  name: piecewise
+  milestones: [0.1666667, 0.3333333, 0.5, 0.6666667, 0.8333333]
+  values: [1.0e-4, 3.9810717e-5, 1.5848932e-5, 6.3095734e-6, 2.5118864e-6, 1.0e-6]
 
 train:
-  # 100 epochs = 28,300 steps at batch 32 = 0.91M sample presentations, about 11.8%
-  # of the paper's 240,000 iterations (7.68M presentations at batch 32). Chosen
-  # because 27.5M parameters on 9,056 patches with no augmentation will plateau on
-  # validation well before the paper's budget, and because resuming from last.pt
-  # makes the choice extendable rather than final. ~3.4 h on MPS, faster on the 3070.
-  epochs: 100
+  # The paper's budget, expressed in ITERATIONS as the paper states it (Appendix H.1:
+  # 240k iterations at batch 32). The epoch count is DERIVED from the train split size
+  # rather than hardcoded -- 9,056 patches / batch 32 = 283 steps/epoch, so 240,000
+  # rounds to the nearest whole epoch at 848 epochs = 239,984 steps (16 short, 0.007%).
+  # Change the split or the batch size and the epoch count follows automatically.
+  iterations: 240000
+  epochs: null          # exactly one of iterations/epochs may be set
   amp: false            # CUDA only; raises on MPS/CPU rather than silently no-op
   grad_clip: null
-  val_every_n_epochs: 1 # 16 s per validation, so there is no reason to skip
+
+  # Kept at 1. At this budget validation costs ~16 s against a ~120 s epoch: about 13%
+  # of the run, or ~3.8 h of ~33 h. That buys a fine-grained overfitting signal and the
+  # largest possible candidate set for checkpoint selection. The genuinely expensive
+  # cadence at 848 epochs is log.diagnostics_every_n_epochs, which is why THAT was
+  # relaxed below rather than this.
+  val_every_n_epochs: 1
   limit_train_batches: null
   limit_val_batches: null
 
@@ -90,7 +142,12 @@ log:
   # The latent diagnostics matter more than the loss curve: with KL at ~0.0006% of
   # the objective the risk is an unconstrained latent whose prior never covers the
   # grader variants, which the training loss cannot show.
-  diagnostics_every_n_epochs: 5
+  #
+  # Relaxed 5 -> 25 for the paper's budget. At 848 epochs a cadence of 5 means 170 runs
+  # of the expensive diagnostics (16 prior samples over 64 images, plus a panel); 25
+  # gives ~34 sampling points, which is ample resolution for a curve that spans days.
+  # This touches no checkpoint-selection semantics.
+  diagnostics_every_n_epochs: 25
   prior_samples_for_ce: 4
   diversity_samples: 16
   diversity_images: 64  # fixed, stratified across ambiguity buckets

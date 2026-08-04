@@ -55,7 +55,20 @@ data:
   num_workers: 0
   pin_memory: false
   normalization: none
-  augment: false
+
+  # Matches the base model the head is fitted on. The head must see the same input
+  # distribution the frozen base was trained on.
+  augmentation:
+    enabled: true
+    seed: 5034
+    pad_to_px: 180
+    random_crop: true
+    rotation_degrees: 22.5
+    scale_range: [0.8, 1.2]
+    shear: 0.1
+    elastic_alpha_px: 5.0
+    elastic_sigma_px: 10.0
+    max_redraws: 3
 
 optim:
   name: adam
@@ -72,6 +85,7 @@ schedule:
 train:
   mode: selection_head    # requires --base-checkpoint
   epochs: 30              # PHASE 3: a small head on frozen features needs far less
+  iterations: null        # an epoch count is the natural unit for the head
   amp: false
   grad_clip: null
   val_every_n_epochs: 1

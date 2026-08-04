@@ -11,6 +11,7 @@ prior pass per batch, reused across four posterior passes and four ``f_comb`` pa
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from pathlib import Path
@@ -47,8 +48,10 @@ from probunet.training.diagnostics import (
 )
 from probunet.utils.runtime import (
     describe_device,
+    rng_state,
     seed_everything,
     select_device,
+    set_rng_state,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -109,7 +112,7 @@ class Trainer:
         )
 
         self.steps_per_epoch = self._steps_per_epoch()
-        self.total_steps = self.steps_per_epoch * config.train.epochs
+        self.planned_epochs, self.total_steps = self._resolve_budget()
         self.scheduler = self._build_scheduler()
         self.scaler = torch.amp.GradScaler(enabled=config.train.amp)
 
@@ -149,6 +152,139 @@ class Trainer:
         batches = len(self.data.loaders["train"])
         limit = self.config.train.limit_train_batches
         return min(batches, limit) if limit else batches
+
+    def _resolve_budget(self) -> tuple[int, int]:
+        """Turn the configured budget into an epoch count and a total step count.
+
+        The paper states its budget in iterations (240k at batch 32), so that is what the
+        config expresses and the epoch count is *derived* from the train split size rather
+        than hardcoded. An iteration budget rarely divides evenly into whole epochs, and
+        the loop's unit is an epoch, so it is rounded to the **nearest** whole epoch. For
+        the real configuration that is a far better fit than rounding up: 240,000 / 283 =
+        848.06, so nearest gives 848 epochs = 239,984 steps (16 short, 0.007%) where
+        rounding up would give 849 = 240,267 (267 over).
+
+        The realized count is what the learning-rate milestones are taken as fractions
+        of, so the schedule always spans exactly the run that is actually performed.
+
+        Returns:
+            ``(planned_epochs, total_steps)``.
+        """
+        train = self.config.train
+        if train.iterations is not None:
+            epochs = max(1, round(train.iterations / self.steps_per_epoch))
+            total = epochs * self.steps_per_epoch
+            LOGGER.info(
+                "budget: %d iterations requested -> %d epochs x %d steps = %d steps "
+                "(%+d, %+.3f%%)",
+                train.iterations,
+                epochs,
+                self.steps_per_epoch,
+                total,
+                total - train.iterations,
+                100.0 * (total - train.iterations) / train.iterations,
+            )
+            return epochs, total
+        assert train.epochs is not None  # guaranteed by TrainConfig validation
+        return train.epochs, train.epochs * self.steps_per_epoch
+
+    def estimate_seconds_per_epoch(self, probe_steps: int = 3) -> float | None:
+        """Measure the cost of a training step, without disturbing the run.
+
+        A 240k-iteration budget is a multi-day job on some of the hardware this runs on,
+        so the startup banner should say so rather than let the user discover it. The
+        measurement is a real forward/backward/step on real batches -- including the
+        augmentation cost, since that is paid in ``__getitem__`` -- but it is performed on
+        a **deep copy** of the model with a throwaway optimizer, and the global RNG state
+        is snapshotted and restored around it. Nothing about the actual trajectory
+        changes.
+
+        Batches are assembled directly from the dataset rather than drawn from the train
+        DataLoader, because iterating that loader would advance its generator and change
+        the batch order the run replays.
+
+        Args:
+            probe_steps: Steps to time. The first is discarded as warm-up (lazy kernel
+                compilation on MPS and cuDNN autotuning both land there).
+
+        Returns:
+            Estimated seconds per epoch, or None if the probe could not run -- it is a
+            convenience, so any failure is logged and swallowed rather than killing a run
+            that was about to start.
+        """
+        dataset = self.data.datasets["train"]
+        batch_size = self.config.data.batch_size
+        if len(dataset) < batch_size or probe_steps < 2:
+            return None
+
+        snapshot = rng_state()
+        try:
+            model = copy.deepcopy(self.model)
+            model.train()
+            optimizer = torch.optim.Adam(model.parameters(), lr=self.config.optim.lr)
+            durations: list[float] = []
+            for step in range(probe_steps):
+                start = step * batch_size % max(len(dataset) - batch_size, 1)
+                samples = [dataset[start + offset] for offset in range(batch_size)]
+                image = torch.stack([s["image"] for s in samples]).to(self.device)
+                mask = torch.stack([s["mask"] for s in samples]).to(self.device)
+
+                began = time.perf_counter()
+                optimizer.zero_grad(set_to_none=True)
+                output = model(image, mask)
+                terms = elbo_loss(
+                    output.logits,
+                    mask,
+                    output.posterior,
+                    output.prior,
+                    beta=self.config.loss.beta,
+                )
+                terms["total"].backward()
+                optimizer.step()
+                self._synchronize()
+                durations.append(time.perf_counter() - began)
+            # Drop the warm-up step.
+            per_step = sum(durations[1:]) / len(durations[1:])
+            return per_step * self.steps_per_epoch
+        except Exception as error:  # noqa: BLE001 - a timing estimate must never be fatal
+            LOGGER.warning("could not estimate runtime (%s); continuing without it", error)
+            return None
+        finally:
+            # The probe consumed RNG draws (latent sampling, and augmentation if it were
+            # global). Restoring makes the run's sequence identical to a run that never
+            # probed, which the reproducibility tests depend on.
+            set_rng_state(snapshot)
+            del dataset
+            self.data.datasets["train"].aug_stats.reset()
+
+    def _synchronize(self) -> None:
+        """Wait for queued accelerator work, so a timing measurement is not a lie."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        elif self.device.type == "mps":
+            torch.mps.synchronize()
+
+    @staticmethod
+    def format_duration(seconds: float) -> str:
+        """Render a duration as a human-readable string.
+
+        Args:
+            seconds: Duration in seconds.
+
+        Returns:
+            A compact string such as ``"1 d 8.4 h"`` or ``"12.3 min"``.
+        """
+        if seconds < 90:
+            return f"{seconds:.1f} s"
+        if seconds < 5400:
+            return f"{seconds / 60:.1f} min"
+        # Switch to days at 24 h, not 48 h: the paper's budget lands around 33 h on some
+        # of this project's hardware, and "1 d 9.0 h" is the phrasing that makes a
+        # multi-day commitment obvious where "33.0 h" invites a shrug.
+        if seconds < 86400:
+            return f"{seconds / 3600:.1f} h"
+        days, remainder = divmod(seconds, 86400)
+        return f"{int(days)} d {remainder / 3600:.1f} h"
 
     def _build_scheduler(self) -> torch.optim.lr_scheduler.LRScheduler:
         """Build the learning-rate schedule.
@@ -205,9 +341,24 @@ class Trainer:
             "missing is the head module, its scoring target and its training step."
         )
 
-    def describe(self) -> str:
-        """Return a startup banner: config, device, seed and provenance."""
+    def describe(self, estimate_runtime: bool = False) -> str:
+        """Return a startup banner: config, device, seed and provenance.
+
+        Args:
+            estimate_runtime: Time a few probe steps and include a projected wall-clock
+                total. Off by default so tests and short runs pay nothing for it.
+
+        Returns:
+            The banner text.
+        """
         parameters = sum(p.numel() for p in self.model.parameters())
+        train_config = self.config.train
+        budget = (
+            f"{train_config.iterations} iterations (paper: 240000)"
+            if train_config.iterations is not None
+            else f"{train_config.epochs} epochs"
+        )
+        augmentation = self.config.data.augmentation
         lines = [
             f"run           : {self.config.run.name}",
             f"mode          : {self.config.train.mode}",
@@ -218,13 +369,37 @@ class Trainer:
             + ("" if self.config.model.max_channels is None else "  [CAPPED - not baseline]"),
             f"train patches : {len(self.data.datasets['train'])}",
             f"val patches   : {len(self.data.datasets['val'])}",
+            f"augmentation  : "
+            + (
+                f"on  (pad {augmentation.pad_to_px}px, rot +-{augmentation.rotation_degrees} deg, "
+                f"scale {augmentation.scale_range}, shear +-{augmentation.shear}, "
+                f"elastic <={augmentation.elastic_alpha_px}px)"
+                if self.data.datasets["train"].augmenting
+                else "OFF - not the paper's configuration; label this run as an ablation"
+            ),
+            f"budget        : {budget}",
             f"steps/epoch   : {self.steps_per_epoch}",
+            f"planned epochs: {self.planned_epochs}",
             f"total steps   : {self.total_steps}",
             f"beta          : {self.config.loss.beta}",
             f"lr            : {self.config.optim.lr} ({self.config.schedule.name})",
+            f"validation    : every {train_config.val_every_n_epochs} epoch(s)",
+            f"diagnostics   : every {self.config.log.diagnostics_every_n_epochs} epoch(s)",
             f"monitor       : {self.config.checkpoint.monitor} ({self.config.checkpoint.mode})",
             f"run dir       : {self.run_dir}",
         ]
+
+        if estimate_runtime:
+            seconds_per_epoch = self.estimate_seconds_per_epoch()
+            if seconds_per_epoch is not None:
+                remaining = max(self.planned_epochs - self.epoch, 0)
+                training = seconds_per_epoch * remaining
+                lines += [
+                    f"measured      : {seconds_per_epoch:.1f} s/epoch "
+                    f"({seconds_per_epoch / self.steps_per_epoch * 1000:.0f} ms/step)",
+                    f"ESTIMATED RUN : {self.format_duration(training)} for {remaining} epoch(s), "
+                    "excluding validation and diagnostics",
+                ]
         return "\n".join(lines)
 
     # --------------------------------------------------------------- training
@@ -286,6 +461,9 @@ class Trainer:
 
         metrics = {key: value / max(count, 1) for key, value in totals.items()}
         metrics["seconds"] = time.perf_counter() - started
+        # Augmentation counters for the epoch just finished, then reset. Empty when the
+        # run is not augmenting, so an ablation logs nothing rather than a hollow zero.
+        metrics.update(self.data.augmentation_metrics())
         return metrics
 
     @torch.no_grad()
@@ -465,11 +643,11 @@ class Trainer:
             A summary with the best monitored value, the epoch it occurred at, and the
             per-epoch history.
         """
-        LOGGER.info("starting training\n%s", self.describe())
+        LOGGER.info("starting training\n%s", self.describe(estimate_runtime=True))
         (self.run_dir / "config.resolved.yaml").write_text(self.config.to_yaml())
 
         start_epoch = self.epoch
-        for epoch in range(start_epoch, self.config.train.epochs):
+        for epoch in range(start_epoch, self.planned_epochs):
             train_metrics = self.train_epoch(epoch)
             record = {f"train/{k}": v for k, v in train_metrics.items()}
 
@@ -477,8 +655,10 @@ class Trainer:
                 val_metrics = self.validate()
                 record.update({f"val/{k}": v for k, v in val_metrics.items()})
                 # The overfitting gap as a first-class number: 27.5M parameters on
-                # 9,056 patches with no augmentation will diverge, and the report needs
-                # the magnitude quantified rather than eyeballed off two curves.
+                # 9,056 patches is a regime where the gap is the thing to watch, and the
+                # report needs its magnitude quantified rather than eyeballed off two
+                # curves. With augmentation on, this is also how we see what the
+                # augmentation bought.
                 record["diag/gap_total"] = record["val/total"] - record["train/total"]
                 record["diag/gap_ce"] = record["val/ce"] - record["train/ce"]
 
@@ -497,6 +677,8 @@ class Trainer:
             "best_metric": self.best_metric,
             "monitor": self.config.checkpoint.monitor,
             "epochs": self.epoch,
+            "planned_epochs": self.planned_epochs,
+            "iterations_requested": self.config.train.iterations,
             "global_step": self.global_step,
             "history": self.history,
         }
@@ -522,7 +704,18 @@ class Trainer:
             for key in ("train/total", "train/ce", "train/kl", "val/total", "diag/gap_total")
             if key in record
         )
-        LOGGER.info("epoch %d/%d %s", epoch + 1, self.config.train.epochs, summary)
+        # A live ETA from the epochs actually observed. On a multi-day run this is the
+        # number that matters more than the startup estimate, because it includes
+        # validation and diagnostics as they really fall.
+        # _log_epoch runs before the record is appended to history, so include it here to
+        # get an ETA from the very first epoch rather than the second.
+        eta = ""
+        elapsed = [entry.get("train/seconds", 0.0) for entry in self.history[-9:]]
+        elapsed.append(record.get("train/seconds", 0.0))
+        if any(elapsed) and self.planned_epochs > epoch + 1:
+            mean_seconds = sum(elapsed) / len(elapsed)
+            eta = f" eta={self.format_duration(mean_seconds * (self.planned_epochs - epoch - 1))}"
+        LOGGER.info("epoch %d/%d %s%s", epoch + 1, self.planned_epochs, summary, eta)
 
     def _checkpoint(self, epoch: int, record: dict[str, float]) -> None:
         """Save last, and best when the monitored metric improves.
@@ -545,6 +738,9 @@ class Trainer:
             "monitor": policy.monitor,
             "metrics": {k: v for k, v in record.items()},
             "loader_generator_state": generator.get_state() if generator is not None else None,
+            # The record for this epoch is appended to self.history after _log_epoch but
+            # before _checkpoint, so history already includes it.
+            "history": self.history,
         }
         if policy.save_last:
             save_checkpoint(
@@ -565,8 +761,24 @@ class Trainer:
     def resume(self, path: Path) -> None:
         """Restore a run from a checkpoint, continuing the exact sequence.
 
+        Everything a continuation depends on is restored: weights, optimizer moments, the
+        scheduler's position, the epoch and step counters, the best-so-far metric, the
+        per-epoch history, the DataLoader's shuffle generator and the RNG state of every
+        backend. Because a checkpoint is written at the end of every epoch, an
+        interruption costs at most one epoch of work.
+
+        The augmentation needs nothing stored: its draws are derived from
+        ``(seed, epoch, position)``, and the epoch is restored here, so a resumed run
+        reproduces the same transforms it would have applied uninterrupted.
+
         Args:
             path: Checkpoint file, normally ``last.pt``.
+
+        Warns:
+            If the checkpoint was written on a different device, or under a different
+            planned budget. Both silently change what a "continued" run means: seeds do
+            not reproduce across backends, and the learning-rate milestones are fractions
+            of the total step count.
         """
         state = load_checkpoint(
             path,
@@ -579,18 +791,45 @@ class Trainer:
         self.epoch = state.epoch
         self.global_step = state.global_step
         self.best_metric = state.best_metric
+        self.history = list(state.history)
         from probunet.training.checkpoint import loader_generator_state
 
         saved = loader_generator_state(path)
         generator = self.data.loaders["train"].generator
         if saved is not None and generator is not None:
             generator.set_state(saved)
+
+        if state.device != str(self.device):
+            LOGGER.warning(
+                "checkpoint was written on %s but this run is on %s: the sampling "
+                "sequence will not match, and numbers from before and after this resume "
+                "are not strictly comparable",
+                state.device,
+                self.device,
+            )
+        saved_train = state.config.get("train", {})
+        if saved_train.get("iterations") != self.config.train.iterations or saved_train.get(
+            "epochs"
+        ) != self.config.train.epochs:
+            LOGGER.warning(
+                "budget changed across the resume (checkpoint: iterations=%s epochs=%s; "
+                "now: iterations=%s epochs=%s). Learning-rate milestones are fractions of "
+                "the total step count, so the schedule shape has shifted.",
+                saved_train.get("iterations"),
+                saved_train.get("epochs"),
+                self.config.train.iterations,
+                self.config.train.epochs,
+            )
         LOGGER.info(
-            "resumed from %s at epoch %d (step %d, best %s=%s, git %s)",
+            "resumed from %s at epoch %d/%d (step %d/%d, best %s=%s, %d history entries, "
+            "git %s)",
             path,
             state.epoch,
+            self.planned_epochs,
             state.global_step,
+            self.total_steps,
             state.monitor,
             state.best_metric,
+            len(self.history),
             state.git_revision,
         )

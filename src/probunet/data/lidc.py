@@ -28,12 +28,19 @@ posterior input               ``float32`` cast inside ``PosteriorNet``
 
 **No normalization is applied.** The images are already in [0, 1] (see the Stage 0
 findings) and the paper specifies no further normalization, so they are passed through
-unchanged. :class:`DataConfig` exposes ``normalization`` and ``augment`` hooks that
-*raise* rather than silently no-op, so a future phase cannot mistake "off" for "on".
+unchanged. :class:`DataConfig` exposes a ``normalization`` hook that *raises* rather than
+silently no-ops, so a future phase cannot mistake "off" for "on".
+
+**Augmentation is applied to the training split only**, and only when
+``data.augmentation.enabled`` is set. Validation and test are returned untransformed in
+every configuration, so a val/test number is never a function of the augmentation
+settings. See :mod:`probunet.data.transforms` for the paper's specification and for what
+we could and could not reproduce.
 """
 
 from __future__ import annotations
 
+import logging
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +58,13 @@ from probunet.data.splits import (
     load_split,
     nonempty_masks_per_patch,
 )
+from probunet.data.transforms import (
+    AugmentationConfig,
+    AugmentationStats,
+    augment_pair,
+)
+
+LOGGER = logging.getLogger(__name__)
 
 DEFAULT_NPZ_PATH = Path("data/processed/lidc.npz")
 
@@ -81,16 +95,16 @@ class DataConfig:
             why more is rarely useful here.
         pin_memory: CUDA-only optimization; leave False on MPS and CPU.
         pairing_seed: Seed for the random grader pairing.
-        normalization: Must be ``"none"`` in the baseline phase.
-        augment: Must be False in the baseline phase.
+        normalization: Must be ``"none"``; the paper specifies none.
+        augmentation: Training-split augmentation. Disabled by default; enabled in
+            ``configs/baseline.yaml``, which is the paper's own configuration.
         validate_on_load: Check dtypes, ranges and binarity when loading.
         drop_last: Drop a trailing partial training batch.
 
     Raises:
-        NotImplementedError: If ``normalization`` is not ``"none"`` or ``augment`` is
-            True. Both are deliberate hooks for the modernization phase; failing
-            loudly stops a future caller from believing they are active when the
-            baseline ignores them.
+        NotImplementedError: If ``normalization`` is not ``"none"``. It is a deliberate
+            hook for the modernization phase; failing loudly stops a future caller from
+            believing it is active when nothing applies it.
         ValueError: If ``batch_size`` or ``num_workers`` is invalid.
     """
 
@@ -101,7 +115,7 @@ class DataConfig:
     pin_memory: bool = False
     pairing_seed: int = DEFAULT_PAIRING_SEED
     normalization: str = "none"
-    augment: bool = False
+    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
     validate_on_load: bool = True
     drop_last: bool = False
 
@@ -114,10 +128,16 @@ class DataConfig:
                 "specifies no further normalization. Add it as a flag-gated change "
                 "in the modernization phase."
             )
-        if self.augment:
-            raise NotImplementedError(
-                "augmentation is not implemented in the baseline phase. See the "
-                "AUGMENTATION HOOK in LidcDataset.__getitem__."
+        if self.augmentation.enabled and self.num_workers > 0:
+            # The augmentation counters live in whichever process runs __getitem__, so
+            # with workers the parent would read zeros and a lesion-loss problem would
+            # look like a clean run. The augmentation itself is still correct.
+            LOGGER.warning(
+                "num_workers=%d with augmentation enabled: the augmentation counters "
+                "(aug_lesion_lost_fraction, aug_redraw_rate) are accumulated per worker "
+                "and will read as zero in the training log. Use num_workers=0 to see "
+                "them.",
+                self.num_workers,
             )
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {self.batch_size}")
@@ -361,6 +381,7 @@ class LidcDataset(Dataset):
         mode: Mode = "train",
         pairing_seed: int = DEFAULT_PAIRING_SEED,
         epoch: int = 0,
+        augmentation: AugmentationConfig | None = None,
     ) -> None:
         """Build the dataset.
 
@@ -371,17 +392,30 @@ class LidcDataset(Dataset):
             pairing_seed: Seed for the grader pairing.
             epoch: Initial epoch, so a train dataset is usable before the first
                 :meth:`set_epoch` call.
+            augmentation: Augmentation settings. Only meaningful in ``"train"`` mode;
+                passing an *enabled* config with ``mode="eval"`` is an error rather than
+                a silent no-op, because a transformed validation set would invalidate
+                every checkpoint-selection decision.
 
         Raises:
-            ValueError: If ``mode`` is unknown or ``indices`` are out of range.
+            ValueError: If ``mode`` is unknown, ``indices`` are out of range, or
+                augmentation is enabled on an evaluation dataset.
         """
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+        if augmentation is not None and augmentation.enabled and mode != "train":
+            raise ValueError(
+                f"augmentation is enabled on a mode={mode!r} dataset. Only the training "
+                "split may be augmented: validation and test must stay untransformed or "
+                "their numbers stop being comparable across configurations."
+            )
         self.arrays = arrays
         self.indices = np.asarray(indices, dtype=np.int64)
         self.mode = mode
         self.pairing_seed = pairing_seed
         self.epoch = epoch
+        self.augmentation = augmentation
+        self.aug_stats = AugmentationStats()
         if self.indices.size and (
             self.indices.min() < 0 or self.indices.max() >= len(arrays)
         ):
@@ -392,6 +426,15 @@ class LidcDataset(Dataset):
         self._graders: np.ndarray | None = None
         if mode == "train":
             self.set_epoch(epoch)
+
+    @property
+    def augmenting(self) -> bool:
+        """Whether this dataset actually transforms its samples."""
+        return (
+            self.mode == "train"
+            and self.augmentation is not None
+            and self.augmentation.enabled
+        )
 
     def __len__(self) -> int:
         """Number of patches in this split."""
@@ -454,27 +497,38 @@ class LidcDataset(Dataset):
             ``image``, ``masks`` (4, H, W) uint8 and ``index``.
         """
         row = int(self.indices[position])
-        # .copy() detaches the sample from the shared arrays: torch.from_numpy would
-        # otherwise return a view, and any future in-place transform would silently
-        # corrupt the dataset for every other split.
-        image = torch.from_numpy(self.arrays.images[row].copy()).unsqueeze(0)
+        sample: dict[str, Tensor] = {"index": torch.tensor(row, dtype=torch.int64)}
 
-        # AUGMENTATION HOOK (modernization phase): apply paired image/mask transforms
-        # here, on `image` together with the mask selected below. Nothing is applied
-        # in the baseline; DataConfig.augment raises if it is switched on.
-
-        sample: dict[str, Tensor] = {
-            "image": image,
-            "index": torch.tensor(row, dtype=torch.int64),
-        }
         if self.mode == "train":
             grader = int(self.graders[position])
+            image_array = self.arrays.images[row]
+            mask_array = self.arrays.masks[row, grader]
+            if self.augmenting:
+                # Augment AFTER the grader pairing, so the posterior net receives a
+                # consistent (augmented image, augmented mask) pair. Both go through one
+                # shared coordinate map inside augment_pair, which is what keeps them
+                # registered. map_coordinates always allocates, so no .copy() is needed.
+                assert self.augmentation is not None  # narrowed by self.augmenting
+                image_array, mask_array, outcome = augment_pair(
+                    image_array,
+                    mask_array,
+                    self.augmentation,
+                    epoch=self.epoch,
+                    position=position,
+                )
+                self.aug_stats.record(outcome)
+            else:
+                # .copy() detaches the sample from the shared arrays: torch.from_numpy
+                # would otherwise return a view, and an in-place edit downstream would
+                # silently corrupt the dataset for every other split.
+                image_array, mask_array = image_array.copy(), mask_array.copy()
+            sample["image"] = torch.from_numpy(image_array).unsqueeze(0)
             # int64 because nn.CrossEntropyLoss takes class indices, not one-hot.
-            sample["mask"] = torch.from_numpy(
-                self.arrays.masks[row, grader].astype(np.int64)
-            )
+            sample["mask"] = torch.from_numpy(mask_array.astype(np.int64))
             sample["grader"] = torch.tensor(grader, dtype=torch.int64)
         else:
+            # Never augmented, in any configuration: see __init__.
+            sample["image"] = torch.from_numpy(self.arrays.images[row].copy()).unsqueeze(0)
             # uint8 as stored: the metrics convert to bool themselves, and an
             # intermediate float cast would be pure waste.
             sample["masks"] = torch.from_numpy(self.arrays.masks[row].copy())
@@ -512,12 +566,27 @@ class LidcData:
     config: DataConfig
 
     def set_epoch(self, epoch: int) -> None:
-        """Redraw the training pairing for a new epoch.
+        """Redraw the training pairing, and the augmentation draw, for a new epoch.
 
         Args:
             epoch: Epoch index.
         """
         self.datasets["train"].set_epoch(epoch)
+
+    def augmentation_metrics(self, reset: bool = True) -> dict[str, float]:
+        """Collect and optionally clear the training split's augmentation counters.
+
+        Args:
+            reset: Zero the counters afterwards, so each epoch reports its own rates.
+
+        Returns:
+            Augmentation scalars, or an empty mapping when nothing was augmented.
+        """
+        train = self.datasets["train"]
+        metrics = train.aug_stats.as_metrics()
+        if reset:
+            train.aug_stats.reset()
+        return metrics
 
     def nonempty_counts(self, indices: np.ndarray) -> np.ndarray:
         """Ambiguity bucket per patch for arbitrary global indices.
@@ -564,6 +633,9 @@ def build_data(config: DataConfig | None = None) -> LidcData:
             split.indices[name],
             mode="train" if name == "train" else "eval",
             pairing_seed=config.pairing_seed,
+            # Train only. Val and test are constructed with no augmentation at all, so
+            # there is no code path by which a transform could reach them.
+            augmentation=config.augmentation if name == "train" else None,
         )
         for name in SPLIT_NAMES
     }

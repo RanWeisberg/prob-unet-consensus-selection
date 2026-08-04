@@ -12,6 +12,7 @@ between splits.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from probunet.data.lidc import (
     nonempty_grader_counts,
 )
 from probunet.data.splits import SPLIT_NAMES, generate_split, load_split
+from probunet.data.transforms import AugmentationConfig
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_NPZ = REPO_ROOT / "data" / "processed" / "lidc.npz"
@@ -180,10 +182,151 @@ def test_normalization_hook_raises() -> None:
         DataConfig(normalization="standardize")
 
 
-def test_augment_hook_raises() -> None:
-    """The augmentation hook refuses to silently no-op."""
-    with pytest.raises(NotImplementedError, match="augmentation"):
-        DataConfig(augment=True)
+# --------------------------------------------------------------------------- #
+# Augmentation reaches the train split and only the train split
+# --------------------------------------------------------------------------- #
+def augmenting_config(base: DataConfig) -> DataConfig:
+    """Enable augmentation on a config, scaled to the synthetic tile size.
+
+    Args:
+        base: The configuration to modify.
+
+    Returns:
+        A copy with augmentation enabled.
+    """
+    return dataclasses.replace(
+        base,
+        augmentation=AugmentationConfig(enabled=True, pad_to_px=SIZE + 4, elastic_sigma_px=2.0),
+    )
+
+
+def test_augmentation_is_off_by_default(tiny: DataConfig) -> None:
+    """The default configuration augments nothing, so an ablation is the default."""
+    assert tiny.augmentation.enabled is False
+    assert build_data(tiny).datasets["train"].augmenting is False
+
+
+def test_augmentation_changes_the_train_split(tiny: DataConfig) -> None:
+    """With the flag on, training samples really are transformed."""
+    plain = build_data(tiny).datasets["train"]
+    augmented = build_data(augmenting_config(tiny)).datasets["train"]
+    assert augmented.augmenting is True
+
+    differences = sum(
+        not np.array_equal(plain[position]["image"], augmented[position]["image"])
+        for position in range(len(plain))
+    )
+    assert differences > len(plain) // 2, (
+        f"only {differences}/{len(plain)} train images changed; augmentation is not active"
+    )
+
+
+def test_disabled_augmentation_is_bit_identical_to_the_current_behaviour(
+    tiny: DataConfig,
+) -> None:
+    """The flag off must reproduce the pre-augmentation pipeline exactly.
+
+    This is what makes ``configs/ablation_no_augmentation.yaml`` a valid control: with
+    the flag down, nothing about the data path changes.
+    """
+    data = build_data(tiny)
+    dataset = data.datasets["train"]
+    for position in range(len(dataset)):
+        sample = dataset[position]
+        row = int(sample["index"])
+        grader = int(sample["grader"])
+        assert np.array_equal(sample["image"].numpy()[0], data.arrays.images[row])
+        assert np.array_equal(
+            sample["mask"].numpy(), data.arrays.masks[row, grader].astype(np.int64)
+        )
+
+
+@pytest.mark.parametrize("split", ["val", "test"])
+def test_val_and_test_are_never_augmented(tiny: DataConfig, split: str) -> None:
+    """Validation and test stay untransformed even with augmentation switched on.
+
+    A transformed validation set would silently invalidate every checkpoint-selection
+    decision and make val numbers a function of the augmentation settings.
+    """
+    data = build_data(augmenting_config(tiny))
+    dataset = data.datasets[split]
+    assert dataset.augmenting is False
+    assert dataset.augmentation is None
+    for position in range(len(dataset)):
+        sample = dataset[position]
+        row = int(sample["index"])
+        assert np.array_equal(sample["image"].numpy()[0], data.arrays.images[row])
+        assert np.array_equal(sample["masks"].numpy(), data.arrays.masks[row])
+
+
+def test_enabling_augmentation_on_an_eval_dataset_is_an_error(tiny: DataConfig) -> None:
+    """Constructing the wrong thing must fail loudly rather than transform val."""
+    arrays = LidcArrays.load(tiny.npz_path)
+    with pytest.raises(ValueError, match="Only the training split may be augmented"):
+        LidcDataset(
+            arrays,
+            np.arange(4),
+            mode="eval",
+            augmentation=AugmentationConfig(enabled=True, pad_to_px=SIZE + 4),
+        )
+
+
+def test_augmented_masks_stay_binary_and_images_stay_in_range(tiny: DataConfig) -> None:
+    """The dtype and range contract survives augmentation, across several epochs."""
+    dataset = build_data(augmenting_config(tiny)).datasets["train"]
+    for epoch in range(4):
+        dataset.set_epoch(epoch)
+        for position in range(len(dataset)):
+            sample = dataset[position]
+            mask = sample["mask"].numpy()
+            image = sample["image"].numpy()
+            assert sample["mask"].dtype == torch.int64
+            assert set(np.unique(mask)).issubset({0, 1}), np.unique(mask)
+            assert sample["image"].dtype == torch.float32
+            assert image.min() >= 0.0 and image.max() <= 1.0
+
+
+def test_augmentation_is_reproducible_across_datasets(tiny: DataConfig) -> None:
+    """Two datasets built from the same config emit identical augmented samples."""
+    first = build_data(augmenting_config(tiny)).datasets["train"]
+    second = build_data(augmenting_config(tiny)).datasets["train"]
+    for position in range(len(first)):
+        assert np.array_equal(first[position]["image"], second[position]["image"])
+        assert np.array_equal(first[position]["mask"], second[position]["mask"])
+
+
+def test_augmentation_redraws_each_epoch(tiny: DataConfig) -> None:
+    """A new epoch must draw new transforms, not repeat the previous ones."""
+    dataset = build_data(augmenting_config(tiny)).datasets["train"]
+    dataset.set_epoch(0)
+    first = [dataset[p]["image"].clone() for p in range(len(dataset))]
+    dataset.set_epoch(1)
+    second = [dataset[p]["image"] for p in range(len(dataset))]
+    assert any(not torch.equal(a, b) for a, b in zip(first, second, strict=True))
+
+
+def test_augmentation_counters_are_reported_and_reset(tiny: DataConfig) -> None:
+    """The lesion-loss counter is the only signal that augmentation is misbehaving."""
+    data = build_data(augmenting_config(tiny))
+    assert data.augmentation_metrics() == {}, "nothing augmented yet"
+
+    dataset = data.datasets["train"]
+    for position in range(len(dataset)):
+        dataset[position]
+    metrics = data.augmentation_metrics()
+    assert metrics["aug_samples"] == len(dataset)
+    assert 0.0 <= metrics["aug_lesion_lost_fraction"] <= 1.0
+    # Reset, so each epoch reports its own rate rather than a running total.
+    assert data.augmentation_metrics() == {}
+
+
+def test_no_augmentation_means_no_counters(tiny: DataConfig) -> None:
+    """An ablation run must log nothing rather than a misleading zero."""
+    data = build_data(tiny)
+    dataset = data.datasets["train"]
+    for position in range(len(dataset)):
+        dataset[position]
+    assert data.augmentation_metrics() == {}
 
 
 def test_config_validates_numbers() -> None:

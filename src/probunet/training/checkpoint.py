@@ -47,6 +47,7 @@ class CheckpointState:
         git_revision: Revision the run was launched from.
         device: Device string the run used, for the cross-backend caveat.
         metrics: Metrics recorded at save time.
+        history: Per-epoch metric records from the start of the run.
     """
 
     epoch: int
@@ -58,6 +59,7 @@ class CheckpointState:
     git_revision: str
     device: str
     metrics: dict[str, float]
+    history: list[dict[str, float]]
 
 
 def save_checkpoint(
@@ -74,6 +76,7 @@ def save_checkpoint(
     best_metric: float | None,
     metrics: dict[str, float],
     loader_generator_state: torch.Tensor | None = None,
+    history: list[dict[str, float]] | None = None,
 ) -> None:
     """Write a checkpoint atomically.
 
@@ -95,6 +98,10 @@ def save_checkpoint(
         metrics: Metrics at save time.
         loader_generator_state: State of the training DataLoader's generator, so a
             resume replays the same batch order.
+        history: Per-epoch metrics so far. Carried in the checkpoint because a run
+            spanning days may be resumed several times, and without it ``summary.json``
+            would hold only the epochs since the last resume -- a loss curve silently
+            truncated to its own tail.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +119,7 @@ def save_checkpoint(
         "device": device,
         "git_revision": git_revision(),
         "metrics": metrics,
+        "history": list(history or []),
         "rng": rng_state(),
         "loader_generator": loader_generator_state,
         "torch_version": torch.__version__,
@@ -176,6 +184,7 @@ def load_checkpoint(
         git_revision=str(payload.get("git_revision", "unknown")),
         device=str(payload.get("device", "unknown")),
         metrics=dict(payload.get("metrics", {})),
+        history=list(payload.get("history", [])),
     )
 
 

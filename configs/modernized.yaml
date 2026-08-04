@@ -17,6 +17,10 @@
 #   - GroupNorm or InstanceNorm in place of no normalization.
 #   - KL annealing / free bits against posterior collapse.
 #
+# NOT a candidate: data augmentation. It is the paper's own method (Appendix H.1) and
+# belongs to the Phase 1 baseline. Claiming it as a Phase 2 "modernization" would
+# misattribute the authors' work to us.
+#
 # Everything below is identical to configs/baseline.yaml. Diff the two files: the only
 # lines that should ever differ are the flags under test.
 
@@ -51,7 +55,22 @@ data:
   num_workers: 0
   pin_memory: false
   normalization: none     # PHASE 2 candidate; raises today if changed
-  augment: false          # PHASE 2 candidate; raises today if changed
+
+  # MUST match configs/baseline.yaml. Augmentation is the PAPER'S technique and is part
+  # of the Phase 1 baseline, so it is NOT a Phase 2 candidate and must not be toggled
+  # here -- doing so would confound the modernization comparison with the augmentation
+  # ablation. Keep this block byte-identical to baseline.yaml.
+  augmentation:
+    enabled: true
+    seed: 5034
+    pad_to_px: 180
+    random_crop: true
+    rotation_degrees: 22.5
+    scale_range: [0.8, 1.2]
+    shear: 0.1
+    elastic_alpha_px: 5.0
+    elastic_sigma_px: 10.0
+    max_redraws: 3
 
 optim:
   name: adam
@@ -61,13 +80,16 @@ optim:
   eps: 1.0e-8
 
 schedule:
-  name: constant
-  milestones: []
-  values: []
+  # Identical to baseline.yaml: the paper's five-step decay. Same reason as the data
+  # block -- the schedule is part of the baseline, not a Phase 2 variable.
+  name: piecewise
+  milestones: [0.1666667, 0.3333333, 0.5, 0.6666667, 0.8333333]
+  values: [1.0e-4, 3.9810717e-5, 1.5848932e-5, 6.3095734e-6, 2.5118864e-6, 1.0e-6]
 
 train:
   mode: elbo
-  epochs: 100             # same budget as baseline, or the comparison is confounded
+  iterations: 240000      # same budget as baseline, or the comparison is confounded
+  epochs: null
   amp: false
   grad_clip: null
   val_every_n_epochs: 1
@@ -77,7 +99,7 @@ train:
 log:
   tensorboard: true
   log_every_n_steps: 20
-  diagnostics_every_n_epochs: 5
+  diagnostics_every_n_epochs: 25
   prior_samples_for_ce: 4
   diversity_samples: 16
   diversity_images: 64
