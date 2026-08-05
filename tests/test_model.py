@@ -23,6 +23,7 @@ from torch.distributions import kl_divergence
 from probunet.model import (
     ConvBlock,
     FComb,
+    LatentStats,
     PosteriorNet,
     PriorNet,
     ProbUNet,
@@ -151,11 +152,13 @@ def test_unet_uses_average_pooling_and_no_norm_layers() -> None:
 
 
 def test_latent_encoder_shapes() -> None:
-    """Both encoders emit (mu, logvar) of shape (B, latent_dim)."""
+    """Both encoders emit mu and logvar of shape (B, latent_dim)."""
     prior = PriorNet(image_channels=1, latent_dim=LATENT_DIM)
-    mu, logvar = prior(torch.zeros(BATCH, 1, SIZE, SIZE))
-    assert mu.shape == (BATCH, LATENT_DIM)
-    assert logvar.shape == (BATCH, LATENT_DIM)
+    stats = prior(torch.zeros(BATCH, 1, SIZE, SIZE))
+    assert stats.mu.shape == (BATCH, LATENT_DIM)
+    assert stats.logvar.shape == (BATCH, LATENT_DIM)
+    assert stats.sigma.shape == (BATCH, LATENT_DIM)
+    assert stats.latent_dim == LATENT_DIM
 
     distribution = prior.distribution(torch.zeros(BATCH, 1, SIZE, SIZE))
     assert distribution.batch_shape == (BATCH,)
@@ -425,15 +428,19 @@ def test_scale_is_exp_half_logvar(model: ProbUNet, batch: tuple[torch.Tensor, to
     image, mask = batch
     encoded = model.encode(image, mask)
 
-    mu, logvar = encoded.prior_stats
-    assert torch.allclose(encoded.prior.base_dist.loc, mu)
-    assert torch.allclose(encoded.prior.base_dist.scale, torch.exp(0.5 * logvar))
+    prior_stats = encoded.prior_stats
+    assert torch.allclose(encoded.prior.base_dist.loc, prior_stats.mu)
+    assert torch.allclose(
+        encoded.prior.base_dist.scale, torch.exp(0.5 * prior_stats.logvar)
+    )
+    # And the container's own convenience property agrees with the arithmetic.
+    assert torch.equal(prior_stats.sigma, torch.exp(0.5 * prior_stats.logvar))
 
     assert encoded.posterior_stats is not None
-    post_mu, post_logvar = encoded.posterior_stats
-    assert torch.allclose(encoded.posterior.base_dist.loc, post_mu)
+    posterior_stats = encoded.posterior_stats
+    assert torch.allclose(encoded.posterior.base_dist.loc, posterior_stats.mu)
     assert torch.allclose(
-        encoded.posterior.base_dist.scale, torch.exp(0.5 * post_logvar)
+        encoded.posterior.base_dist.scale, torch.exp(0.5 * posterior_stats.logvar)
     )
 
 
@@ -446,7 +453,7 @@ def test_logvar_can_be_negative_and_scale_stays_positive() -> None:
     prior = PriorNet(image_channels=1, latent_dim=LATENT_DIM)
     mu = torch.zeros(1, LATENT_DIM)
     logvar = torch.full((1, LATENT_DIM), -8.0)
-    distribution = prior.distribution_from_stats(mu, logvar)
+    distribution = prior.distribution_from_stats(LatentStats(mu=mu, logvar=logvar))
     assert torch.all(distribution.base_dist.scale > 0)
     assert torch.allclose(
         distribution.base_dist.scale, torch.full((1, LATENT_DIM), float(np.exp(-4.0)))

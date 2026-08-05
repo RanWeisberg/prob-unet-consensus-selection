@@ -14,15 +14,54 @@ to get it wrong:
 
 Log-variance is parameterized rather than sigma, so ``scale = exp(0.5 * logvar)``.
 This keeps the scale positive without a clamp and keeps gradients well behaved.
+
+The predicted parameters travel as a :class:`LatentStats` rather than a bare tuple, so
+that adding a covariance factor later is a new *field* rather than a change of arity at
+every call site.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
 from torch.distributions import Independent, Normal
 
 from probunet.model.unet import ConvBlock, channel_widths
+
+
+@dataclass(frozen=True)
+class LatentStats:
+    """The raw parameters a latent encoder predicts.
+
+    A named container rather than a tuple. The parameters are consumed in four places
+    (distribution construction, the sigma diagnostics, the latent-stats logging and the
+    tests), and a tuple whose length depends on a config flag would make the arity
+    implicit at every one of them -- including four ``*stats`` star-unpacks.
+
+    Attributes:
+        mu: Means of shape ``(B, latent_dim)``.
+        logvar: Log-variances of shape ``(B, latent_dim)``. Log-variance rather than
+            sigma or log-sigma; see DEVIATIONS.md entry 1.
+    """
+
+    mu: Tensor
+    logvar: Tensor
+
+    @property
+    def sigma(self) -> Tensor:
+        """Standard deviations, ``exp(0.5 * logvar)``.
+
+        Positive by construction with no clamp, which is the reason for parameterizing
+        the log-variance.
+        """
+        return torch.exp(0.5 * self.logvar)
+
+    @property
+    def latent_dim(self) -> int:
+        """Dimensionality ``N`` of the latent space."""
+        return int(self.mu.shape[-1])
 
 
 class LatentEncoder(nn.Module):
@@ -76,14 +115,15 @@ class LatentEncoder(nn.Module):
         """The first convolution, whose ``in_channels`` distinguishes the two roles."""
         return self.blocks[0].block[0]
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor) -> LatentStats:
         """Predict the Gaussian parameters for an already-assembled input.
 
         Args:
             x: Input of shape ``(B, in_channels, H, W)``.
 
         Returns:
-            A ``(mu, logvar)`` pair, each of shape ``(B, latent_dim)``.
+            The predicted :class:`LatentStats`, each field of shape
+            ``(B, latent_dim)``.
         """
         for index, block in enumerate(self.blocks):
             if index > 0:
@@ -91,13 +131,14 @@ class LatentEncoder(nn.Module):
             x = block(x)
         # Global average pooling over the spatial dimensions, then a 1x1 conv.
         pooled = x.mean(dim=(2, 3), keepdim=True)
-        stats = self.head(pooled).flatten(start_dim=1)
-        mu = stats[:, : self.latent_dim]
-        logvar = stats[:, self.latent_dim :]
-        return mu, logvar
+        predicted = self.head(pooled).flatten(start_dim=1)
+        return LatentStats(
+            mu=predicted[:, : self.latent_dim],
+            logvar=predicted[:, self.latent_dim :],
+        )
 
     @staticmethod
-    def distribution_from_stats(mu: Tensor, logvar: Tensor) -> Independent:
+    def distribution_from_stats(stats: LatentStats) -> Independent:
         """Build the latent distribution from already-computed parameters.
 
         ``Independent(..., 1)`` reinterprets the latent axis as part of the event
@@ -107,14 +148,13 @@ class LatentEncoder(nn.Module):
         structural here rather than hand-rolled in the loss.
 
         Args:
-            mu: Means of shape ``(B, latent_dim)``.
-            logvar: Log-variances of shape ``(B, latent_dim)``.
+            stats: The predicted parameters.
 
         Returns:
             An ``Independent(Normal(mu, exp(0.5 * logvar)), 1)`` distribution with
             batch shape ``(B,)`` and event shape ``(latent_dim,)``.
         """
-        return Independent(Normal(loc=mu, scale=torch.exp(0.5 * logvar)), 1)
+        return Independent(Normal(loc=stats.mu, scale=stats.sigma), 1)
 
     def distribution_from_input(self, x: Tensor) -> Independent:
         """Build the latent distribution for an already-assembled input.
@@ -125,7 +165,7 @@ class LatentEncoder(nn.Module):
         Returns:
             The latent distribution over ``z``.
         """
-        return self.distribution_from_stats(*self.forward(x))
+        return self.distribution_from_stats(self.forward(x))
 
 
 class PriorNet(LatentEncoder):

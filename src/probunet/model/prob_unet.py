@@ -21,7 +21,7 @@ import torch
 from torch import Tensor, nn
 from torch.distributions import Independent
 
-from probunet.model.encoder import LatentEncoder, PosteriorNet, PriorNet
+from probunet.model.encoder import LatentEncoder, LatentStats, PosteriorNet, PriorNet
 from probunet.model.fcomb import FComb
 from probunet.model.unet import UNet
 
@@ -132,16 +132,16 @@ class Encoded:
     Attributes:
         features: Last U-Net activation, shape ``(B, base_channels, H, W)``.
         prior: ``P(z | X)``.
-        prior_stats: The prior's raw ``(mu, logvar)``.
+        prior_stats: The prior's raw predicted parameters.
         posterior: ``Q(z | X, Y)``, or None if no mask was supplied.
-        posterior_stats: The posterior's raw ``(mu, logvar)``, or None.
+        posterior_stats: The posterior's raw predicted parameters, or None.
     """
 
     features: Tensor
     prior: Independent
-    prior_stats: tuple[Tensor, Tensor]
+    prior_stats: LatentStats
     posterior: Independent | None = None
-    posterior_stats: tuple[Tensor, Tensor] | None = None
+    posterior_stats: LatentStats | None = None
 
     @property
     def batch_size(self) -> int:
@@ -271,7 +271,7 @@ class ProbUNet(nn.Module):
         # prior_net(image) and then prior_net.distribution(image) would run a 7.9 M
         # parameter encoder twice per step.
         prior_stats = self.prior_net(image)
-        prior = LatentEncoder.distribution_from_stats(*prior_stats)
+        prior = LatentEncoder.distribution_from_stats(prior_stats)
 
         posterior = None
         posterior_stats = None
@@ -279,7 +279,7 @@ class ProbUNet(nn.Module):
             posterior_stats = self.posterior_net(
                 self.posterior_net.assemble_input(image, mask)
             )
-            posterior = LatentEncoder.distribution_from_stats(*posterior_stats)
+            posterior = LatentEncoder.distribution_from_stats(posterior_stats)
 
         return Encoded(
             features=features,

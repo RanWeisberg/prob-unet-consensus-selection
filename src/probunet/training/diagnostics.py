@@ -48,6 +48,7 @@ from torch.distributions import Independent, Normal, kl_divergence
 
 from probunet.data.lidc import LidcDataset
 from probunet.evaluation.metrics import binary_iou
+from probunet.model.encoder import LatentStats
 from probunet.model.prob_unet import Encoded, ProbUNet
 
 LOGGER = logging.getLogger(__name__)
@@ -191,18 +192,21 @@ def reparameterize(
     return base.loc + base.scale * noise
 
 
-def sigma_stats(stats: tuple[Tensor, Tensor], prefix: str) -> dict[str, float]:
+def sigma_stats(stats: LatentStats, prefix: str) -> dict[str, float]:
     """Summarize a latent distribution's predicted standard deviations.
 
     Args:
-        stats: The ``(mu, logvar)`` pair the encoder produced.
+        stats: The parameters the encoder produced.
         prefix: Metric name prefix, e.g. ``"prior"``.
 
     Returns:
         Mean and standard deviation of sigma, and the mean absolute mu.
     """
-    mu, logvar = stats
-    sigma = torch.exp(0.5 * logvar)
+    # .detach() before the float() conversions: these are logging scalars, and reading a
+    # tensor that still requires grad both warns and needlessly keeps the graph alive.
+    # Numerically identical -- the Phase 1 fingerprint asserts that.
+    mu = stats.mu.detach()
+    sigma = stats.sigma.detach()
     return {
         f"{prefix}_sigma_mean": float(sigma.mean()),
         f"{prefix}_sigma_std": float(sigma.std()),

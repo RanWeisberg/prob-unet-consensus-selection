@@ -527,8 +527,8 @@ class Trainer:
         posterior_stats = self.model.posterior_net(
             self.model.posterior_net.assemble_input(image, target)
         )
-        prior = self.model.prior_net.distribution_from_stats(*prior_stats)
-        posterior = self.model.posterior_net.distribution_from_stats(*posterior_stats)
+        prior = self.model.prior_net.distribution_from_stats(prior_stats)
+        posterior = self.model.posterior_net.distribution_from_stats(posterior_stats)
 
         stats = sigma_stats(prior_stats, "prior")
         stats.update(sigma_stats(posterior_stats, "posterior"))
