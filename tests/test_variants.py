@@ -16,10 +16,13 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from torch.distributions import MultivariateNormal
 
 from probunet.data.lidc import DataConfig, LidcArrays, panel_batch
 from probunet.data.splits import generate_split
 from probunet.evaluation.sampling import SamplingConfig, collect_per_patch_metrics
+from probunet.losses.elbo import elbo_loss, kl_term
+from probunet.model.encoder import LatentStats, PriorNet
 from probunet.model.prob_unet import ProbUNet, ProbUNetConfig
 from probunet.training.checkpoint import (
     export_weights,
@@ -445,18 +448,206 @@ def test_no_shipped_config_caps_channels(name: str) -> None:
     assert raw["model"]["max_channels"] is None
 
 
-def test_variants_differ_only_by_intended_flags() -> None:
-    """baseline and modernized share every architecture value.
+def test_variants_differ_only_by_the_improvement_flag() -> None:
+    """baseline and modernized share every architecture value EXCEPT latent_covariance.
 
-    The three variants are one model implementation with different flags. If this ever
-    fails, the configs have drifted apart in a way that would confound the comparison.
+    Replaces the former ``baseline.model == modernized.model`` assertion, which could not
+    survive Phase 2 introducing a real architectural flag. The claim is now the sharper
+    one: the two configs differ in **exactly one field**, so the comparison isolates a
+    single variable. Any second difference fails here by name.
     """
     baseline = ExperimentConfig.from_yaml(CONFIGS / "baseline.yaml")
     modernized = ExperimentConfig.from_yaml(CONFIGS / "modernized.yaml")
-    assert baseline.model == modernized.model
+
+    differing = {
+        field.name
+        for field in dataclasses.fields(baseline.model)
+        if getattr(baseline.model, field.name) != getattr(modernized.model, field.name)
+    }
+    assert differing <= {"latent_covariance"}, (
+        f"modernized.yaml differs from baseline.yaml in {sorted(differing)}; Phase 2 is "
+        "one flag, so anything beyond latent_covariance confounds the comparison"
+    )
+    assert baseline.model.latent_covariance == "diagonal"
+
     assert baseline.optim == modernized.optim
-    assert baseline.train.epochs == modernized.train.epochs, "budgets must match"
-    assert baseline.data.batch_size == modernized.data.batch_size
+    assert baseline.schedule == modernized.schedule
+    assert baseline.loss == modernized.loss
+    assert baseline.train.iterations == modernized.train.iterations, "budgets must match"
+    assert baseline.data == modernized.data, "the data pipeline must be identical"
+    assert baseline.run.seed == modernized.run.seed
+
+
+def test_flag_off_is_bit_identical_to_the_baseline() -> None:
+    """modernized.yaml with the improvement flag off reproduces baseline.yaml EXACTLY.
+
+    This is the load-bearing test of Phase 2. The whole comparison rests on flag-off being
+    Phase 1 rather than something numerically near it, which is why the diagonal case takes
+    the ``Independent(Normal)`` path unchanged instead of a MultivariateNormal with a
+    diagonal factor -- the latter is algebraically identical but reaches the answer through
+    different kernels and disagrees at ~5e-7.
+
+    Bit-exact equality under a fixed seed, on logits, z and every loss term.
+    """
+    baseline = ExperimentConfig.from_yaml(CONFIGS / "baseline.yaml").model
+    modernized = ExperimentConfig.from_yaml(CONFIGS / "modernized.yaml").model
+    flag_off = dataclasses.replace(modernized, latent_covariance="diagonal")
+    assert baseline == flag_off, "with the flag off the two architectures must be equal"
+
+    generator = torch.Generator().manual_seed(11)
+    image = torch.rand(2, 1, 32, 32, generator=generator)
+    mask = (torch.rand(2, 32, 32, generator=generator) > 0.6).to(torch.int64)
+
+    outputs = []
+    for architecture in (baseline, flag_off):
+        # Rebuilt under the same seed, so initialization is identical too.
+        torch.manual_seed(4242)
+        model = ProbUNet(
+            dataclasses.replace(architecture, base_channels=8, num_downs=2, convs_per_scale=1)
+        )
+        torch.manual_seed(99)
+        output = model(image, mask)
+        terms = elbo_loss(output.logits, mask, output.posterior, output.prior, beta=1.0)
+        outputs.append(
+            (output.logits, output.z, {k: v.detach().clone() for k, v in terms.items()})
+        )
+
+    (left_logits, left_z, left_terms), (right_logits, right_z, right_terms) = outputs
+    assert torch.equal(left_logits, right_logits), "logits differ with the flag off"
+    assert torch.equal(left_z, right_z), "latent samples differ with the flag off"
+    for key in sorted(left_terms):
+        assert torch.equal(left_terms[key], right_terms[key]), f"{key} differs"
+
+
+def test_full_covariance_flag_is_actually_engaged() -> None:
+    """POSITIVE CONTROL: the deliberate complement to the bit-identity test.
+
+    Distribution construction dispatches on ``stats.lower is None``, so a plumbing bug that
+    dropped ``lower`` would make a full-configured model train **diagonally** while every
+    label, config dump and report said otherwise. The bit-identity test cannot catch that:
+    it only asserts flag-off is identical, never that flag-on is different. The result would
+    be an undetectable false null -- the worst outcome available to this project -- so the
+    engaged path is asserted directly, through the real config-to-model wiring rather than a
+    hand-constructed encoder.
+    """
+    config = ExperimentConfig.from_dict(
+        {"model": {"latent_dim": 6, "latent_covariance": "full"}}
+    )
+    assert config.model.full_covariance is True
+    model = ProbUNet(
+        dataclasses.replace(
+            config.model, base_channels=8, num_downs=2, convs_per_scale=1
+        )
+    )
+
+    # (a) The architecture really is the wide-head one.
+    for net in (model.prior_net, model.posterior_net):
+        assert net.full_covariance is True
+        assert net.head.out_channels == 27, "head is not N + N(N+1)/2 wide"
+        assert net.n_lower == 15
+
+    generator = torch.Generator().manual_seed(3)
+    image = torch.rand(2, 1, 32, 32, generator=generator)
+    mask = (torch.rand(2, 32, 32, generator=generator) > 0.6).to(torch.int64)
+    encoded = model.encode(image, mask)
+
+    # (b) The parameters carry a factor, and the distributions are the full family.
+    assert encoded.prior_stats.lower is not None
+    assert encoded.posterior_stats.lower is not None
+    assert isinstance(encoded.prior, MultivariateNormal)
+    assert isinstance(encoded.posterior, MultivariateNormal)
+
+    # (b, belt and braces) A full-configured encoder handed diagonal parameters refuses,
+    # rather than silently building the Phase 1 distribution.
+    with pytest.raises(RuntimeError, match="latent parameterization mismatch"):
+        model.prior_net.distribution_from_stats(
+            LatentStats(encoded.prior_stats.mu, encoded.prior_stats.logvar)
+        )
+    # And the converse, so neither direction can drift.
+    diagonal_net = ProbUNet(
+        dataclasses.replace(
+            config.model,
+            latent_covariance="diagonal",
+            base_channels=8,
+            num_downs=2,
+            convs_per_scale=1,
+        )
+    ).prior_net
+    with pytest.raises(RuntimeError, match="latent parameterization mismatch"):
+        diagonal_net.distribution_from_stats(encoded.prior_stats)
+
+
+def test_full_covariance_diverges_from_diagonal_once_correlations_are_nonzero() -> None:
+    """The other half of the positive control: the paths differ where they should.
+
+    Zero-init deliberately makes the two agree at step 0, and a separate test asserts that.
+    Here the correlations are set non-zero, and z and the KL must then diverge from what the
+    diagonal path produces from the same mu and logvar. Without this, "full covariance"
+    could be a no-op that every other test happily passes.
+    """
+    torch.manual_seed(0)
+    batch, dims = 4, 6
+    mu = torch.randn(batch, dims)
+    logvar = torch.randn(batch, dims) * 0.3
+    prior_mu = torch.randn(batch, dims)
+    prior_logvar = torch.randn(batch, dims) * 0.3
+    correlations = torch.randn(batch, dims * (dims - 1) // 2)
+
+    diagonal_net = PriorNet(image_channels=1, latent_dim=dims)
+    full_net = PriorNet(image_channels=1, latent_dim=dims, full_covariance=True)
+
+    diagonal_posterior = diagonal_net.distribution_from_stats(LatentStats(mu, logvar))
+    diagonal_prior = diagonal_net.distribution_from_stats(
+        LatentStats(prior_mu, prior_logvar)
+    )
+    full_posterior = full_net.distribution_from_stats(
+        LatentStats(mu, logvar, lower=correlations)
+    )
+    full_prior = full_net.distribution_from_stats(
+        LatentStats(prior_mu, prior_logvar, lower=torch.zeros_like(correlations))
+    )
+
+    # The KL must move: correlations change the geometry, not just the marginals.
+    diagonal_kl = kl_term(diagonal_posterior, diagonal_prior)
+    full_kl = kl_term(full_posterior, full_prior)
+    assert not torch.isclose(diagonal_kl, full_kl, atol=1e-4), (
+        "the KL is unchanged by non-zero correlations: the full path is a no-op"
+    )
+
+    # And the samples must move, under the same noise.
+    torch.manual_seed(7)
+    diagonal_z = diagonal_posterior.rsample()
+    torch.manual_seed(7)
+    full_z = full_posterior.rsample()
+    assert not torch.allclose(diagonal_z, full_z, atol=1e-5), (
+        "z is unchanged by non-zero correlations: L is not reaching the sample"
+    )
+    # The first coordinate is unaffected by construction -- row 0 of L has no strict lower
+    # entries -- which is a useful check that the factor is lower- and not upper-triangular.
+    assert torch.allclose(diagonal_z[:, 0], full_z[:, 0], atol=1e-6)
+
+
+def test_shipped_configs_agree_with_the_models_they_build() -> None:
+    """Whatever each shipped config declares, the built model must actually be that.
+
+    Flag-agnostic on purpose, so it keeps its meaning as modernized.yaml flips to ``full``
+    in Stage 5 rather than needing an edit at the moment it matters most.
+    """
+    for name in ("baseline", "modernized", "extension", "ablation_no_augmentation"):
+        declared = ExperimentConfig.from_yaml(CONFIGS / f"{name}.yaml").model
+        model = ProbUNet(
+            dataclasses.replace(
+                declared, base_channels=8, num_downs=2, convs_per_scale=1
+            )
+        )
+        expected_width = declared.latent_head_outputs
+        for net in (model.prior_net, model.posterior_net):
+            assert net.full_covariance is declared.full_covariance, name
+            assert net.head.out_channels == expected_width, (
+                f"{name}: config declares latent_covariance={declared.latent_covariance!r} "
+                f"(head width {expected_width}) but the model built a "
+                f"{net.head.out_channels}-wide head"
+            )
 
 
 def test_extension_config_uses_selection_head_mode() -> None:

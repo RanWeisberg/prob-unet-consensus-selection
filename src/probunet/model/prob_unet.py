@@ -22,7 +22,6 @@ from torch import Tensor, nn
 
 from probunet.model.encoder import (
     LatentDistribution,
-    LatentEncoder,
     LatentStats,
     PosteriorNet,
     PriorNet,
@@ -284,7 +283,7 @@ class ProbUNet(nn.Module):
         # prior_net(image) and then prior_net.distribution(image) would run a 7.9 M
         # parameter encoder twice per step.
         prior_stats = self.prior_net(image)
-        prior = LatentEncoder.distribution_from_stats(prior_stats)
+        prior = self.prior_net.distribution_from_stats(prior_stats)
 
         posterior = None
         posterior_stats = None
@@ -292,7 +291,7 @@ class ProbUNet(nn.Module):
             posterior_stats = self.posterior_net(
                 self.posterior_net.assemble_input(image, mask)
             )
-            posterior = LatentEncoder.distribution_from_stats(posterior_stats)
+            posterior = self.posterior_net.distribution_from_stats(posterior_stats)
 
         return Encoded(
             features=features,

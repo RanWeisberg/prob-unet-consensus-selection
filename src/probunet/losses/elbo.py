@@ -6,11 +6,14 @@
 
 * Cross-entropy is **summed over pixels and averaged over the batch**.
 * KL is **summed over latent dimensions and averaged over the batch**. The sum over
-  latent dims is not written by hand: the distributions are
-  ``Independent(Normal(...), 1)``, so ``kl_divergence`` returns one value per batch
-  element and the sum is part of the type. :func:`elbo_loss` rejects distributions
-  that are not wrapped that way, because a plain ``Normal`` would silently give a
-  per-latent-dimension KL that then gets averaged instead of summed.
+  latent dims is not written by hand: the latent axis is part of the distribution's
+  *event* shape -- via ``Independent(Normal(...), 1)`` for the diagonal parameterization
+  and by construction for ``MultivariateNormal`` -- so ``kl_divergence`` returns one
+  value per batch element and the sum is part of the type. :func:`elbo_loss` rejects
+  distributions that are not wrapped that way, because a plain ``Normal`` would silently
+  give a per-latent-dimension KL that then gets averaged instead of summed.
+  **The Phase 2 full-covariance flag does not change this line at all**: both families
+  return a batch-shaped tensor, so the reduction is a drop-in.
 
 ``beta`` is only meaningful relative to this convention, and both failure modes are
 silent:
@@ -43,7 +46,12 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.distributions import Distribution, kl_divergence
+from torch.distributions import (
+    Distribution,
+    Independent,
+    MultivariateNormal,
+    kl_divergence,
+)
 
 if TYPE_CHECKING:  # import only for type checking: losses must not import model at runtime
     from probunet.model.prob_unet import ProbUNetOutput
@@ -103,29 +111,62 @@ def _validate(logits: Tensor, target: Tensor) -> None:
         )
 
 
+LATENT_DISTRIBUTIONS: tuple[type[Distribution], ...] = (Independent, MultivariateNormal)
+"""Distribution types whose ``kl_divergence`` sums over the latent dimension.
+
+``Independent(Normal, 1)`` reinterprets the latent axis as event shape;
+``MultivariateNormal`` has it as event shape by construction. A plain ``Normal`` does not,
+and is rejected.
+"""
+
+
 def kl_term(posterior: Distribution, prior: Distribution) -> Tensor:
     """KL(Q || P), summed over latent dims and averaged over the batch.
 
+    **The reduction is identical for both latent parameterizations.** Whether the
+    distributions are ``Independent(Normal, 1)`` (diagonal, Phase 1) or
+    ``MultivariateNormal(loc, scale_tril=L)`` (full covariance, Phase 2),
+    ``kl_divergence`` already sums over the latent dimension and returns one value per
+    batch element, so the ``.mean()`` below is the batch mean in both cases. Nothing here
+    adds a second sum, and nothing removes the batch mean. The KL stays closed-form; there
+    is no Monte Carlo estimate and no new hyperparameter.
+
     Args:
-        posterior: ``Q(z | X, Y)`` as ``Independent(Normal(...), 1)``.
-        prior: ``P(z | X)`` as ``Independent(Normal(...), 1)``.
+        posterior: ``Q(z | X, Y)``, an ``Independent(Normal(...), 1)`` or a
+            ``MultivariateNormal``.
+        prior: ``P(z | X)``, of the same family.
 
     Returns:
         A scalar tensor.
 
     Raises:
-        ValueError: If ``kl_divergence`` does not return one value per batch element.
-            That happens when the distributions are plain ``Normal`` rather than
-            ``Independent(..., 1)``, in which case the latent dimensions would be
-            averaged rather than summed -- a silent factor of ``latent_dim``.
+        TypeError: If either distribution is not one of :data:`LATENT_DISTRIBUTIONS`. A
+            plain ``Normal`` is the case this exists to catch: its ``kl_divergence`` is
+            per-latent-dimension, so the ``.mean()`` would average the latent dimensions
+            instead of summing them -- a silent factor of ``latent_dim`` on the KL and
+            therefore a silent redefinition of ``beta``.
+        ValueError: If ``kl_divergence`` still does not return one value per batch
+            element. Kept alongside the type check because the type check alone would
+            pass an ``Independent`` built with the wrong
+            ``reinterpreted_batch_ndims``, and the shape check alone would pass a plain
+            ``Normal`` at ``latent_dim == 1``.
     """
+    for name, distribution in (("posterior", posterior), ("prior", prior)):
+        if not isinstance(distribution, LATENT_DISTRIBUTIONS):
+            expected = ", ".join(kind.__name__ for kind in LATENT_DISTRIBUTIONS)
+            raise TypeError(
+                f"{name} is a {type(distribution).__name__}; expected one of "
+                f"({expected}). A plain Normal gives a per-latent-dimension KL, which "
+                "would be averaged rather than summed -- a silent factor of latent_dim "
+                "and a silent redefinition of beta."
+            )
     per_item = kl_divergence(posterior, prior)
     if per_item.dim() != 1:
         raise ValueError(
             "kl_divergence returned shape "
-            f"{tuple(per_item.shape)}; expected one value per batch element. Wrap the "
-            "latent distributions in Independent(Normal(...), 1) so the sum over "
-            "latent dimensions is explicit."
+            f"{tuple(per_item.shape)}; expected one value per batch element. Wrap a "
+            "diagonal latent in Independent(Normal(...), 1) so the sum over latent "
+            "dimensions is explicit."
         )
     return per_item.mean()
 
@@ -142,8 +183,9 @@ def elbo_loss(
     Args:
         logits: Class logits of shape ``(B, C, H, W)``.
         target: Class indices of shape ``(B, H, W)``, dtype int64.
-        posterior: ``Q(z | X, Y)``, an ``Independent(Normal(...), 1)``.
-        prior: ``P(z | X)``, an ``Independent(Normal(...), 1)``.
+        posterior: ``Q(z | X, Y)``, an ``Independent(Normal(...), 1)`` or a
+            ``MultivariateNormal``.
+        prior: ``P(z | X)``, of the same family.
         beta: Weight of the KL term.
 
     Returns:

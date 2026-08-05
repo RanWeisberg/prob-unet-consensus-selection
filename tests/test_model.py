@@ -934,10 +934,13 @@ def test_zero_init_kl_equals_the_diagonal_kl(full_config: ProbUNetConfig) -> Non
     encoded = model.encode(image, mask)
 
     full_kl = kl_divergence(encoded.posterior, encoded.prior)
-    hand = LatentEncoder.distribution_from_stats(
+    # A diagonal encoder to build the reference distributions through, since
+    # distribution_from_stats now cross-checks the encoder's own configuration.
+    reference = PriorNet(image_channels=1, latent_dim=LATENT_DIM)
+    hand = reference.distribution_from_stats(
         LatentStats(encoded.posterior_stats.mu, encoded.posterior_stats.logvar)
     )
-    hand_prior = LatentEncoder.distribution_from_stats(
+    hand_prior = reference.distribution_from_stats(
         LatentStats(encoded.prior_stats.mu, encoded.prior_stats.logvar)
     )
     assert torch.allclose(full_kl, kl_divergence(hand, hand_prior), atol=1e-5)
@@ -953,3 +956,112 @@ def test_reparameterize_refuses_full_covariance_until_stage_4(
     encoded = ProbUNet(full_config).encode(torch.rand(BATCH, 1, SIZE, SIZE))
     with pytest.raises(NotImplementedError, match="does not yet support a full-covariance"):
         reparameterize(encoded.prior, torch.Generator().manual_seed(0))
+
+
+def test_strict_lower_mask_cache_is_keyed_by_device() -> None:
+    """A model moved between backends must not get a mask on the wrong device.
+
+    The cache key includes ``device``; ``dtype`` is not a parameter because a boolean index
+    mask is invariantly ``torch.bool``. Also asserts it is a module-level function rather
+    than a cached method, since ``lru_cache`` on a method pins ``self`` for the process
+    lifetime.
+    """
+    import inspect
+
+    from probunet.model.encoder import strict_lower_mask
+
+    assert inspect.isfunction(strict_lower_mask.__wrapped__)
+
+    cpu = strict_lower_mask(LATENT_DIM, torch.device("cpu"))
+    assert cpu.device.type == "cpu"
+    assert cpu.dtype == torch.bool
+    assert int(cpu.sum()) == LATENT_DIM * (LATENT_DIM - 1) // 2
+    assert torch.equal(cpu, cpu.tril(-1))
+    # Re-requesting the same device hits the cache and stays on that device.
+    assert strict_lower_mask(LATENT_DIM, torch.device("cpu")).device.type == "cpu"
+    # A different N is a different entry.
+    assert int(strict_lower_mask(3, torch.device("cpu")).sum()) == 3
+
+    for name in ("mps", "cuda"):
+        if getattr(torch, name, None) is None:
+            continue
+        available = (
+            torch.backends.mps.is_available() if name == "mps" else torch.cuda.is_available()
+        )
+        if not available:
+            continue
+        other = strict_lower_mask(LATENT_DIM, torch.device(name))
+        assert other.device.type == name, f"cache returned a {other.device} mask for {name}"
+        assert torch.equal(other.cpu(), cpu)
+
+
+def test_full_covariance_checkpoint_cannot_load_into_a_diagonal_model(tmp_path) -> None:
+    """A cross-parameterization load fails loudly, naming the flag as the cause.
+
+    Phase 3 loads a frozen Phase 2 checkpoint via --base-checkpoint, so the failure mode
+    that matters is loading the wrong arm. It must never load partially or silently.
+    """
+    from probunet.training.checkpoint import load_checkpoint, save_checkpoint
+    from probunet.training.config import ExperimentConfig
+
+    small = {"base_channels": 8, "num_downs": 2, "convs_per_scale": 1}
+    full_config = ProbUNetConfig(latent_dim=LATENT_DIM, latent_covariance=FULL, **small)
+    full_model = ProbUNet(full_config)
+    path = tmp_path / "full.pt"
+    save_checkpoint(
+        path,
+        model=full_model,
+        optimizer=torch.optim.Adam(full_model.parameters()),
+        scheduler=None,
+        epoch=1,
+        global_step=1,
+        config=ExperimentConfig(model=full_config).to_dict(),
+        seed=0,
+        device="cpu",
+        monitor="val/total",
+        best_metric=None,
+        metrics={},
+    )
+
+    # The flag is recorded, which is what Phase 3 relies on.
+    state = load_checkpoint(path, restore_rng=False)
+    assert state.config["model"]["latent_covariance"] == FULL
+
+    diagonal_model = ProbUNet(ProbUNetConfig(latent_dim=LATENT_DIM, **small))
+    with pytest.raises(RuntimeError, match="latent_covariance"):
+        load_checkpoint(path, model=diagonal_model, restore_rng=False)
+    # And nothing was partially applied: the head is still its original width.
+    assert diagonal_model.prior_net.head.out_channels == 2 * LATENT_DIM
+
+    # Loading into the matching configuration works.
+    load_checkpoint(path, model=ProbUNet(full_config), restore_rng=False)
+
+
+def test_diagonal_checkpoint_cannot_load_into_a_full_model(tmp_path) -> None:
+    """The converse direction is equally refused."""
+    from probunet.training.checkpoint import load_checkpoint, save_checkpoint
+    from probunet.training.config import ExperimentConfig
+
+    small = {"base_channels": 8, "num_downs": 2, "convs_per_scale": 1}
+    diagonal_config = ProbUNetConfig(latent_dim=LATENT_DIM, **small)
+    diagonal_model = ProbUNet(diagonal_config)
+    path = tmp_path / "diagonal.pt"
+    save_checkpoint(
+        path,
+        model=diagonal_model,
+        optimizer=torch.optim.Adam(diagonal_model.parameters()),
+        scheduler=None,
+        epoch=1,
+        global_step=1,
+        config=ExperimentConfig(model=diagonal_config).to_dict(),
+        seed=0,
+        device="cpu",
+        monitor="val/total",
+        best_metric=None,
+        metrics={},
+    )
+    full_model = ProbUNet(
+        ProbUNetConfig(latent_dim=LATENT_DIM, latent_covariance=FULL, **small)
+    )
+    with pytest.raises(RuntimeError, match="latent_covariance"):
+        load_checkpoint(path, model=full_model, restore_rng=False)

@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn.functional as F
-from torch.distributions import Independent, Normal
+from torch.distributions import Independent, MultivariateNormal, Normal, kl_divergence
 
 from probunet.losses import ElboConfig, ElboLoss, elbo_from_output, elbo_loss, kl_term
 from probunet.model import ProbUNet, ProbUNetConfig, ProbUNetOutput
@@ -112,11 +112,114 @@ def test_kl_averages_over_batch() -> None:
 
 
 def test_plain_normal_is_rejected() -> None:
-    """A bare Normal would average over latent dims instead of summing."""
+    """A bare Normal would average over latent dims instead of summing.
+
+    Still rejected after Phase 2 widened the guard to admit MultivariateNormal. This is
+    the case the guard exists for: a plain Normal's kl_divergence is
+    per-latent-dimension, so the batch mean would silently divide the KL by latent_dim
+    and redefine beta.
+    """
     posterior = Normal(torch.zeros(2, 6), torch.ones(2, 6))
     prior = Normal(torch.zeros(2, 6), torch.ones(2, 6))
-    with pytest.raises(ValueError, match="Independent"):
+    with pytest.raises(TypeError, match="expected one of"):
         kl_term(posterior, prior)
+
+
+def test_plain_normal_is_rejected_when_its_shape_would_slip_through() -> None:
+    """The type check is why this fails; the shape check alone would pass it.
+
+    A Normal with ``(B,)``-shaped parameters gives a ``(B,)``-shaped kl_divergence, which
+    satisfies "one value per batch element" while still meaning "a single latent dimension,
+    then averaged". The shape guard cannot tell that apart from a correctly wrapped
+    distribution, so the type guard is what catches it.
+    """
+    posterior = Normal(torch.zeros(4), torch.ones(4))
+    prior = Normal(torch.zeros(4), torch.ones(4))
+    assert kl_divergence(posterior, prior).shape == (4,)  # a shape-only guard would pass
+    with pytest.raises(TypeError, match="expected one of"):
+        kl_term(posterior, prior)
+
+
+def test_wrongly_wrapped_independent_is_rejected() -> None:
+    """The shape check is why this fails; the type check alone would pass it.
+
+    An Independent with reinterpreted_batch_ndims=2 folds the batch axis into the event
+    shape too, so kl_divergence returns a scalar and the batch mean silently disappears.
+    """
+    posterior = Independent(Normal(torch.zeros(2, 6), torch.ones(2, 6)), 2)
+    prior = Independent(Normal(torch.zeros(2, 6), torch.ones(2, 6)), 2)
+    with pytest.raises(ValueError, match="one value per batch element"):
+        kl_term(posterior, prior)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2: the KL path accepts a full covariance
+# --------------------------------------------------------------------------- #
+def full(mu: float, sigma: float, dims: int, batch: int = 1, correlation: float = 0.0):
+    """Build a MultivariateNormal with a constant diagonal and one off-diagonal entry.
+
+    Args:
+        mu: Constant mean.
+        sigma: Constant diagonal of the Cholesky factor.
+        dims: Latent dimensionality.
+        batch: Batch size.
+        correlation: Value placed in the strict lower triangle.
+
+    Returns:
+        The distribution.
+    """
+    factor = torch.diag_embed(torch.full((batch, dims), sigma))
+    if correlation:
+        mask = torch.ones(dims, dims, dtype=torch.bool).tril(-1)
+        factor = factor.clone()
+        factor[:, mask] = correlation
+    return MultivariateNormal(torch.full((batch, dims), mu), scale_tril=factor)
+
+
+def test_multivariate_normal_is_accepted() -> None:
+    """The Phase 2 latent passes the guard and returns a scalar."""
+    value = kl_term(full(1.0, 1.0, 6, batch=4, correlation=0.3), full(0.0, 1.0, 6, batch=4))
+    assert value.dim() == 0
+    assert torch.isfinite(value)
+    assert value > 0
+
+
+def test_full_kl_is_zero_for_identical_distributions() -> None:
+    """The same sanity check the diagonal path gets, on the full path."""
+    same = full(0.5, 1.2, 6, batch=3, correlation=0.4)
+    assert kl_term(same, same).item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_full_kl_reduction_matches_the_diagonal_convention() -> None:
+    """Sum over latent dims, mean over batch -- unchanged by the flag.
+
+    Asserted the same two ways the diagonal path is: the KL scales with latent_dim (so it
+    is summed, not averaged), and it does not scale with batch size (so it is meaned).
+    """
+    two = kl_term(full(1.0, 1.0, 2, batch=1), full(0.0, 1.0, 2, batch=1))
+    six = kl_term(full(1.0, 1.0, 6, batch=1), full(0.0, 1.0, 6, batch=1))
+    assert six.item() == pytest.approx(3.0 * two.item(), rel=1e-5)
+
+    one = kl_term(full(1.0, 1.0, 6, batch=1), full(0.0, 1.0, 6, batch=1))
+    eight = kl_term(full(1.0, 1.0, 6, batch=8), full(0.0, 1.0, 6, batch=8))
+    assert eight.item() == pytest.approx(one.item(), rel=1e-5)
+
+
+def test_mixing_the_two_families_fails_loudly() -> None:
+    """A full posterior against a diagonal prior raises rather than misreducing.
+
+    torch registers no KL between MultivariateNormal and Independent(Normal), so the pair
+    raises NotImplementedError from torch itself. That is the safe outcome and worth
+    pinning: this project never mixes the families -- both latent nets are built from the
+    same ``model.latent_covariance`` flag, and
+    ``LatentEncoder.distribution_from_stats`` refuses a mismatch between its own
+    configuration and its parameters -- but if a future change ever produced the pair, it
+    would stop rather than quietly compute a wrong objective.
+    """
+    with pytest.raises(NotImplementedError, match="No KL"):
+        kl_term(
+            full(1.0, 1.0, 6, batch=4, correlation=0.2), diagonal(0.0, 1.0, 6, batch=4)
+        )
 
 
 # --------------------------------------------------------------------------- #

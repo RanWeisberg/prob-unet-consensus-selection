@@ -239,7 +239,22 @@ def per_dim_kl(posterior: Independent, prior: Independent) -> Tensor:
 
     Returns:
         A tensor of shape ``(latent_dim,)``.
+
+    Raises:
+        NotImplementedError: For a full-covariance latent. This is reached from
+            ``Trainer._latent_stats`` via ``validate()``, i.e. **every epoch**, so a
+            full-covariance run stops at the end of epoch 1 rather than limping to the
+            first diagnostics epoch. Stage 4 replaces this with the prior-whitened
+            decomposition, which is the axis-rotation-invariant measurement.
     """
+    if isinstance(posterior, MultivariateNormal) or isinstance(prior, MultivariateNormal):
+        raise NotImplementedError(
+            "per_dim_kl is axis-aligned and is not defined for a full-covariance latent "
+            "(model.latent_covariance: full). Stage 4 adds the prior-whitened KL "
+            "decomposition, which measures the same question without assuming the "
+            "informative directions are coordinate axes. Do not start a full-covariance "
+            "run until then."
+        )
     per_element = kl_divergence(posterior.base_dist, prior.base_dist)
     return per_element.mean(dim=0)
 

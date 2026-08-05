@@ -164,7 +164,7 @@ def load_checkpoint(
     payload = torch.load(path, map_location=map_location, weights_only=False)
 
     if model is not None:
-        model.load_state_dict(payload["model"])
+        _load_model_state(model, payload, path)
     # A weights-only export has no optimizer, scheduler or RNG state. Loading one for
     # evaluation is fine; resuming from one is not, and the absent keys say so.
     if optimizer is not None and "optimizer" in payload:
@@ -186,6 +186,49 @@ def load_checkpoint(
         metrics=dict(payload.get("metrics", {})),
         history=list(payload.get("history", [])),
     )
+
+
+def _load_model_state(model: nn.Module, payload: dict[str, Any], path: Path) -> None:
+    """Load weights strictly, explaining a latent-parameterization mismatch.
+
+    The prior/posterior heads are ``2N`` channels wide for a diagonal latent and
+    ``N + N(N+1)/2`` for a full covariance, so a Phase 1 checkpoint cannot load into a
+    Phase 2 model or vice versa. ``load_state_dict`` already refuses -- strictly, and
+    never partially -- but it refuses by reporting raw tensor shapes, which does not tell
+    the reader that a *config flag* is the cause. Since Phase 3 loads a frozen Phase 2
+    checkpoint via ``--base-checkpoint``, that diagnosis is worth spelling out.
+
+    Args:
+        model: The model to fill.
+        payload: The loaded checkpoint payload.
+        path: Source path, for the message.
+
+    Raises:
+        RuntimeError: On any state-dict mismatch. Re-raised with the two
+            ``latent_covariance`` values named when that is what differs, and otherwise
+            passed through unchanged.
+    """
+    try:
+        model.load_state_dict(payload["model"])
+    except RuntimeError as error:
+        saved = "unknown"
+        try:
+            saved = json.loads(payload["config_json"])["model"]["latent_covariance"]
+        except (KeyError, ValueError, TypeError):
+            # A checkpoint written before the flag existed is a diagonal one.
+            saved = "diagonal (absent from the recorded config)"
+        current = getattr(getattr(model, "config", None), "latent_covariance", "unknown")
+        if str(saved).split()[0] != str(current):
+            raise RuntimeError(
+                f"cannot load {path}: it was written by a model with "
+                f"latent_covariance={saved!r} but is being loaded into one with "
+                f"latent_covariance={current!r}. The prior/posterior heads have different "
+                "output widths in the two parameterizations, so the weights are genuinely "
+                "incompatible -- this is not something to force. Evaluate the checkpoint "
+                "with the configuration it was trained under, or train the arm you want.\n"
+                f"Underlying error: {error}"
+            ) from error
+        raise
 
 
 def loader_generator_state(path: Path) -> torch.Tensor | None:

@@ -49,6 +49,16 @@ def strict_lower_mask(latent_dim: int, device: torch.device) -> Tensor:
     Cached because it is a constant that would otherwise be rebuilt twice per training
     step (prior and posterior) for 240,000 steps.
 
+    A module-level function rather than a cached method, because ``lru_cache`` on a method
+    would keep ``self`` alive for the life of the process.
+
+    ``device`` is part of the cache key, so a model moved between MPS and CUDA gets a mask
+    on the right device rather than a stale one. ``dtype`` is not a parameter because a
+    boolean index mask is invariantly ``torch.bool``. Note that ``torch.device("mps")`` and
+    ``torch.device("mps", 0)`` compare unequal and so occupy separate entries; the cost is
+    one extra entry, never a wrong device, and ``maxsize`` leaves room for cpu, mps and
+    cuda in both spellings.
+
     Args:
         latent_dim: Dimensionality ``N``.
         device: Device the mask is needed on.
@@ -260,8 +270,7 @@ class LatentEncoder(nn.Module):
             lower=predicted[:, 2 * n :] if self.full_covariance else None,
         )
 
-    @staticmethod
-    def distribution_from_stats(stats: LatentStats) -> LatentDistribution:
+    def distribution_from_stats(self, stats: LatentStats) -> LatentDistribution:
         """Build the latent distribution from already-computed parameters.
 
         Two genuinely separate code paths, dispatched on whether a Cholesky factor was
@@ -281,12 +290,32 @@ class LatentEncoder(nn.Module):
         KLs measurably disagree by ~5e-7. Phase 2's entire comparison rests on flag-off
         reproducing Phase 1 exactly, so the two paths stay separate.
 
+        **This is an instance method specifically so it can cross-check intent against
+        data.** Dispatching on ``stats.lower is None`` is what keeps the diagonal branch
+        untouched, but on its own it means a plumbing bug that dropped ``lower`` would
+        silently train a *diagonal* model inside a run labelled full-covariance -- an
+        undetectable false null, and the worst failure available to this project. Every
+        construction path in the codebase goes through a module that knows its own
+        configuration, so the mismatch is caught here rather than discovered in a report.
+
         Args:
             stats: The predicted parameters.
 
         Returns:
             A distribution with batch shape ``(B,)`` and event shape ``(latent_dim,)``.
+
+        Raises:
+            RuntimeError: If the encoder is configured for one parameterization and the
+                parameters describe the other.
         """
+        if self.full_covariance != stats.is_full:
+            raise RuntimeError(
+                f"latent parameterization mismatch: encoder was built with "
+                f"full_covariance={self.full_covariance} but received parameters with "
+                f"lower={'set' if stats.is_full else 'None'}. A full-covariance model "
+                "must never fall back to the diagonal path -- that would train and report "
+                "the wrong arm of the Phase 2 comparison."
+            )
         if stats.lower is None:
             return Independent(Normal(loc=stats.mu, scale=stats.sigma), 1)
         return MultivariateNormal(loc=stats.mu, scale_tril=stats.scale_tril)
