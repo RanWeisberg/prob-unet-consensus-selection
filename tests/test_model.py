@@ -23,6 +23,7 @@ from torch.distributions import kl_divergence
 from probunet.model import (
     ConvBlock,
     FComb,
+    LatentEncoder,
     LatentStats,
     PosteriorNet,
     PriorNet,
@@ -666,3 +667,289 @@ def test_latent_covariance_flag_is_recorded_in_the_config_dict() -> None:
     config = ExperimentConfig(model=ProbUNetConfig(latent_covariance="full"))
     assert config.to_dict()["model"]["latent_covariance"] == "full"
     assert ExperimentConfig.from_dict(config.to_dict()).model.latent_covariance == "full"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2: full-covariance heads and the Cholesky factor
+# --------------------------------------------------------------------------- #
+FULL = "full"
+
+
+@pytest.fixture
+def full_config() -> ProbUNetConfig:
+    """A full-covariance config matching the diagonal test fixture otherwise."""
+    return ProbUNetConfig(
+        latent_dim=LATENT_DIM, num_classes=NUM_CLASSES, latent_covariance=FULL
+    )
+
+
+def test_head_width_follows_the_flag() -> None:
+    """The 1x1 head predicts 2N channels diagonally and 2N + N(N-1)/2 when full."""
+    diagonal = PriorNet(image_channels=1, latent_dim=LATENT_DIM)
+    full = PriorNet(image_channels=1, latent_dim=LATENT_DIM, full_covariance=True)
+    assert diagonal.head.out_channels == 2 * LATENT_DIM == 12
+    assert full.head.out_channels == 2 * LATENT_DIM + LATENT_DIM * (LATENT_DIM - 1) // 2
+    assert full.head.out_channels == 27
+    assert full.n_lower == 15
+
+
+def test_diagonal_stats_carry_no_factor() -> None:
+    """The diagonal path emits lower=None, which is what routes it down Phase 1."""
+    prior = PriorNet(image_channels=1, latent_dim=LATENT_DIM)
+    stats = prior(torch.zeros(BATCH, 1, SIZE, SIZE))
+    assert stats.lower is None
+    assert stats.is_full is False
+    with pytest.raises(ValueError, match="scale_tril is undefined for diagonal"):
+        _ = stats.scale_tril
+
+
+def test_full_stats_carry_the_strict_lower_triangle() -> None:
+    """The full path emits N(N-1)/2 unconstrained entries."""
+    prior = PriorNet(image_channels=1, latent_dim=LATENT_DIM, full_covariance=True)
+    stats = prior(torch.zeros(BATCH, 1, SIZE, SIZE))
+    assert stats.is_full is True
+    assert stats.lower is not None
+    assert stats.lower.shape == (BATCH, 15)
+
+
+def test_scale_tril_is_lower_triangular_with_sigma_on_the_diagonal() -> None:
+    """diag(L) is exactly the sigma the diagonal path would produce.
+
+    This is constraint 4 of the Phase 2 spec, and it is what makes the flag-off
+    comparison meaningful rather than approximate.
+    """
+    mu = torch.zeros(BATCH, LATENT_DIM)
+    logvar = torch.linspace(-2.0, 1.0, LATENT_DIM).expand(BATCH, LATENT_DIM).contiguous()
+    lower = torch.arange(1.0, 16.0).expand(BATCH, 15).contiguous()
+    stats = LatentStats(mu=mu, logvar=logvar, lower=lower)
+
+    factor = stats.scale_tril
+    assert factor.shape == (BATCH, LATENT_DIM, LATENT_DIM)
+    # Exactly lower triangular: the strict upper triangle is zero.
+    assert torch.equal(factor, factor.tril())
+    # The diagonal is sigma, not logvar and not sigma squared.
+    assert torch.allclose(factor.diagonal(dim1=-2, dim2=-1), torch.exp(0.5 * logvar))
+    # Every predicted entry appears exactly once, in row-major order.
+    mask = torch.ones(LATENT_DIM, LATENT_DIM, dtype=torch.bool).tril(-1)
+    assert torch.equal(factor[0][mask], lower[0])
+
+
+@pytest.mark.parametrize("scale", [0.0, 1.0, 50.0, 1000.0])
+def test_covariance_is_positive_definite_by_construction(scale: float) -> None:
+    """The PD guarantee is checked through the FACTOR, which is where it lives.
+
+    ``Sigma = L L^T`` is positive-definite for **any** strict lower triangle, however
+    extreme, precisely because ``L`` is triangular with a strictly positive diagonal --
+    ``det(Sigma) = prod(diag(L))^2 > 0`` and the same holds for every leading minor. So the
+    invariant to assert is a property of ``L``, and it holds exactly, at every scale.
+
+    Deliberately *not* asserted by forming ``Sigma`` and eigendecomposing it: at an
+    off-diagonal scale of 1000 the condition number of ``Sigma`` reaches ~1e15, and
+    ``eigvalsh`` then returns a smallest eigenvalue of about -7e-9 against a largest of
+    1e7. The matrix is still mathematically PD; the *measurement* lost it to rounding.
+    That is a neat illustration of why the factor is parameterized rather than the matrix
+    (Phase 2 spec, constraint 5), so it is documented here rather than tolerated with a
+    loosened threshold. The realistic-scale numerical check lives in the next test.
+    """
+    torch.manual_seed(0)
+    stats = LatentStats(
+        mu=torch.randn(BATCH, LATENT_DIM),
+        logvar=torch.randn(BATCH, LATENT_DIM),
+        lower=torch.randn(BATCH, 15) * scale,
+    )
+    factor = stats.scale_tril
+    assert torch.equal(factor, factor.tril()), "L is not lower triangular"
+    diagonal = factor.diagonal(dim1=-2, dim2=-1)
+    assert (diagonal > 0).all(), "diag(L) is not strictly positive"
+    assert torch.isfinite(factor).all()
+
+
+def test_covariance_is_numerically_pd_at_realistic_scales() -> None:
+    """At correlation magnitudes a trained model would actually produce, Sigma is PD.
+
+    Two independent confirmations: every eigenvalue is positive, and a Cholesky
+    factorization of the reconstructed ``Sigma`` succeeds. The second is the round trip --
+    ``cholesky(L L^T)`` recovering a valid factor is only possible if ``Sigma`` really is
+    PD. Note this is a *test* calling ``cholesky``; the model never factorizes a predicted
+    matrix.
+    """
+    torch.manual_seed(0)
+    for scale in (0.1, 1.0, 3.0):
+        stats = LatentStats(
+            mu=torch.randn(BATCH, LATENT_DIM),
+            logvar=torch.randn(BATCH, LATENT_DIM),
+            lower=torch.randn(BATCH, 15) * scale,
+        )
+        sigma = stats.scale_tril @ stats.scale_tril.transpose(-1, -2)
+        assert torch.allclose(sigma, sigma.transpose(-1, -2), atol=1e-5)
+        assert (torch.linalg.eigvalsh(sigma.double()) > 0).all(), f"not PD at {scale}"
+        torch.linalg.cholesky(sigma.double())  # raises if not PD
+
+
+def test_full_covariance_builds_a_multivariate_normal(full_config: ProbUNetConfig) -> None:
+    """The full path yields MultivariateNormal; the diagonal path stays Independent."""
+    from torch.distributions import Independent, MultivariateNormal
+
+    torch.manual_seed(0)
+    image = torch.rand(BATCH, 1, SIZE, SIZE)
+    mask = (torch.rand(BATCH, SIZE, SIZE) > 0.7).to(torch.int64)
+
+    full = ProbUNet(full_config).encode(image, mask)
+    assert isinstance(full.prior, MultivariateNormal)
+    assert isinstance(full.posterior, MultivariateNormal)
+
+    diagonal = ProbUNet(
+        ProbUNetConfig(latent_dim=LATENT_DIM, num_classes=NUM_CLASSES)
+    ).encode(image, mask)
+    assert isinstance(diagonal.prior, Independent)
+    assert isinstance(diagonal.posterior, Independent)
+
+    # Both report the same shapes, which is what makes the loss reduction a drop-in.
+    for encoded in (full, diagonal):
+        assert encoded.prior.batch_shape == (BATCH,)
+        assert encoded.prior.event_shape == (LATENT_DIM,)
+
+
+def test_zero_init_makes_the_factor_exactly_diagonal(full_config: ProbUNetConfig) -> None:
+    """At step 0 the full model's latent distribution replicates the diagonal one.
+
+    The strictly-lower head slice is zeroed after the He-normal pass, so L is exactly
+    diag(sigma) and any correlation the trained model shows is demonstrably learned.
+    """
+    torch.manual_seed(0)
+    model = ProbUNet(full_config)
+    assert torch.equal(
+        model.prior_net.head.weight[2 * LATENT_DIM :],
+        torch.zeros_like(model.prior_net.head.weight[2 * LATENT_DIM :]),
+    )
+    assert torch.equal(
+        model.posterior_net.head.bias[2 * LATENT_DIM :],
+        torch.zeros_like(model.posterior_net.head.bias[2 * LATENT_DIM :]),
+    )
+
+    stats = model.prior_net(torch.rand(BATCH, 1, SIZE, SIZE))
+    assert stats.lower is not None
+    assert torch.equal(stats.lower, torch.zeros_like(stats.lower))
+    factor = stats.scale_tril
+    assert torch.equal(factor, torch.diag_embed(factor.diagonal(dim1=-2, dim2=-1)))
+
+
+def test_zero_init_leaves_mu_and_logvar_he_normal(full_config: ProbUNetConfig) -> None:
+    """Only the correlation slice is zeroed; the first 2N channels keep their init."""
+    torch.manual_seed(0)
+    model = ProbUNet(full_config)
+    kept = model.prior_net.head.weight[: 2 * LATENT_DIM]
+    assert not torch.equal(kept, torch.zeros_like(kept))
+
+
+def test_gradients_reach_the_correlation_slice_from_zero(
+    full_config: ProbUNetConfig,
+) -> None:
+    """Zero-init does not strand the new parameters: dz_i/dL_ij = eps_j != 0.
+
+    Each of the N(N-1)/2 outputs occupies a distinct position in L and so receives a
+    distinct gradient -- there is no symmetry to break, which is why zero is safe here.
+    """
+    torch.manual_seed(0)
+    model = ProbUNet(full_config)
+    image = torch.rand(BATCH, 1, SIZE, SIZE)
+    mask = (torch.rand(BATCH, SIZE, SIZE) > 0.7).to(torch.int64)
+
+    output = model(image, mask)
+    output.logits.sum().backward()
+
+    slice_grad = model.posterior_net.head.weight.grad[2 * LATENT_DIM :]
+    assert slice_grad is not None
+    assert torch.isfinite(slice_grad).all()
+    assert (slice_grad != 0).any(), "the correlation slice received no gradient"
+    # Distinct gradients per output channel: no two rows are identical.
+    flat = slice_grad.flatten(start_dim=1)
+    assert len({tuple(row.tolist()) for row in flat}) == flat.shape[0]
+
+
+def test_full_covariance_parameter_count() -> None:
+    """Phase 2 costs 15,390 parameters: +0.056%, so the two arms are the same run cost."""
+    diagonal = ProbUNet(ProbUNetConfig()).parameter_counts()
+    full = ProbUNet(ProbUNetConfig(latent_covariance=FULL)).parameter_counts()
+
+    assert diagonal["total"] == 27_499_098
+    assert full["total"] == 27_514_488
+    # 512 -> 27 instead of 512 -> 12, plus biases, in each of the two latent nets.
+    per_net = (512 * 27 + 27) - (512 * 12 + 12)
+    assert per_net == 7_695
+    assert full["total"] - diagonal["total"] == 2 * per_net == 15_390
+    # The U-Net and f_comb are untouched: this flag changes only the latent heads.
+    assert full["unet"] == diagonal["unet"]
+    assert full["fcomb"] == diagonal["fcomb"]
+
+
+def test_full_covariance_trains_end_to_end(full_config: ProbUNetConfig) -> None:
+    """A forward/backward/step on the full path produces finite everything."""
+    from probunet.losses.elbo import elbo_loss
+
+    torch.manual_seed(0)
+    model = ProbUNet(full_config)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    image = torch.rand(BATCH, 1, SIZE, SIZE)
+    mask = (torch.rand(BATCH, SIZE, SIZE) > 0.7).to(torch.int64)
+
+    for _ in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        output = model(image, mask)
+        terms = elbo_loss(output.logits, mask, output.posterior, output.prior, beta=1.0)
+        assert torch.isfinite(terms["total"])
+        assert terms["kl"] >= 0
+        terms["total"].backward()
+        optimizer.step()
+
+    # After a step the correlations have actually moved off zero.
+    stats = model.prior_net(image)
+    assert stats.lower is not None
+    assert (stats.lower != 0).any(), "correlations never left the diagonal manifold"
+
+
+def test_kl_still_reduces_to_one_value_per_batch_element(
+    full_config: ProbUNetConfig,
+) -> None:
+    """MultivariateNormal keeps the reduction a drop-in: no extra sum, no lost mean."""
+    torch.manual_seed(0)
+    model = ProbUNet(full_config)
+    image = torch.rand(BATCH, 1, SIZE, SIZE)
+    mask = (torch.rand(BATCH, SIZE, SIZE) > 0.7).to(torch.int64)
+    encoded = model.encode(image, mask)
+    assert kl_divergence(encoded.posterior, encoded.prior).shape == (BATCH,)
+
+
+def test_zero_init_kl_equals_the_diagonal_kl(full_config: ProbUNetConfig) -> None:
+    """With L diagonal at init, the full KL matches the diagonal formula.
+
+    Not bit-exact -- MultivariateNormal reaches the same algebra through triangular
+    solves rather than elementwise ops, which is precisely why the diagonal path is a
+    separate branch rather than a diagonal L (Phase 2 spec, constraint 2).
+    """
+    torch.manual_seed(0)
+    model = ProbUNet(full_config)
+    image = torch.rand(BATCH, 1, SIZE, SIZE)
+    mask = (torch.rand(BATCH, SIZE, SIZE) > 0.7).to(torch.int64)
+    encoded = model.encode(image, mask)
+
+    full_kl = kl_divergence(encoded.posterior, encoded.prior)
+    hand = LatentEncoder.distribution_from_stats(
+        LatentStats(encoded.posterior_stats.mu, encoded.posterior_stats.logvar)
+    )
+    hand_prior = LatentEncoder.distribution_from_stats(
+        LatentStats(encoded.prior_stats.mu, encoded.prior_stats.logvar)
+    )
+    assert torch.allclose(full_kl, kl_divergence(hand, hand_prior), atol=1e-5)
+
+
+def test_reparameterize_refuses_full_covariance_until_stage_4(
+    full_config: ProbUNetConfig,
+) -> None:
+    """An explicit refusal, not an AttributeError on a missing base_dist."""
+    from probunet.training.diagnostics import reparameterize
+
+    torch.manual_seed(0)
+    encoded = ProbUNet(full_config).encode(torch.rand(BATCH, 1, SIZE, SIZE))
+    with pytest.raises(NotImplementedError, match="does not yet support a full-covariance"):
+        reparameterize(encoded.prior, torch.Generator().manual_seed(0))

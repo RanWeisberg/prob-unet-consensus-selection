@@ -44,11 +44,11 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import Tensor
-from torch.distributions import Independent, Normal, kl_divergence
+from torch.distributions import Independent, MultivariateNormal, Normal, kl_divergence
 
 from probunet.data.lidc import LidcDataset
 from probunet.evaluation.metrics import binary_iou
-from probunet.model.encoder import LatentStats
+from probunet.model.encoder import LatentDistribution, LatentStats
 from probunet.model.prob_unet import Encoded, ProbUNet
 
 LOGGER = logging.getLogger(__name__)
@@ -168,7 +168,7 @@ def save_diagnostic_sets(sets: DiagnosticSets, path: Path) -> None:
 
 
 def reparameterize(
-    distribution: Independent, generator: torch.Generator | None = None
+    distribution: LatentDistribution, generator: torch.Generator | None = None
 ) -> Tensor:
     """Draw a latent sample with an optionally seeded generator.
 
@@ -182,7 +182,18 @@ def reparameterize(
 
     Returns:
         A sample of shape ``(batch, latent_dim)``.
+
+    Raises:
+        NotImplementedError: For a full-covariance distribution. Stage 4 implements the
+            ``mu + L @ eps`` branch; until then this refuses explicitly rather than
+            failing on a missing ``base_dist`` attribute.
     """
+    if isinstance(distribution, MultivariateNormal):
+        raise NotImplementedError(
+            "reparameterize does not yet support a full-covariance latent "
+            "(model.latent_covariance: full). The seeded z = mu + L @ eps branch lands in "
+            "Stage 4 together with the whitened-KL diagnostics."
+        )
     base: Normal = distribution.base_dist  # type: ignore[assignment]
     if generator is None:
         return distribution.rsample()

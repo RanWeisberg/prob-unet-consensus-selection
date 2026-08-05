@@ -19,9 +19,14 @@ from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor, nn
-from torch.distributions import Independent
 
-from probunet.model.encoder import LatentEncoder, LatentStats, PosteriorNet, PriorNet
+from probunet.model.encoder import (
+    LatentDistribution,
+    LatentEncoder,
+    LatentStats,
+    PosteriorNet,
+    PriorNet,
+)
 from probunet.model.fcomb import FComb
 from probunet.model.unet import UNet
 
@@ -138,9 +143,9 @@ class Encoded:
     """
 
     features: Tensor
-    prior: Independent
+    prior: LatentDistribution
     prior_stats: LatentStats
-    posterior: Independent | None = None
+    posterior: LatentDistribution | None = None
     posterior_stats: LatentStats | None = None
 
     @property
@@ -164,12 +169,12 @@ class ProbUNetOutput:
     encoded: Encoded = field(repr=False)
 
     @property
-    def prior(self) -> Independent:
+    def prior(self) -> LatentDistribution:
         """``P(z | X)``."""
         return self.encoded.prior
 
     @property
-    def posterior(self) -> Independent | None:
+    def posterior(self) -> LatentDistribution | None:
         """``Q(z | X, Y)``."""
         return self.encoded.posterior
 
@@ -200,12 +205,14 @@ class ProbUNet(nn.Module):
         self.prior_net = PriorNet(
             image_channels=self.config.image_channels,
             latent_dim=self.config.latent_dim,
+            full_covariance=self.config.full_covariance,
             **shared,
         )
         self.posterior_net = PosteriorNet(
             image_channels=self.config.image_channels,
             mask_channels=self.config.mask_channels,
             latent_dim=self.config.latent_dim,
+            full_covariance=self.config.full_covariance,
             **shared,
         )
         self.fcomb = FComb(
@@ -223,6 +230,12 @@ class ProbUNet(nn.Module):
         self._unet_forward_calls = 0
 
         self.apply(self._init_module)
+        # After the blanket He-normal pass, so it is not overwritten: the head slice
+        # predicting L's strictly-lower triangle starts at exactly zero, making the
+        # full-covariance model an exact replica of the diagonal one at step 0. See
+        # LatentEncoder.zero_correlation_head for why that matters here specifically.
+        self.prior_net.zero_correlation_head()
+        self.posterior_net.zero_correlation_head()
 
     def _init_module(self, module: nn.Module) -> None:
         """Initialize one module: He-normal weights, truncated-normal biases.
