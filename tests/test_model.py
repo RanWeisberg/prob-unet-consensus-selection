@@ -602,3 +602,60 @@ def test_float32_end_to_end(model: ProbUNet, batch: tuple[torch.Tensor, torch.Te
     assert output.logits.dtype == torch.float32
     assert output.z.dtype == torch.float32
     assert all(p.dtype == torch.float32 for p in model.parameters())
+
+# --------------------------------------------------------------------------- #
+# Phase 2: the latent_covariance flag
+# --------------------------------------------------------------------------- #
+def test_latent_covariance_defaults_to_diagonal() -> None:
+    """The default is the paper's axis-aligned Gaussian.
+
+    Phase 2 is opt-in. A default of ``full`` would silently make every existing config
+    a Phase 2 config.
+    """
+    assert ProbUNetConfig().latent_covariance == "diagonal"
+    assert ProbUNetConfig().full_covariance is False
+
+
+@pytest.mark.parametrize("mode", ["diagonal", "full"])
+def test_latent_covariance_accepts_both_modes(mode: str) -> None:
+    """Both supported modes construct."""
+    assert ProbUNetConfig(latent_covariance=mode).latent_covariance == mode
+
+
+@pytest.mark.parametrize("mode", ["Diagonal", "FULL", "dense", "tril", "", "none"])
+def test_unknown_latent_covariance_is_rejected(mode: str) -> None:
+    """An unrecognized mode must fail loudly, never fall back to the default.
+
+    A typo that quietly trained the Phase 1 model under the Phase 2 config's name would
+    produce a comparison of the baseline against itself.
+    """
+    with pytest.raises(ValueError, match="latent_covariance must be one of"):
+        ProbUNetConfig(latent_covariance=mode)
+
+
+def test_non_positive_latent_dim_is_rejected() -> None:
+    """The config validates latent_dim, not only the encoder."""
+    with pytest.raises(ValueError, match="latent_dim must be positive"):
+        ProbUNetConfig(latent_dim=0)
+
+
+def test_latent_head_output_width_follows_the_flag() -> None:
+    """2N when diagonal, N + N(N+1)/2 when full: 12 vs 27 at N = 6."""
+    assert ProbUNetConfig(latent_dim=6).latent_head_outputs == 12
+    assert ProbUNetConfig(latent_dim=6, latent_covariance="full").latent_head_outputs == 27
+    # The extra entries are the strictly-lower triangle: 27 - 12 = 15 = 6*5/2.
+    assert 27 - 12 == 6 * 5 // 2
+    # And the arithmetic holds at other N, so nothing is hardcoded to 6.
+    for n in (1, 2, 3, 8):
+        assert ProbUNetConfig(latent_dim=n).latent_head_outputs == 2 * n
+        full = ProbUNetConfig(latent_dim=n, latent_covariance="full")
+        assert full.latent_head_outputs == n + n * (n + 1) // 2
+
+
+def test_latent_covariance_flag_is_recorded_in_the_config_dict() -> None:
+    """Phase 3 loads a frozen Phase 2 checkpoint, so the flag must survive to disk."""
+    from probunet.training.config import ExperimentConfig
+
+    config = ExperimentConfig(model=ProbUNetConfig(latent_covariance="full"))
+    assert config.to_dict()["model"]["latent_covariance"] == "full"
+    assert ExperimentConfig.from_dict(config.to_dict()).model.latent_covariance == "full"

@@ -25,6 +25,16 @@ from probunet.model.encoder import LatentEncoder, PosteriorNet, PriorNet
 from probunet.model.fcomb import FComb
 from probunet.model.unet import UNet
 
+LATENT_COVARIANCE_MODES: tuple[str, ...] = ("diagonal", "full")
+"""Supported latent covariance parameterizations.
+
+* ``"diagonal"`` -- the paper's axis-aligned Gaussian (Appendix H.1). **Phase 1.**
+* ``"full"`` -- a full covariance via its Cholesky factor. **Phase 2**, and the only
+  change Phase 2 makes.
+"""
+
+DIAGONAL, FULL = LATENT_COVARIANCE_MODES
+
 
 @dataclass(frozen=True)
 class ProbUNetConfig:
@@ -35,7 +45,15 @@ class ProbUNetConfig:
     authors' released code and stays behind this flag.
 
     Attributes:
-        latent_dim: Dimensionality ``N`` of the latent space.
+        latent_dim: Dimensionality ``N`` of the latent space. Held at 6 across both
+            Phase 2 arms: the follow-up work tuned it per model, so changing the
+            covariance *and* the dimension would confound two variables.
+        latent_covariance: ``"diagonal"`` for the paper's axis-aligned Gaussian, or
+            ``"full"`` for a full covariance parameterized by its Cholesky factor.
+            This is **the** Phase 2 flag. ``"diagonal"`` takes the Phase 1 code path
+            completely unchanged rather than a full-covariance object with a diagonal
+            factor -- the latter samples through a different kernel and drifts the
+            numbers (measured: the two KLs differ by ~5e-7).
         base_channels: Width of the shallowest scale.
         num_downs: Number of down/up-sampling operations.
         convs_per_scale: 3x3 convolutions per scale.
@@ -52,6 +70,7 @@ class ProbUNetConfig:
     """
 
     latent_dim: int = 6
+    latent_covariance: str = DIAGONAL
     base_channels: int = 32
     num_downs: int = 4
     convs_per_scale: int = 3
@@ -64,10 +83,46 @@ class ProbUNetConfig:
     align_corners: bool = False
     bias_init_std: float = 1e-3
 
+    def __post_init__(self) -> None:
+        """Validate the configuration.
+
+        Raises:
+            ValueError: If ``latent_covariance`` is not a supported mode, or
+                ``latent_dim`` is not positive. An unrecognized covariance mode must
+                fail here rather than fall through to the diagonal default: a typo
+                that silently trained the Phase 1 model under the name of the Phase 2
+                arm would produce a comparison of the baseline against itself.
+        """
+        if self.latent_covariance not in LATENT_COVARIANCE_MODES:
+            raise ValueError(
+                f"latent_covariance must be one of {LATENT_COVARIANCE_MODES}, got "
+                f"{self.latent_covariance!r}"
+            )
+        if self.latent_dim <= 0:
+            raise ValueError(f"latent_dim must be positive, got {self.latent_dim}")
+
     @property
     def resolved_fcomb_channels(self) -> int:
         """Hidden width of ``f_comb``, defaulting to the U-Net's base width."""
         return self.base_channels if self.fcomb_channels is None else self.fcomb_channels
+
+    @property
+    def full_covariance(self) -> bool:
+        """Whether the latent Gaussians carry a full covariance."""
+        return self.latent_covariance == FULL
+
+    @property
+    def latent_head_outputs(self) -> int:
+        """Number of channels the prior/posterior 1x1 head predicts.
+
+        ``2N`` for the diagonal parameterization (mean and log-variance), and
+        ``N + N(N+1)/2`` for the full one -- 27 at ``N = 6``. The layout is
+        ``[mu | logvar | strictly-lower-triangular]``, chosen so the **first 2N
+        channels mean exactly what they mean in the diagonal case**; the extra
+        ``N(N-1)/2`` are purely additive.
+        """
+        n = self.latent_dim
+        return n + n * (n + 1) // 2 if self.full_covariance else 2 * n
 
 
 @dataclass
