@@ -35,6 +35,7 @@ import torch
 from torch import Tensor, nn
 
 from probunet.model.prob_unet import ProbUNet
+from probunet.training.diagnostics import logits_to_mask, reparameterize
 from probunet.training.freeze import assert_frozen, freeze_module
 
 DEFAULT_SCORER_CHANNELS: tuple[int, ...] = (32, 64, 128)
@@ -246,6 +247,77 @@ class SelectionHead(nn.Module):
             Feature map of shape ``(B, base_channels, H, W)``.
         """
         return self.base.encode(image).features
+
+    @torch.no_grad()
+    def sample_candidates(
+        self, image: Tensor, n_samples: int, generator: torch.Generator | None = None
+    ) -> tuple[Tensor, Tensor]:
+        """Draw ``n_samples`` **prior** candidates per image, plus the cached features.
+
+        **Prior, never posterior.** Posterior samples have seen the ground-truth mask and
+        are almost always good, so a head trained only on those never encounters a bad
+        candidate and learns to emit a constant high score -- the failure CLAUDE.md names
+        explicitly. Nothing in this method can reach the posterior: the base is encoded
+        without a mask, so no posterior exists to sample from.
+
+        The U-Net runs **once**; each candidate re-runs only ``f_comb``. Binarization goes
+        through :func:`~probunet.training.diagnostics.logits_to_mask` -- argmax over the
+        class axis -- which is the same convention Phase 1 evaluation already uses. The
+        head consumes exactly the artifact that gets scored and delivered.
+
+        Args:
+            image: Image batch of shape ``(B, C, H, W)``.
+            n_samples: Candidates per image.
+            generator: Optional CPU generator. Supplied at validation so the candidate set
+                is identical across epochs and arms; omitted during training so candidates
+                are freshly resampled every epoch.
+
+        Returns:
+            ``(features, candidates)`` with shapes ``(B, C_f, H, W)`` and
+            ``(B, n_samples, H, W)``, the candidates uint8.
+        """
+        encoded = self.base.encode(image)
+        candidates = torch.stack(
+            [
+                logits_to_mask(
+                    self.base.reconstruct(encoded, reparameterize(encoded.prior, generator))
+                )
+                for _ in range(n_samples)
+            ],
+            dim=1,
+        )
+        return encoded.features, candidates
+
+    def score_candidates(self, features: Tensor, candidates: Tensor) -> Tensor:
+        """Score every candidate against its image.
+
+        Each candidate is scored **independently**, which is what lets the training and
+        evaluation candidate counts differ.
+
+        Args:
+            features: Frozen features of shape ``(B, C, H, W)``.
+            candidates: Masks of shape ``(B, n, H, W)``.
+
+        Returns:
+            Unbounded scores of shape ``(B, n)``.
+        """
+        scores = [
+            self.scorer(features, candidates[:, index])
+            for index in range(candidates.shape[1])
+        ]
+        return torch.stack(scores, dim=1)
+
+    def select(self, features: Tensor, candidates: Tensor) -> Tensor:
+        """Choose one candidate per image, **without ground truth**.
+
+        Args:
+            features: Frozen features of shape ``(B, C, H, W)``.
+            candidates: Masks of shape ``(B, n, H, W)``.
+
+        Returns:
+            Chosen indices of shape ``(B,)``.
+        """
+        return self.score_candidates(features, candidates).argmax(dim=1)
 
     def parameter_counts(self) -> dict[str, int]:
         """Parameter count for the frozen base and the trainable scorer.

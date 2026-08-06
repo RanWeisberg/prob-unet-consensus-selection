@@ -21,6 +21,7 @@ from torch.distributions import MultivariateNormal
 
 from probunet.data.lidc import DataConfig, LidcArrays, panel_batch
 from probunet.data.splits import generate_split
+from probunet.evaluation.metrics import consensus_scores
 from probunet.evaluation.sampling import SamplingConfig, collect_per_patch_metrics
 from probunet.losses.elbo import elbo_loss, kl_term
 from probunet.model.encoder import LatentStats, PriorNet
@@ -369,37 +370,200 @@ def test_a_drifting_base_is_caught_at_the_epoch_boundary(
         trainer.train_epoch(0)
 
 
-def test_scaffold_writes_last_but_refuses_best(
-    tiny_experiment: ExperimentConfig, tmp_path: Path, caplog
+def test_head_trains_and_monitors_the_deliverable(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
 ) -> None:
-    """A placeholder objective must not leave a best.pt a later stage could trust.
+    """Stage 4: the monitored metric exists, so best.pt is written on the real quantity.
 
-    The configured monitor (``val/selected_consensus_dice``) does not exist until Stage 4,
-    and the objective here is meaningless. Writing a best.pt selected on anything else --
-    or on a flat curve -- would produce a scaffold checkpoint indistinguishable from a
-    real one. Refusing loudly is the safe failure.
+    ``val/selected_consensus_dice`` is the deliverable itself -- the consensus score of the
+    sample the head picked -- so it cannot be gamed by a constant predictor, which
+    degenerates to a fixed arbitrary pick and scores about the same as random selection.
     """
     checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
     config = dataclasses.replace(
         config,
+        train=dataclasses.replace(config.train, epochs=2),
         checkpoint=dataclasses.replace(
             config.checkpoint, monitor="val/selected_consensus_dice", mode="max"
         ),
     )
     trainer = Trainer(config, base_checkpoint=checkpoint)
+    summary = trainer.train()
 
+    assert (trainer.checkpoint_dir / "best.pt").exists()
+    assert trainer.best_metric is not None
+    last = summary["history"][-1]
+    for key in (
+        "val/selected_consensus_dice",
+        "val/random_consensus_dice",
+        "val/oracle_consensus_dice",
+        "val/ceiling",
+        "val/huber",
+        "val/spearman",
+        "val/selected_fraction_of_ceiling",
+    ):
+        assert key in last, key
+    # Never reported against 1.0: soft-consensus scores are bounded by the ceiling.
+    assert last["val/selected_consensus_dice"] <= last["val/ceiling"] + 1e-6
+    # The selected sample is one of the candidates, so it cannot beat the oracle.
+    assert last["val/selected_consensus_dice"] <= last["val/oracle_consensus_dice"] + 1e-6
+    # The ELBO is not computed at all under a frozen base.
+    assert "val/total" not in last
+
+
+def test_a_missing_monitor_is_still_loud(
+    tiny_experiment: ExperimentConfig, tmp_path: Path, caplog
+) -> None:
+    """A monitor that names nothing must warn and write no best.pt, in any mode."""
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    config = dataclasses.replace(
+        config,
+        checkpoint=dataclasses.replace(config.checkpoint, monitor="val/does_not_exist"),
+    )
+    trainer = Trainer(config, base_checkpoint=checkpoint)
     with caplog.at_level(logging.WARNING):
-        summary = trainer.train()
+        trainer.train()
+    assert not (trainer.checkpoint_dir / "best.pt").exists()
+    assert "val/does_not_exist" in " ".join(r.message for r in caplog.records)
 
-    assert (trainer.checkpoint_dir / "last.pt").exists()
-    assert not (trainer.checkpoint_dir / "best.pt").exists(), "wrote a scaffold best.pt"
-    assert trainer.best_metric is None
-    messages = " ".join(record.message for record in caplog.records)
-    assert "STAGE 3 SCAFFOLD" in messages
-    assert "no best.pt" in messages
-    # The ELBO is constant under a frozen base, so it is not computed or logged at all.
-    for record in summary["history"]:
-        assert not any(key.startswith("val/") for key in record), record
+
+def test_the_head_never_touches_the_posterior(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """Candidates come from the PRIOR. A posterior-trained head learns a constant.
+
+    Posterior samples have seen the ground-truth mask and are almost always good, so a head
+    trained on them never meets a bad candidate. Asserted by watching the posterior net for
+    any call at all during a training epoch.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+
+    calls = {"n": 0}
+    handle = trainer.head.base.posterior_net.register_forward_hook(
+        lambda *_: calls.__setitem__("n", calls["n"] + 1)
+    )
+    try:
+        trainer.train_epoch(0)
+    finally:
+        handle.remove()
+    assert calls["n"] == 0, "the posterior net was invoked during head training"
+
+
+def test_the_regression_target_is_data_not_a_gradient_path(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """Targets are detached: gradients flow only through the head's prediction."""
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+    batch = next(iter(trainer.train_loader))
+
+    graders = batch["masks"].to(trainer.device)
+    _, candidates = trainer.head.sample_candidates(
+        batch["image"].to(trainer.device), 3
+    )
+    targets = trainer._consensus_targets(graders, candidates)
+    assert not targets.requires_grad
+    assert targets.grad_fn is None
+    # And they are the real soft-consensus scores, not a stand-in.
+    assert torch.allclose(targets, consensus_scores(candidates, graders))
+
+
+def test_validation_candidates_are_a_fixed_shared_set(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """The candidate set is identical across validation passes, so epochs are comparable.
+
+    Re-seeded at the start of every pass. Without this an epoch-to-epoch change in the
+    selected score would mix the head improving with the draw changing.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+
+    first = trainer.validate()
+    second = trainer.validate()
+    for key in ("random_consensus_dice", "oracle_consensus_dice", "ceiling"):
+        assert first[key] == pytest.approx(second[key], rel=1e-9), key
+
+
+def test_head_training_uses_all_four_graders(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """The head trains on the EVAL-mode four-mask shape, not the single-grader pairing.
+
+    The consensus needs every grader; a target built from one quarter of the evidence
+    would be a different quantity. DEVIATIONS entry 13.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+
+    batch = next(iter(trainer.train_loader))
+    assert "masks" in batch and batch["masks"].shape[1] == N_GRADERS
+    assert "mask" not in batch, "still on the single-grader training path"
+    # And it is the TRAIN split, not val.
+    assert len(trainer.train_loader.dataset) == len(trainer.data.datasets["train"])
+
+
+def test_selection_head_refuses_augmentation(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """Augmentation is off for this phase, and the refusal is explicit."""
+    from probunet.data.transforms import AugmentationConfig
+
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    config = dataclasses.replace(
+        config,
+        data=dataclasses.replace(
+            config.data,
+            augmentation=AugmentationConfig(enabled=True, pad_to_px=SIZE + 4),
+        ),
+    )
+    with pytest.raises(ValueError, match="augmentation.enabled=false"):
+        Trainer(config, base_checkpoint=checkpoint)
+
+
+def test_mean_centered_targets_are_available_as_the_pre_registered_fallback(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """The fallback for the image-only shortcut exists and does what it says.
+
+    Recorded in advance (FINDINGS 4.4) so that switching it on later is a planned
+    contingency rather than an unexplained pivot. Centering within each image removes the
+    between-image component a shortcut would exploit.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    config = dataclasses.replace(
+        config, head=dataclasses.replace(config.head, mean_centered_targets=True)
+    )
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+    batch = next(iter(trainer.train_loader))
+    _, candidates = trainer.head.sample_candidates(
+        batch["image"].to(trainer.device), 4
+    )
+    targets = trainer._consensus_targets(batch["masks"].to(trainer.device), candidates)
+    assert torch.allclose(
+        targets.mean(dim=1), torch.zeros(targets.shape[0]), atol=1e-6
+    )
+
+
+def test_spearman_exclusions_are_reported_not_dropped(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """Degenerate images are counted per bucket -- the fraction is itself a finding.
+
+    It measures how often the sampler offered no real choice at all.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+    metrics = trainer.validate()
+
+    assert "spearman_excluded_fraction" in metrics
+    assert 0.0 <= metrics["spearman_excluded_fraction"] <= 1.0
+    assert metrics["spearman_images"] >= 0
+    per_bucket = [k for k in metrics if k.startswith("spearman_excluded_fraction_bucket")]
+    assert per_bucket, "no per-bucket exclusion bookkeeping"
+    for key in per_bucket:
+        assert 0.0 <= metrics[key] <= 1.0
 
 
 def test_the_freeze_record_reaches_the_checkpoint(

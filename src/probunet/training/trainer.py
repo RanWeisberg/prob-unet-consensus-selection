@@ -23,6 +23,13 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 
 from probunet.data.lidc import LidcDataset, build_data, panel_batch
+from probunet.evaluation.metrics import (
+    consensus_ceiling,
+    consensus_scores,
+    consensus_selected,
+    spearman_per_image,
+)
+from probunet.evaluation.sampling import DEFAULT_EVAL_SEED
 from probunet.losses.elbo import elbo_loss
 from probunet.model.prob_unet import ProbUNet
 from probunet.training.checkpoint import (
@@ -111,6 +118,7 @@ class Trainer:
         self.model = ProbUNet(config.model).to(self.device)
         self.base_record: dict[str, object] | None = None
         self.head: SelectionHead | None = None
+        self.head_train_loader: torch.utils.data.DataLoader | None = None
         self.base_fingerprint: str | None = None
         self.base_provenance: dict[str, Any] | None = None
         if config.train.mode == "selection_head":
@@ -165,9 +173,22 @@ class Trainer:
         self.history: list[dict[str, float]] = []
 
     # ------------------------------------------------------------------ setup
+    @property
+    def train_loader(self) -> torch.utils.data.DataLoader:
+        """The loader this run trains on.
+
+        In ``selection_head`` mode that is the eval-mode four-mask loader over the train
+        split, not ``data.loaders["train"]`` -- the head needs every grader to form the
+        consensus, and the single-grader pairing an ELBO run uses would give it a target
+        computed from one quarter of the evidence.
+        """
+        return (
+            self.head_train_loader if self.head is not None else self.data.loaders["train"]
+        )
+
     def _steps_per_epoch(self) -> int:
         """Training batches per epoch, respecting ``limit_train_batches``."""
-        batches = len(self.data.loaders["train"])
+        batches = len(self.train_loader)
         limit = self.config.train.limit_train_batches
         return min(batches, limit) if limit else batches
 
@@ -398,10 +419,223 @@ class Trainer:
             base_state.torch_version,
             self.base_fingerprint[:12],
         )
-        LOGGER.warning(
-            "selection_head is STAGE 3 SCAFFOLD: the objective is a placeholder with no "
-            "scoring target. Metrics from this run mean nothing and no best.pt is written."
+        # The head needs ALL FOUR grader masks per image to form the consensus, which is
+        # the eval-mode dataset shape. With augmentation off (DEVIATIONS 13) that shape is
+        # usable directly for training, so there is no third dataset mode: the same
+        # LidcDataset class, mode="eval", over the train split's indices.
+        head_dataset = LidcDataset(
+            self.data.arrays, self.data.datasets["train"].indices, mode="eval"
         )
+        self.head_train_loader = torch.utils.data.DataLoader(
+            head_dataset,
+            batch_size=self.config.data.batch_size,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(self.config.data.pairing_seed),
+            num_workers=self.config.data.num_workers,
+            pin_memory=self.config.data.pin_memory,
+            drop_last=self.config.data.drop_last,
+            persistent_workers=False,
+        )
+        if self.data.datasets["train"].augmenting:
+            raise ValueError(
+                "selection_head requires data.augmentation.enabled=false. The head trains "
+                "on the eval-mode four-mask path, and an augmented eval dataset is refused "
+                "by construction; see DEVIATIONS.md entry 13 for why augmentation is off "
+                "for this phase rather than extended to carry four masks."
+            )
+
+    @property
+    def base_model(self) -> ProbUNet:
+        """The Probabilistic U-Net, whichever mode this run is in.
+
+        In ``selection_head`` mode ``self.model`` is the :class:`SelectionHead` wrapper, so
+        anything that needs the generative model itself -- the channel schedule, the
+        latent diagnostics, sampling -- has to reach through it rather than assume
+        ``self.model`` is a ``ProbUNet``.
+        """
+        return self.head.base if self.head is not None else self.model
+
+    @property
+    def is_selection_head(self) -> bool:
+        """Whether this run trains the selection head rather than the ELBO."""
+        return self.config.train.mode == "selection_head"
+
+    def _elbo_step(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """One ELBO training step: z from the posterior, CE + beta*KL.
+
+        Extracted unchanged from the training loop so ``train_epoch`` can dispatch between
+        objectives without an inline branch. Phases 1 and 2 take this path.
+
+        Args:
+            batch: A training batch carrying ``image`` and one paired grader ``mask``.
+
+        Returns:
+            The ELBO terms; ``total`` is what is minimized.
+        """
+        image = batch["image"].to(self.device, non_blocking=True)
+        mask = batch["mask"].to(self.device, non_blocking=True)
+        output = self.model(image, mask)
+        return elbo_loss(
+            output.logits, mask, output.posterior, output.prior, beta=self.config.loss.beta
+        )
+
+    def _consensus_targets(self, graders: Tensor, candidates: Tensor) -> Tensor:
+        """Soft-consensus Dice of each candidate: the head's regression target.
+
+        Computed under ``no_grad`` and returned detached -- it is **data**, not a
+        differentiable objective. Gradients must flow only through the head's prediction.
+
+        Args:
+            graders: All four grader masks, shape ``(B, 4, H, W)``.
+            candidates: Binary candidates, shape ``(B, n, H, W)``.
+
+        Returns:
+            Targets of shape ``(B, n)``.
+        """
+        with torch.no_grad():
+            targets = consensus_scores(candidates, graders)
+            if self.config.head.mean_centered_targets:
+                # The pre-registered fallback (FINDINGS 4.4): remove the between-image
+                # component so the head cannot score well by predicting each image's
+                # typical value while ignoring the candidate.
+                targets = targets - targets.mean(dim=1, keepdim=True)
+        return targets.detach()
+
+    def _selection_head_step(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """One head training step: draw candidates, score them, regress onto the target.
+
+        Draws ``head.train_samples`` **prior** candidates per image, scores each against
+        the soft consensus of the four graders, and fits the head's prediction to that
+        score under a Huber loss.
+
+        **Prior candidates, never posterior.** Posterior samples have seen the ground-truth
+        mask and are almost always good, so a head trained on them would never meet a bad
+        candidate and would learn a constant high score.
+
+        **Candidates are redrawn every step**, which is where the head's data variety comes
+        from -- and the reason augmentation is off for this phase (DEVIATIONS 13): the head
+        sees fresh candidates on every pass, so its effective dataset is already far larger
+        than the patch count.
+
+        Args:
+            batch: An eval-mode batch carrying ``image`` and all four ``masks``.
+
+        Returns:
+            ``total`` (the Huber loss), plus the mean predicted and target scores for
+            monitoring drift between them.
+        """
+        image = batch["image"].to(self.device, non_blocking=True)
+        graders = batch["masks"].to(self.device, non_blocking=True)
+
+        # sample_candidates is @torch.no_grad on a frozen base: no gradient path exists
+        # back into the generative model.
+        features, candidates = self.head.sample_candidates(
+            image, self.config.head.train_samples
+        )
+        targets = self._consensus_targets(graders, candidates)
+        predicted = self.head.score_candidates(features, candidates)
+
+        loss = torch.nn.functional.huber_loss(
+            predicted, targets, delta=self.config.head.huber_delta
+        )
+        return {
+            "total": loss,
+            "target_mean": targets.mean().detach(),
+            "predicted_mean": predicted.mean().detach(),
+        }
+
+    @torch.no_grad()
+    def _validate_selection_head(self) -> dict[str, float]:
+        """Validate the head on what it is actually for: the sample it selects.
+
+        **One shared candidate set per image.** The candidates are drawn once, at a fixed
+        seed re-set at the start of every validation pass, and the head-selected, random
+        and oracle scores are all computed from that same set. Scoring them from
+        independent draws would confound the head's contribution with sampling noise, and
+        re-seeding each pass makes the candidate set identical across epochs and across
+        arms, so an epoch-to-epoch change is the head changing rather than the draw.
+
+        Returns:
+            The monitored ``selected_consensus_dice`` plus the baselines it must beat, the
+            regression loss, and the rank correlation with its exclusion bookkeeping.
+        """
+        self.model.eval()
+        config = self.config.head
+        limit = self.config.train.limit_val_batches
+        generator = torch.Generator().manual_seed(DEFAULT_EVAL_SEED)
+
+        totals: dict[str, float] = {}
+        images = 0
+        rho_sum = 0.0
+        rho_valid = 0
+        rho_by_bucket: dict[int, list[int]] = {}
+
+        for index, batch in enumerate(self.data.loaders["val"]):
+            if limit and index >= limit:
+                break
+            image = batch["image"].to(self.device, non_blocking=True)
+            graders = batch["masks"].to(self.device, non_blocking=True)
+
+            features, candidates = self.head.sample_candidates(
+                image, config.eval_samples, generator
+            )
+            scores = consensus_scores(candidates, graders)
+            predicted = self.head.score_candidates(features, candidates)
+            chosen = predicted.argmax(dim=1)
+
+            batch_totals = {
+                # THE deliverable, and the monitored metric.
+                "selected_consensus_dice": consensus_selected(candidates, graders, chosen),
+                "random_consensus_dice": scores.mean(dim=1),
+                "oracle_consensus_dice": scores.amax(dim=1),
+                "ceiling": consensus_ceiling(graders),
+                "huber": torch.nn.functional.huber_loss(
+                    predicted,
+                    self._consensus_targets(graders, candidates),
+                    delta=config.huber_delta,
+                    reduction="none",
+                ).mean(dim=1),
+            }
+            for key, value in batch_totals.items():
+                totals[key] = totals.get(key, 0.0) + float(value.sum())
+            images += image.shape[0]
+
+            rho, valid = spearman_per_image(predicted, scores)
+            rho_sum += float(rho[valid].sum()) if bool(valid.any()) else 0.0
+            rho_valid += int(valid.sum())
+            # spearman_per_image returns CPU tensors (float64 ranks are unavailable on
+            # MPS), so the bucket selector has to live there too.
+            buckets = (graders.flatten(start_dim=2).sum(dim=2) > 0).sum(dim=1).cpu()
+            for bucket in range(1, N_GRADERS + 1):
+                selector = buckets == bucket
+                if not bool(selector.any()):
+                    continue
+                counts = rho_by_bucket.setdefault(bucket, [0, 0])
+                counts[0] += int(selector.sum())
+                counts[1] += int(valid[selector].sum())
+
+        metrics = {key: value / max(images, 1) for key, value in totals.items()}
+        # Report the deliverable against what it could have reached, never against 1.0:
+        # soft-consensus scores are bounded well below 1 by construction.
+        metrics["selected_fraction_of_ceiling"] = metrics["selected_consensus_dice"] / max(
+            metrics["ceiling"], 1e-12
+        )
+        metrics["headroom_captured"] = (
+            metrics["selected_consensus_dice"] - metrics["random_consensus_dice"]
+        ) / max(metrics["oracle_consensus_dice"] - metrics["random_consensus_dice"], 1e-12)
+
+        # Spearman over the images where it is DEFINED, with the exclusions counted rather
+        # than silently dropped. The excluded fraction is itself a finding: it measures how
+        # often the sampler offered no real choice, and on bucket 1 -- where empty
+        # candidates all score exactly 0.000 -- it is expected to be substantial.
+        metrics["spearman"] = rho_sum / max(rho_valid, 1)
+        metrics["spearman_images"] = float(rho_valid)
+        metrics["spearman_excluded_fraction"] = 1.0 - rho_valid / max(images, 1)
+        for bucket, (seen, valid_count) in sorted(rho_by_bucket.items()):
+            metrics[f"spearman_excluded_fraction_bucket{bucket}"] = 1.0 - valid_count / max(
+                seen, 1
+            )
+        return metrics
 
     @property
     def base_model(self) -> ProbUNet:
@@ -580,9 +814,12 @@ class Trainer:
             # The freeze must hold at the START of the epoch too, so a failure is
             # attributed to the right epoch rather than to the next one.
             self.head.assert_base_frozen()
-        # Fresh grader pairing for this epoch, reproducible from (pairing_seed, epoch).
-        self.data.set_epoch(epoch)
-        loader = self.data.loaders["train"]
+        if self.head is None:
+            # Fresh grader pairing for this epoch, reproducible from (pairing_seed, epoch).
+            # The head has no pairing: it sees all four masks every epoch, and its
+            # epoch-to-epoch variety comes from freshly drawn candidates instead.
+            self.data.set_epoch(epoch)
+        loader = self.train_loader
         limit = self.config.train.limit_train_batches
 
         totals: dict[str, float] = {}
@@ -671,10 +908,10 @@ class Trainer:
             Mean validation metrics.
         """
         if self.head is not None:
-            # With a frozen base the ELBO is a constant, so computing it would burn a
-            # full validation pass to log a flat line, and monitoring it would mean
-            # selecting checkpoints on noise. Head metrics arrive in Stage 4.
-            return {}
+            # With a frozen base the ELBO is a constant, so computing it would burn a full
+            # validation pass to log a flat line, and monitoring it would mean selecting
+            # checkpoints on noise. The head has its own metrics.
+            return self._validate_selection_head()
 
         self.model.eval()
         loader = self.data.loaders["val"]
@@ -977,7 +1214,7 @@ class Trainer:
             record: Flat metric mapping for this epoch.
         """
         policy = self.config.checkpoint
-        generator = self.data.loaders["train"].generator
+        generator = self.train_loader.generator
         common = {
             "model": self.model,
             "optimizer": self.optimizer,
@@ -1069,7 +1306,7 @@ class Trainer:
         from probunet.training.checkpoint import loader_generator_state
 
         saved = loader_generator_state(path)
-        generator = self.data.loaders["train"].generator
+        generator = self.train_loader.generator
         if saved is not None and generator is not None:
             generator.set_state(saved)
 

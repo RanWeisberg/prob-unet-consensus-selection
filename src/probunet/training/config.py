@@ -282,6 +282,60 @@ class CheckpointConfig:
 
 
 @dataclass(frozen=True)
+class HeadConfig:
+    """Selection-head hyperparameters. Used only when ``train.mode == "selection_head"``.
+
+    Attributes:
+        train_samples: Prior candidates drawn per image per training step. 8. Sampling
+            re-runs only ``f_comb`` with the base under ``no_grad``, so K candidates cost
+            K forward passes of a 1x1-conv stack, not K passes of the U-Net.
+        eval_samples: Candidates per image at validation. 16, so the numbers sit beside
+            the existing Phase 1 table. **Train-K need not equal eval-K**, because the head
+            scores each candidate independently -- a genuine advantage of the regression
+            formulation over a listwise or pairwise one, and worth a sentence in the report.
+        huber_delta: Transition point of the Huber loss. 0.1, chosen at the scale of
+            *within-image* score differences, so the differences the head must actually
+            discriminate sit in the quadratic region while cross-bucket errors get linear
+            treatment. Not MSE: the target distribution is bounded and bucket-1-heavy near
+            zero, so squared error over-weights the few high-target bucket-4 images. Not
+            L1: its constant gradient near zero jitters at convergence.
+        scorer_channels: Width of each stride-2 convolution in the scorer tower.
+        mean_centered_targets: **Pre-registered fallback, off by default.** Achievable
+            scores are strongly bucket-dependent (ceilings 0.40 to 1.00), so plain
+            regression can score well by predicting each image's typical value while
+            ignoring the candidate entirely. If validation Spearman sits near zero while
+            the Huber loss looks healthy, switch this on: targets are then centered within
+            each image, which removes the between-image component the shortcut exploits.
+            Recorded here in advance so that taking it later is a planned contingency
+            rather than an unexplained mid-project pivot.
+
+    Raises:
+        ValueError: If a value is out of range.
+    """
+
+    train_samples: int = 8
+    eval_samples: int = 16
+    huber_delta: float = 0.1
+    scorer_channels: tuple[int, ...] = (32, 64, 128)
+    mean_centered_targets: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate the head settings."""
+        for name in ("train_samples", "eval_samples"):
+            value = getattr(self, name)
+            if value < 2:
+                raise ValueError(
+                    f"{name} must be at least 2 -- a single candidate gives the head "
+                    f"nothing to discriminate between, got {value}"
+                )
+        if self.huber_delta <= 0:
+            raise ValueError(f"huber_delta must be positive, got {self.huber_delta}")
+        if not self.scorer_channels:
+            raise ValueError("scorer_channels must not be empty")
+        object.__setattr__(self, "scorer_channels", tuple(self.scorer_channels))
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     """The full configuration of one run."""
 
@@ -294,6 +348,7 @@ class ExperimentConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     log: LogConfig = field(default_factory=LogConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    head: HeadConfig = field(default_factory=HeadConfig)
 
     def __post_init__(self) -> None:
         """Cross-section validation."""
@@ -418,6 +473,7 @@ _CONFIG_TYPES = {
     "TrainConfig": TrainConfig,
     "LogConfig": LogConfig,
     "CheckpointConfig": CheckpointConfig,
+    "HeadConfig": HeadConfig,
 }
 
 

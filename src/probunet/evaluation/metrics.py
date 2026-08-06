@@ -672,3 +672,92 @@ def summarize(values: np.ndarray | Tensor) -> dict[str, float | int]:
         "max": float(array.max()),
         "n_negative": int((array < 0).sum()),
     }
+
+
+def spearman_per_image(
+    predicted: Tensor, target: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Per-image Spearman correlation between predicted and true candidate scores.
+
+    Measures whether the head **ranks** candidates correctly, which is the only thing
+    selection actually needs. It is reported beside the regression loss because the two
+    can disagree loudly: on bucket-1 images almost every candidate scores near 0, so a head
+    that predicts a constant ~0.1 everywhere achieves a small Huber loss while ranking
+    nothing. That is the image-only shortcut FINDINGS 4.4 pre-registers a fallback for, and
+    a healthy loss beside a near-zero Spearman is exactly its signature.
+
+    **Degenerate images are excluded and counted, never silently dropped.** If all of an
+    image's candidates share one score, Spearman is undefined -- zero variance in the
+    denominator. This is not rare here: on bucket 1 empty candidates all score exactly
+    0.000, so ties are common and whole images can be constant. The excluded *fraction* is
+    itself a finding, because it measures how often the sampler offers no real choice, so
+    the caller receives the validity mask rather than an average that quietly rests on a
+    subset.
+
+    Ties within an otherwise varying image are handled by average ranking, the standard
+    convention, so a partial tie degrades the correlation rather than invalidating it.
+
+    Args:
+        predicted: Predicted scores of shape ``(B, n)``.
+        target: True scores of the same shape.
+
+    Returns:
+        ``(rho, valid)``, both on the **CPU**: ``rho`` is ``(B,)`` float32 with NaN where
+        undefined, and ``valid`` is a ``(B,)`` bool mask, True where both sides had
+        non-degenerate variance.
+
+    Raises:
+        ValueError: If the shapes differ or there are fewer than two candidates.
+    """
+    if predicted.shape != target.shape:
+        raise ValueError(
+            f"shape mismatch: {tuple(predicted.shape)} vs {tuple(target.shape)}"
+        )
+    if predicted.dim() != 2:
+        raise ValueError(f"expected (B, n), got {tuple(predicted.shape)}")
+    if predicted.shape[1] < 2:
+        raise ValueError("need at least two candidates to correlate")
+
+    # CPU before float64: MPS has no float64 at all, and ranks want the precision more
+    # than they want the device. These are (B, n) with n = 16, so the transfer is free.
+    left = _average_ranks(predicted.detach().cpu().to(torch.float64))
+    right = _average_ranks(target.detach().cpu().to(torch.float64))
+    left = left - left.mean(dim=1, keepdim=True)
+    right = right - right.mean(dim=1, keepdim=True)
+
+    numerator = (left * right).sum(dim=1)
+    denominator = left.pow(2).sum(dim=1).sqrt() * right.pow(2).sum(dim=1).sqrt()
+    # A constant side gives a zero-length rank vector: the correlation is undefined, not
+    # zero. Zero would read as "the head ranked randomly", which is a different claim.
+    valid = denominator > 1e-12
+    rho = torch.where(valid, numerator / denominator.clamp_min(1e-12), torch.nan)
+    return rho.to(torch.float32), valid
+
+
+def _average_ranks(values: Tensor) -> Tensor:
+    """Rank each row, averaging the ranks of tied values.
+
+    Args:
+        values: Scores of shape ``(B, n)``.
+
+    Returns:
+        Ranks of shape ``(B, n)``, float64.
+    """
+    order = values.argsort(dim=1)
+    ranks = torch.empty_like(values)
+    positions = torch.arange(
+        values.shape[1], dtype=values.dtype, device=values.device
+    ).expand_as(values)
+    ranks.scatter_(1, order, positions)
+
+    # Average the ranks within each group of equal values, per row.
+    for row in range(values.shape[0]):
+        unique, inverse = torch.unique(values[row], return_inverse=True)
+        if unique.numel() == values.shape[1]:
+            continue  # no ties in this row
+        totals = torch.zeros(unique.numel(), dtype=values.dtype, device=values.device)
+        counts = torch.zeros_like(totals)
+        totals.index_add_(0, inverse, ranks[row])
+        counts.index_add_(0, inverse, torch.ones_like(ranks[row]))
+        ranks[row] = (totals / counts)[inverse]
+    return ranks

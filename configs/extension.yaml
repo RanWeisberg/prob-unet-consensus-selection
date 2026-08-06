@@ -1,9 +1,8 @@
-# Extension variant: the consensus-selection head -- SCAFFOLD, not yet runnable.
+# Extension variant (Phase 3): the consensus-selection head. LIVE.
 #
 # train.mode = selection_head trains the head on top of an already-trained, FROZEN
-# Probabilistic U-Net. Running it today loads the base checkpoint, freezes it, logs the
-# freeze record, and then raises NotImplementedError: the freeze contract exists and is
-# tested, the head does not.
+# Probabilistic U-Net: draw prior candidates, score each against the soft consensus of the
+# four graders, and regress the head's prediction onto that score.
 #
 #   python scripts/train.py --config configs/extension.yaml \
 #       --base-checkpoint runs/modernized/checkpoints/best.pt
@@ -30,41 +29,21 @@
 # The head trains on PRIOR samples. Posterior samples are almost always good, so a head
 # trained only on those never sees a bad mask and learns a constant high score.
 #
-# HEAD HYPERPARAMETERS -- decided, wired in Stage 4 (they need config plumbing that does
-# not exist yet; recorded here so the decisions are not re-litigated):
-#   - loss: Huber, delta 0.1. Not MSE -- the target distribution is bounded and
-#     bucket-1-heavy near zero, so MSE over-weights the few high-target bucket-4 images.
-#     Not L1 -- its constant gradient near zero jitters at convergence. delta is set at
-#     the scale of WITHIN-IMAGE score differences, so the differences the head actually
-#     has to discriminate sit in the quadratic region while cross-bucket errors get
-#     linear treatment.
-#   - head: concat frozen U-Net features (32ch, 128x128) with the BINARIZED candidate
-#     (1ch) -> strided conv tower 33->32->64->128, stride 2 (128->64->32->16) -> global
-#     average pool -> MLP 128->1. ~150k parameters. Local convolution over
-#     features+mask is what computes spatial agreement; DO NOT pool early.
-#     DO NOT feed mask summary statistics such as area: pooling recovers area implicitly
-#     and handing it over explicitly makes the size-prior shortcut easier to learn.
-#     A mask-area-only regressor is kept as a DIAGNOSTIC -- if the head barely beats it,
-#     the head learned size priors, not spatial agreement.
-#   - samples per image: 8 at training, 16 at evaluation. Sampling re-runs only f_comb
-#     with the base under no_grad, so 8 candidates cost 8x f_comb, not 8x forward.
-#     Train-K need not equal eval-K because the head scores each candidate
-#     INDEPENDENTLY -- a genuine advantage of the regression formulation. K and batch
-#     size are FIXED once: head-on-Phase1 vs head-on-Phase2 requires both runs identical.
-#     If 8 GiB OOMs, reduce batch size, not K, and record it.
-#   - output activation: LINEAR, unbounded. Not sigmoid -- targets cluster near zero,
-#     which is where sigmoid's inverse is steepest, so it would drive pre-activations far
-#     negative and saturate. The score is only ever argmax'd within an image, so values
-#     outside [0, 1] are cosmetic. Clamp for DISPLAY only, never before the loss.
-#   - binarization: reuse diagnostics.logits_to_mask (argmax over the class axis), the
-#     same convention Phase 1 evaluation already uses. Soft-probability input to the head
-#     is a possible ablation, not the default.
+# HEAD HYPERPARAMETERS are in the `head:` block below, each with its reasoning.
 #
-# PLANNED FALLBACK, pre-registered so that taking it later is not an unexplained pivot:
-# achievable score is strongly bucket-dependent (ceiling 0.40 vs 1.00), so plain
-# regression can score well by predicting each image's typical value while ignoring the
-# candidate. If val Spearman sits near zero while Huber loss looks healthy, switch to
-# PER-IMAGE MEAN-CENTERED targets.
+# Two that are not config values and must not drift:
+#   - The head is deliberately NOT given mask summary statistics such as area. Pooling
+#     recovers area implicitly, and handing it over explicitly makes the size-prior
+#     shortcut easier to learn. A mask-area-only regressor is kept as a DIAGNOSTIC: if the
+#     head barely beats it, the head learned size priors, not spatial agreement.
+#   - Binarization reuses diagnostics.logits_to_mask (argmax over the class axis), the same
+#     convention Phase 1 evaluation already uses -- the head consumes exactly the artifact
+#     that gets scored and delivered. Soft-probability input is a possible ablation.
+#
+# The scorer output is LINEAR and unbounded. Not sigmoid: targets cluster near zero, which
+# is where sigmoid's inverse is steepest, so it would drive pre-activations far negative
+# and saturate. The score is only ever argmax'd within an image, so values outside [0, 1]
+# are cosmetic -- clamp for DISPLAY only, never before the loss.
 #
 # The model block must match the base checkpoint's architecture exactly, or the weights
 # will not load. It is repeated here rather than inherited so a mismatch is visible.
@@ -92,6 +71,32 @@ model:
 
 loss:
   beta: 1.0               # unused in selection_head mode; the head has its own objective
+
+head:
+  # Prior candidates per image per TRAINING step. Sampling re-runs only f_comb with the
+  # base under no_grad, so 8 candidates cost 8 passes of a 1x1-conv stack, not 8 U-Nets.
+  train_samples: 8
+  # Candidates at VALIDATION -- 16, so the numbers sit beside the Phase 1 table. Train-K
+  # need not equal eval-K because the head scores each candidate INDEPENDENTLY, which is a
+  # genuine advantage of the regression formulation and worth a sentence in the report.
+  # Both are FIXED once: head-on-Phase1 vs head-on-Phase2 requires identical runs. If
+  # 8 GiB OOMs, reduce data.batch_size, NOT these, and record it.
+  eval_samples: 16
+  # Huber, not MSE and not L1. delta is set at the scale of WITHIN-IMAGE score
+  # differences, so the differences the head must actually discriminate sit in the
+  # quadratic region while cross-bucket errors get linear treatment. MSE would
+  # over-weight the few high-target bucket-4 images given a target distribution that is
+  # bounded and bucket-1-heavy near zero; L1's constant gradient near zero jitters at
+  # convergence.
+  huber_delta: 0.1
+  scorer_channels: [32, 64, 128]
+  # PRE-REGISTERED FALLBACK, off by default (FINDINGS 4.4). Achievable scores are strongly
+  # bucket-dependent, so plain regression can score well by predicting each image's typical
+  # value while ignoring the candidate. If val Spearman sits near zero while the Huber loss
+  # looks healthy, switch this on -- targets are then centered within each image, removing
+  # the between-image component the shortcut exploits. Recorded in advance so that taking
+  # it later is a planned contingency, not an unexplained pivot.
+  mean_centered_targets: false
 
 data:
   npz_path: data/processed/lidc.npz
