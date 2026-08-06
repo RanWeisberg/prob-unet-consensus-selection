@@ -68,7 +68,7 @@ Three variants, **one model implementation**, selected by config:
 ```bash
 python scripts/train.py --config configs/smoke.yaml        # verify the loop, <1 min
 python scripts/train.py --config configs/baseline.yaml     # phase 1
-python scripts/train.py --config configs/modernized.yaml   # phase 2 (scaffold)
+python scripts/train.py --config configs/modernized.yaml   # phase 2
 python scripts/train.py --config configs/extension.yaml \
     --base-checkpoint runs/modernized/checkpoints/best.pt  # phase 3 (scaffold)
 
@@ -78,10 +78,21 @@ python scripts/compare.py --split val \
     --checkpoint modernized=runs/modernized/checkpoints/best.pt
 ```
 
-`configs/modernized.yaml` and `configs/extension.yaml` are scaffolds: the phase-2 flags
-do not exist yet, and `extension.yaml` loads and freezes its base model and then raises,
-because the head is phase 3. Diff the configs — the only lines that differ between
-variants are the flags under test.
+`configs/modernized.yaml` is live: it sets `model.latent_covariance: full`, a
+full-covariance latent Gaussian parameterized by its Cholesky factor, and that one line is
+its only difference from `baseline.yaml` besides the run name. Diff the configs — the only
+lines that differ between variants are the flags under test.
+
+`configs/extension.yaml` is still a scaffold: it loads and freezes its base model, logs the
+freeze record, and then raises, because the head is phase 3. Its **scoring target is
+decided** — a candidate mask is scored by soft Dice against the *soft consensus*
+`c = mean of the four grader masks`, so each pixel of `c` says what fraction of graders
+included it, and the head regresses onto that score. Consensus is the **selection target
+only**: GED and every other distribution metric keep using the four separate grader masks,
+because collapsing them into one average would discard exactly the grader spread phase 1
+measures. Note that soft-consensus scores are bounded well below 1 by construction — a
+perfect mask on an image where only one of four graders saw a lesion scores 0.40, not 1.0 —
+so they are reported against the per-bucket ceiling, never against 1.0.
 
 `--split` is required and has no default: development happens on `val`, and `test` is
 evaluated once for the final numbers. Metrics are GED at 1/4/8/16 samples, oracle /
