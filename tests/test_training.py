@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -55,7 +56,13 @@ from probunet.training.diagnostics import (
     whitened_kl_decomposition,
 )
 from probunet.training.trainer import Trainer
-from probunet.utils.runtime import git_revision, rng_state, select_device, set_rng_state
+from probunet.utils.runtime import (
+    git_revision,
+    rng_state,
+    select_device,
+    set_rng_state,
+    source_is_dirty,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIGS = REPO_ROOT / "configs"
@@ -1565,3 +1572,73 @@ def test_git_revision_is_a_string() -> None:
     """Provenance is best-effort but never blank."""
     revision = git_revision()
     assert isinstance(revision, str) and revision
+
+def make_repo(root: Path) -> None:
+    """Initialize a git repo with a source file and a tracked results file.
+
+    Args:
+        root: Directory to turn into a repository.
+    """
+    (root / "src").mkdir(parents=True, exist_ok=True)
+    (root / "results").mkdir(parents=True, exist_ok=True)
+    (root / "src" / "code.py").write_text("x = 1\n")
+    (root / "results" / "metrics.json").write_text("{}\n")
+    for command in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@t"],
+        ["git", "config", "user.name", "t"],
+        ["git", "add", "-A"],
+        ["git", "commit", "-qm", "init"],
+    ):
+        subprocess.run(command, cwd=root, check=True, capture_output=True)
+
+
+def test_results_only_changes_do_not_mark_the_source_dirty(tmp_path: Path) -> None:
+    """``-dirty`` must mean "the code is not this SHA", not "a result was written".
+
+    ``results/`` is tracked on purpose, so every measurement run dirties the tree simply
+    by writing the JSON it was asked to write. If that raised ``-dirty``, the marker would
+    fire on the most routine action in the project and stop being read -- which is exactly
+    when a genuine source change needs it to be believed.
+    """
+    make_repo(tmp_path)
+    assert not source_is_dirty(tmp_path)
+    assert not git_revision(tmp_path).endswith("-dirty")
+
+    # A measurement run writing its output: tracked, but provenance-irrelevant.
+    (tmp_path / "results" / "metrics.json").write_text('{"effrank": 1.19}\n')
+    assert not source_is_dirty(tmp_path), "a results write was reported as source drift"
+    assert not git_revision(tmp_path).endswith("-dirty")
+
+    # A source change: the recorded SHA no longer describes the code that ran.
+    (tmp_path / "src" / "code.py").write_text("x = 2\n")
+    assert source_is_dirty(tmp_path)
+    assert git_revision(tmp_path).endswith("-dirty")
+
+
+def test_source_dirty_covers_configs_and_tests(tmp_path: Path) -> None:
+    """Configs change what a run computes, so they count as source."""
+    make_repo(tmp_path)
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "baseline.yaml").write_text("a: 1\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "config"], cwd=tmp_path, check=True, capture_output=True
+    )
+    assert not source_is_dirty(tmp_path)
+
+    (tmp_path / "configs" / "baseline.yaml").write_text("a: 2\n")
+    assert source_is_dirty(tmp_path), "a config change must invalidate provenance"
+
+
+def test_data_splits_are_provenance_irrelevant(tmp_path: Path) -> None:
+    """The frozen split is tracked but is an input, not the code that ran."""
+    make_repo(tmp_path)
+    (tmp_path / "data" / "splits").mkdir(parents=True)
+    (tmp_path / "data" / "splits" / "split.json").write_text("{}\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "split"], cwd=tmp_path, check=True, capture_output=True
+    )
+    (tmp_path / "data" / "splits" / "split.json").write_text('{"train": []}\n')
+    assert not source_is_dirty(tmp_path)

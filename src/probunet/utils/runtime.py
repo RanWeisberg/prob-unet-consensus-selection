@@ -94,16 +94,96 @@ def seed_everything(seed: int, deterministic: bool = True) -> None:
         torch.backends.cudnn.benchmark = False
 
 
-def git_revision(repo: Path | None = None) -> str:
-    """Return the current git revision, marked ``-dirty`` if the tree is modified.
+PROVENANCE_IRRELEVANT_PREFIXES: tuple[str, ...] = ("results/", "data/")
+"""Tracked paths whose modification says nothing about which code produced a result.
+
+``results/`` is tracked on purpose (CLAUDE.md's artifact table), so **every measurement
+run dirties the tree by doing its job** -- it writes the JSON it was asked to write. Same
+for ``data/splits/``. Marking those runs ``-dirty`` would attach the warning to the most
+routine action in the project, and a warning that fires on every ordinary run is one that
+gets ignored precisely when it matters.
+
+Everything else -- ``src/``, ``scripts/``, ``tests/``, ``configs/``, ``pyproject.toml`` --
+does change what a run computes, and a modification there means the recorded SHA does not
+describe the code that ran.
+"""
+
+
+def _dirty_paths(root: Path) -> list[str]:
+    """Paths reported as modified by ``git status --porcelain``.
+
+    Args:
+        root: Repository root.
+
+    Returns:
+        Repository-relative paths, renames resolved to their destination.
+
+    Raises:
+        subprocess.SubprocessError: If git fails.
+        OSError: If git is unavailable.
+    """
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout
+    paths = []
+    for line in status.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip()
+        # "old -> new" for renames: the destination is what exists now.
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        paths.append(path.strip('"'))
+    return paths
+
+
+def source_is_dirty(repo: Path | None = None) -> bool:
+    """Whether any *provenance-relevant* tracked file is modified.
+
+    Distinguishes "the code that ran is not the code at this SHA" from "this run wrote
+    the results file it was supposed to write". Only the first invalidates provenance.
 
     Args:
         repo: Repository root; defaults to the package's repository.
 
     Returns:
-        The short SHA, optionally suffixed with ``-dirty``, or ``"unknown"`` when git
-        is unavailable or this is not a repository. Provenance that silently reads
-        "unknown" is better than a crash, but it is worth noticing in the log.
+        True if anything outside :data:`PROVENANCE_IRRELEVANT_PREFIXES` is modified.
+        False when git is unavailable -- :func:`git_revision` already reports that as
+        ``"unknown"``, and reporting it twice would be noise.
+    """
+    root = repo or Path(__file__).resolve().parents[3]
+    try:
+        paths = _dirty_paths(root)
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return any(
+        not path.startswith(PROVENANCE_IRRELEVANT_PREFIXES) for path in paths
+    )
+
+
+def git_revision(repo: Path | None = None) -> str:
+    """Return the current git revision, marked ``-dirty`` if the **source** is modified.
+
+    ``-dirty`` means *the recorded SHA does not describe the code that ran*. It is
+    deliberately **not** raised by changes confined to
+    :data:`PROVENANCE_IRRELEVANT_PREFIXES`: ``results/`` is tracked, so a measurement run
+    dirties the tree simply by writing its output, and flagging that would make the marker
+    fire on the most routine action in the project. A marker that cries wolf on every
+    measurement run stops being read.
+
+    Args:
+        repo: Repository root; defaults to the package's repository.
+
+    Returns:
+        The short SHA, suffixed with ``-dirty`` only when provenance-relevant files are
+        modified, or ``"unknown"`` when git is unavailable or this is not a repository.
+        Provenance that silently reads "unknown" is better than a crash, but it is worth
+        noticing in the log.
     """
     root = repo or Path(__file__).resolve().parents[3]
     try:
@@ -115,17 +195,13 @@ def git_revision(repo: Path | None = None) -> str:
             timeout=10,
             check=True,
         ).stdout.strip()
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        ).stdout.strip()
+        dirty = any(
+            not path.startswith(PROVENANCE_IRRELEVANT_PREFIXES)
+            for path in _dirty_paths(root)
+        )
     except (subprocess.SubprocessError, OSError):
         return "unknown"
-    return f"{sha}-dirty" if status else sha
+    return f"{sha}-dirty" if dirty else sha
 
 
 def rng_state() -> dict[str, object]:
