@@ -89,7 +89,25 @@ class MaskScorer(nn.Module):
             previous = width
         self.tower = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.project = nn.Linear(previous, 1)
+        # A HIDDEN LAYER, and the reason is structural rather than a guess about capacity.
+        #
+        # The target is a RATIO: soft Dice is 2*sum(s*c) / (sum(s) + sum(c)). Global
+        # average pooling hands the readout spatial *averages* -- roughly an overlap term,
+        # a candidate-area term and a consensus-area term -- and a single linear layer can
+        # only form a weighted SUM of those, `a*overlap + b*area_s + c*area_c`. It can
+        # never form their quotient. One ReLU hidden layer can approximate the division.
+        #
+        # This also bears directly on the size-prior shortcut (FINDINGS 4.4, the
+        # pre-registered mean-centering fallback). Achievable scores are strongly
+        # bucket-dependent -- ceilings run 0.40 to 0.89 -- so normalizing by the areas is
+        # exactly what the task demands. A head that structurally *cannot* divide has no
+        # way to express that normalization, and the nearest thing it can express is an
+        # area prior: precisely the shortcut we are trying to avoid rewarding.
+        self.project = nn.Sequential(
+            nn.Linear(previous, previous),
+            nn.ReLU(inplace=True),
+            nn.Linear(previous, 1),
+        )
 
     def forward(self, features: Tensor, candidate: Tensor) -> Tensor:
         """Score each candidate against its feature map.

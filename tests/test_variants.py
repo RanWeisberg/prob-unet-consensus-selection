@@ -33,7 +33,7 @@ from probunet.training.checkpoint import (
 )
 from probunet.training.config import TRAIN_MODES, ExperimentConfig, RunConfig, TrainConfig
 from probunet.training.freeze import assert_frozen, freeze_module
-from probunet.extension.head import SelectionHead
+from probunet.extension.head import MaskScorer, SelectionHead
 from probunet.training.freeze import parameter_fingerprint
 from probunet.training.trainer import Trainer
 from probunet.variants import ProbUNetVariant, SegmentationVariant
@@ -415,6 +415,77 @@ def test_the_freeze_record_reaches_the_checkpoint(
     assert state.metrics["freeze/frozen_parameters"] > 0
     assert state.metrics["freeze/trainable_parameters"] == 0
     assert state.metrics["freeze/scorer_parameters"] > 0
+
+
+def test_the_scorer_can_represent_a_ratio() -> None:
+    """The projection has a hidden layer because the target is a RATIO, not a sum.
+
+    Soft Dice is ``2*sum(s*c) / (sum(s) + sum(c))``. Global average pooling hands the
+    readout spatial averages -- an overlap term and two area terms -- and a single linear
+    layer can only form a weighted SUM of those, never their quotient. One ReLU hidden
+    layer can approximate the division.
+
+    Structural, not a capacity guess, so it is asserted structurally: there must be a
+    non-linearity between the pooled features and the scalar output.
+    """
+    scorer = MaskScorer(feature_channels=32)
+    layers = list(scorer.project)
+    assert len(layers) == 3, "projection collapsed back to a single linear readout"
+    assert isinstance(layers[0], torch.nn.Linear)
+    assert isinstance(layers[1], torch.nn.ReLU), "no non-linearity: cannot form a quotient"
+    assert isinstance(layers[2], torch.nn.Linear)
+    assert layers[2].out_features == 1
+
+
+def test_head_capacity_is_the_recorded_size() -> None:
+    """~118.5k trainable parameters at the real feature width."""
+    scorer = MaskScorer(feature_channels=32)
+    total = sum(p.numel() for p in scorer.parameters())
+    assert 118_000 <= total <= 119_000, total
+
+
+def test_head_checkpoint_identifies_which_base_it_came_from(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """The artifact must attribute the head to its base, verifiably.
+
+    head-on-Phase1 versus head-on-Phase2 is only a meaningful ablation if each head
+    checkpoint says which base it was frozen on top of -- and a filename is not a
+    guarantee. The parameter hash makes the identity checkable rather than asserted, which
+    also replaces the integrity signal given up by not computing the ELBO on a frozen base.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+    trainer.train_epoch(0)
+    trainer._checkpoint(0, {"train/total": 1.0})
+
+    state = load_checkpoint(trainer.checkpoint_dir / "last.pt")
+    provenance = state.base_provenance
+    assert provenance is not None
+    assert provenance["checkpoint"] == str(checkpoint)
+    for key in ("git_revision", "device", "torch_version", "parameter_sha256", "epoch"):
+        assert provenance[key] is not None, key
+    assert provenance["latent_covariance"] == config.model.latent_covariance
+
+    # VERIFIABLE, not merely recorded: the hash must match the base actually in the
+    # checkpoint, and it is the same hash the epoch-boundary check compares against.
+    assert provenance["parameter_sha256"] == trainer.base_fingerprint
+    assert provenance["parameter_sha256"] == parameter_fingerprint(trainer.head.base)
+
+    # A different base gives a different hash, so the field discriminates.
+    other = ProbUNet(config.model)
+    assert parameter_fingerprint(other) != provenance["parameter_sha256"]
+
+
+def test_elbo_checkpoints_carry_no_base_provenance(
+    tiny_experiment: ExperimentConfig,
+) -> None:
+    """Nothing is frozen in ELBO mode, so the field stays None rather than empty-but-present."""
+    trainer = Trainer(tiny_experiment)
+    assert trainer.base_provenance is None
+    trainer._checkpoint(0, {"val/total": 1.0})
+    state = load_checkpoint(trainer.checkpoint_dir / "last.pt")
+    assert state.base_provenance is None
 
 
 def test_elbo_mode_is_unaffected(tiny_experiment: ExperimentConfig) -> None:

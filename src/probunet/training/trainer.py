@@ -112,6 +112,7 @@ class Trainer:
         self.base_record: dict[str, object] | None = None
         self.head: SelectionHead | None = None
         self.base_fingerprint: str | None = None
+        self.base_provenance: dict[str, Any] | None = None
         if config.train.mode == "selection_head":
             self._prepare_selection_head()
         # THE line that decides whether the base stays frozen. In selection_head mode the
@@ -353,7 +354,7 @@ class Trainer:
                 "train.mode='selection_head' requires --base-checkpoint: the head is "
                 "trained on top of an already-trained, frozen Probabilistic U-Net."
             )
-        load_checkpoint(
+        base_state = load_checkpoint(
             self.base_checkpoint,
             model=self.model,
             map_location=self.device,
@@ -369,9 +370,32 @@ class Trainer:
         self.base_fingerprint = parameter_fingerprint(self.head.base)
         self.base_record["parameter_fingerprint"] = self.base_fingerprint
         self.base_record["scorer_parameters"] = self.head.parameter_counts()["scorer"]
+
+        # WHICH base, not merely that a freeze happened. head-on-Phase1 versus
+        # head-on-Phase2 is only a meaningful ablation if each head checkpoint is
+        # attributable to its base from the artifact alone, and a filename is not a
+        # guarantee. The parameter hash makes the identity verifiable rather than
+        # asserted, and it is the same hash the epoch-boundary check compares against.
+        self.base_provenance = {
+            "checkpoint": str(self.base_checkpoint),
+            "epoch": base_state.epoch,
+            "git_revision": base_state.git_revision,
+            "device": base_state.device,
+            "torch_version": base_state.torch_version,
+            "seed": base_state.seed,
+            "latent_covariance": self.config.model.latent_covariance,
+            "parameter_sha256": self.base_fingerprint,
+            "frozen_parameters": self.head.freeze_record["frozen_parameters"],
+        }
         LOGGER.info(
-            "base frozen and wrapped: %s trainable scorer parameters, base fingerprint %s",
+            "base frozen and wrapped: %s trainable scorer parameters; base = %s "
+            "(epoch %s, git %s, %s, torch %s), sha256 %s",
             f"{self.base_record['scorer_parameters']:,}",
+            self.base_checkpoint,
+            base_state.epoch,
+            base_state.git_revision,
+            base_state.device,
+            base_state.torch_version,
             self.base_fingerprint[:12],
         )
         LOGGER.warning(
@@ -970,6 +994,8 @@ class Trainer:
             # long gone. Numeric-only, matching the metrics dict's contract.
             "metrics": {**{k: v for k, v in record.items()}, **self._freeze_metrics()},
             "loader_generator_state": generator.get_state() if generator is not None else None,
+            # Non-numeric, so it cannot ride in `metrics`; it gets its own field.
+            "base_provenance": self.base_provenance,
             # The record for this epoch is appended to self.history after _log_epoch but
             # before _checkpoint, so history already includes it.
             "history": self.history,

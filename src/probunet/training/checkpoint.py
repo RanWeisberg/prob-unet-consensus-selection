@@ -46,6 +46,8 @@ class CheckpointState:
         seed: The run seed.
         git_revision: Revision the run was launched from.
         device: Device string the run used, for the cross-backend caveat.
+        base_provenance: For a selection-head checkpoint, which base it was frozen on top
+            of and the sha256 of that base's parameters at construction. None otherwise.
         torch_version: The torch the run was produced under. Saved since Phase 1 but not
             surfaced here until now, which quietly defeated CLAUDE.md's promise that "a
             comparison can always be checked for this" -- a Phase 1 arm on one torch and a
@@ -65,6 +67,7 @@ class CheckpointState:
     git_revision: str
     device: str
     torch_version: str
+    base_provenance: dict[str, Any] | None
     metrics: dict[str, float]
     history: list[dict[str, float]]
 
@@ -84,6 +87,7 @@ def save_checkpoint(
     metrics: dict[str, float],
     loader_generator_state: torch.Tensor | None = None,
     history: list[dict[str, float]] | None = None,
+    base_provenance: dict[str, Any] | None = None,
 ) -> None:
     """Write a checkpoint atomically.
 
@@ -109,6 +113,17 @@ def save_checkpoint(
             spanning days may be resumed several times, and without it ``summary.json``
             would hold only the epochs since the last resume -- a loss curve silently
             truncated to its own tail.
+        base_provenance: For a selection-head run, **which** base this head was frozen on
+            top of: the base checkpoint's path, git SHA, device and torch version, plus a
+            sha256 of its parameter values taken at construction. None for an ELBO run.
+
+            The head-on-Phase1 versus head-on-Phase2 ablation is only meaningful if each
+            head checkpoint is attributable to its base **from the artifact alone**, and a
+            filename is not a guarantee. With the parameter hash recorded, the base's
+            identity is *verifiable* rather than asserted -- the same standard the Phase 1
+            fingerprint holds Phase 2 to. It also replaces the integrity signal that a
+            frozen-base run gives up by not computing the ELBO: a hash comparison is both
+            cheaper and stronger than noticing a loss curve looked wrong.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,6 +145,7 @@ def save_checkpoint(
         "rng": rng_state(),
         "loader_generator": loader_generator_state,
         "torch_version": torch.__version__,
+        "base_provenance": base_provenance,
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
@@ -191,6 +207,7 @@ def load_checkpoint(
         git_revision=str(payload.get("git_revision", "unknown")),
         device=str(payload.get("device", "unknown")),
         torch_version=str(payload.get("torch_version", "unknown")),
+        base_provenance=payload.get("base_provenance"),
         metrics=dict(payload.get("metrics", {})),
         history=list(payload.get("history", [])),
     )
