@@ -43,6 +43,7 @@ from probunet.training.diagnostics import (
     nonempty_sample_fraction,
     per_dim_kl,
     prior_samples_for_images,
+    prior_spectrum,
     reparameterize,
     save_diagnostic_sets,
     sigma_stats,
@@ -535,7 +536,7 @@ class Trainer:
                     totals[key] = totals.get(key, 0.0) + float(value)
                 count += 1
                 if accumulator is not None:
-                    accumulator.update(posterior, encoded.prior)
+                    accumulator.update(posterior, encoded.prior, grader=grader)
 
             if index == 0:
                 # Latent statistics from the first batch: cheap, and enough to spot a
@@ -580,6 +581,9 @@ class Trainer:
             stats[f"kl_dim_{dimension}"] = float(value)
         # Rotation-invariant, and an exact decomposition of kl_snapshot_total.
         stats.update(whitened_kl_snapshot(whitened_kl_decomposition(posterior, prior)))
+        # The frame the whitened numbers are measured in: lambda ~ 1 means "matches the
+        # prior", which is only "isotropic" if the prior itself is.
+        stats.update(prior_spectrum(prior))
         return stats
 
     # ------------------------------------------------------------ diagnostics

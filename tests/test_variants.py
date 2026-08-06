@@ -449,12 +449,23 @@ def test_no_shipped_config_caps_channels(name: str) -> None:
 
 
 def test_variants_differ_only_by_the_improvement_flag() -> None:
-    """baseline and modernized share every architecture value EXCEPT latent_covariance.
+    """baseline and modernized differ in EXACTLY ``latent_covariance``, which is ``full``.
 
     Replaces the former ``baseline.model == modernized.model`` assertion, which could not
     survive Phase 2 introducing a real architectural flag. The claim is now the sharper
     one: the two configs differ in **exactly one field**, so the comparison isolates a
     single variable. Any second difference fails here by name.
+
+    **The equality is deliberate and was tightened from a subset check in Stage 5.** Written
+    as ``differing <= {"latent_covariance"}`` this passes when ``differing`` is *empty* --
+    that is, when the flag was never flipped and both arms are the baseline under two
+    different run names. Nothing else in the suite would have caught it: the bit-identity
+    test only asserts flag-off reproduces Phase 1, and
+    ``test_shipped_configs_agree_with_the_models_they_build`` is deliberately flag-agnostic.
+    A green suite would then have accompanied a comparison of the baseline against itself --
+    the same undetectable false null the Stage 3 positive control exists to prevent, one
+    level up at the config layer. Hence both halves below: exactly one field differs, **and**
+    it holds the value Phase 2 is about.
     """
     baseline = ExperimentConfig.from_yaml(CONFIGS / "baseline.yaml")
     modernized = ExperimentConfig.from_yaml(CONFIGS / "modernized.yaml")
@@ -464,11 +475,17 @@ def test_variants_differ_only_by_the_improvement_flag() -> None:
         for field in dataclasses.fields(baseline.model)
         if getattr(baseline.model, field.name) != getattr(modernized.model, field.name)
     }
-    assert differing <= {"latent_covariance"}, (
+    assert differing == {"latent_covariance"}, (
         f"modernized.yaml differs from baseline.yaml in {sorted(differing)}; Phase 2 is "
-        "one flag, so anything beyond latent_covariance confounds the comparison"
+        "exactly one flag. An empty set means the flag was never flipped and both arms "
+        "would train the baseline; anything beyond latent_covariance confounds the "
+        "comparison."
     )
     assert baseline.model.latent_covariance == "diagonal"
+    assert modernized.model.latent_covariance == "full", (
+        "modernized.yaml must actually enable the Phase 2 improvement -- without this the "
+        "headline comparison is the baseline against itself"
+    )
 
     assert baseline.optim == modernized.optim
     assert baseline.schedule == modernized.schedule

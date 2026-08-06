@@ -23,6 +23,13 @@ run:
 
 model:
   latent_dim: 6         # N = 6, Appendix H.1
+
+  # THE PHASE 2 FLAG, held at the paper's value here. `diagonal` is the axis-aligned
+  # Gaussian of Appendix H.1; configs/modernized.yaml sets `full` and that one line is
+  # the entire difference between the two arms. Stated explicitly rather than left to
+  # the default, so a diff of the two configs shows the comparison as one changed line.
+  latent_covariance: diagonal
+
   base_channels: 32
   num_downs: 4          # 4 down- and 4 up-sampling operations
   convs_per_scale: 3    # three 3x3 convs per scale, each followed by ReLU
@@ -117,6 +124,7 @@ schedule:
   values: [1.0e-4, 3.9810717e-5, 1.5848932e-5, 6.3095734e-6, 2.5118864e-6, 1.0e-6]
 
 train:
+  mode: elbo            # the ELBO objective; `selection_head` is Phase 3 (extension.yaml)
   # The paper's budget, expressed in ITERATIONS as the paper states it (Appendix H.1:
   # 240k iterations at batch 32). The epoch count is DERIVED from the train split size
   # rather than hardcoded -- 9,056 patches / batch 32 = 283 steps/epoch, so 240,000

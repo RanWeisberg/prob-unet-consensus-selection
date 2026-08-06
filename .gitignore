@@ -29,4 +29,10 @@ dist/
 # and never needed to read a result. results/ is the tracked counterpart.
 runs/
 experiments/
+
+# FINDINGS.md is excluded ON PURPOSE and this is not an oversight. It is a personal
+# working document -- the running record of measured findings and the reasoning behind
+# each phase -- kept on the Mac and mirrored into the Claude project context, and handed
+# to the report author manually. It is not a repo deliverable. Do not track it and do not
+# `git add -f` it. See the "Artifacts" section of CLAUDE.md and the file's own header.
 FINDINGS.md

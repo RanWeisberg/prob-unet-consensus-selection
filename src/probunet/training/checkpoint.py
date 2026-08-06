@@ -46,6 +46,12 @@ class CheckpointState:
         seed: The run seed.
         git_revision: Revision the run was launched from.
         device: Device string the run used, for the cross-backend caveat.
+        torch_version: The torch the run was produced under. Saved since Phase 1 but not
+            surfaced here until now, which quietly defeated CLAUDE.md's promise that "a
+            comparison can always be checked for this" -- a Phase 1 arm on one torch and a
+            Phase 2 arm on another would confound the covariance change with a library
+            upgrade, and nothing could detect it programmatically. Defaults to "unknown"
+            for checkpoints written before the field existed.
         metrics: Metrics recorded at save time.
         history: Per-epoch metric records from the start of the run.
     """
@@ -58,6 +64,7 @@ class CheckpointState:
     seed: int
     git_revision: str
     device: str
+    torch_version: str
     metrics: dict[str, float]
     history: list[dict[str, float]]
 
@@ -183,6 +190,7 @@ def load_checkpoint(
         seed=int(payload["seed"]),
         git_revision=str(payload.get("git_revision", "unknown")),
         device=str(payload.get("device", "unknown")),
+        torch_version=str(payload.get("torch_version", "unknown")),
         metrics=dict(payload.get("metrics", {})),
         history=list(payload.get("history", [])),
     )

@@ -50,6 +50,7 @@ from probunet.training.diagnostics import (
     mean_pairwise_iou,
     nonempty_sample_fraction,
     per_dim_kl,
+    prior_spectrum,
     stratified_indices,
     whitened_kl_decomposition,
 )
@@ -670,6 +671,147 @@ def test_effective_rank_accumulator_pools_and_summarizes() -> None:
         or metrics["effrank_val_p25"] <= metrics["effrank_val_p75"]
     )
     assert metrics["kl_val_total_mean"] > 0.0
+
+
+def test_accumulator_clusters_the_spread_by_image() -> None:
+    """The pooled spread and the image-clustered spread are different numbers.
+
+    Four graders per image are not independent samples, so a standard error built from the
+    pooled std would claim ~2x the precision the data supports. Constructed here so the
+    within-image variation is large and the between-image variation is nil: the pooled std
+    is then substantial while the image-clustered std is ~0, which is exactly the gap the
+    two keys exist to expose.
+    """
+    mean = torch.zeros(4, WHITEN_DIM, dtype=torch.float64)
+    prior = MultivariateNormal(
+        mean, scale_tril=torch.eye(WHITEN_DIM, dtype=torch.float64).expand(4, -1, -1)
+    )
+    accumulator = EffectiveRankAccumulator()
+    # Grader g activates g+1 directions, identically for every image. Note it has to be
+    # the NUMBER of active directions that varies, not how hard each one is contracted:
+    # effective rank is scale-free, so [0.2, 1, 1, ...] and [0.9, 1, 1, ...] both read 1.0.
+    for grader in range(4):
+        diagonal = torch.tensor(
+            [0.42] * (grader + 1) + [1.0] * (WHITEN_DIM - grader - 1), dtype=torch.float64
+        ).expand(4, -1)
+        posterior = MultivariateNormal(mean, scale_tril=torch.diag_embed(diagonal))
+        accumulator.update(posterior, prior, grader=grader)
+
+    metrics = accumulator.metrics()
+    assert metrics["effrank_val_image_count"] == 4, "images, not image-grader pairs"
+    assert metrics["effrank_val_count"] == 16
+    # Every image saw the same four graders, so between-image spread is zero...
+    assert metrics["effrank_val_image_std"] == pytest.approx(0.0, abs=1e-9)
+    # ...while the pooled spread is not, because it counts within-image variation as if it
+    # were between-image. Reporting the pooled one as a standard error is the error.
+    assert metrics["effrank_val_std"] > 0.05
+    assert metrics["effrank_val_image_mean"] == pytest.approx(
+        metrics["effrank_val_mean"], rel=1e-9
+    )
+
+
+def test_accumulator_reports_a_full_val_spectrum_that_reconciles() -> None:
+    """The full-val whitened vector must still sum to the full-val total.
+
+    The snapshot family has ``kl_snapshot_total`` as its reconciliation partner; this is
+    the same guarantee at validation scale, and it is what the Phase 1 pre-registration
+    and the Phase 2 comparison actually quote. Every image's parts sum to its own total, so
+    the means sum too.
+    """
+    accumulator = EffectiveRankAccumulator()
+    for grader in range(4):
+        accumulator.update(*whiten_pair(torch.float64, seed=grader), grader=grader)
+    metrics = accumulator.metrics()
+
+    spectrum = [metrics[f"kl_whitened_val_{i}"] for i in range(WHITEN_DIM)]
+    assert sum(spectrum) == pytest.approx(metrics["kl_val_total_mean"], rel=1e-9)
+    assert spectrum == sorted(spectrum, reverse=True)
+
+    # The prior's frame, accumulated from grader 0 only so images are not counted 4x.
+    assert metrics["prior_condition_number_val"] >= 1.0
+    assert metrics["prior_eigval_val_0"] >= metrics[f"prior_eigval_val_{WHITEN_DIM - 1}"]
+
+
+def test_prior_spectrum_is_not_counted_four_times() -> None:
+    """The prior depends on the image alone, so only grader 0 contributes it.
+
+    Accumulating it on every grader would quietly turn the image count into a pair count
+    and make any dispersion on it wrong by a factor of two.
+    """
+    posterior, prior = whiten_pair(torch.float64)
+    one_grader = EffectiveRankAccumulator()
+    one_grader.update(posterior, prior, grader=0)
+
+    all_graders = EffectiveRankAccumulator()
+    for grader in range(4):
+        all_graders.update(posterior, prior, grader=grader)
+
+    assert all_graders.metrics()["prior_condition_number_val"] == pytest.approx(
+        one_grader.metrics()["prior_condition_number_val"], rel=1e-12
+    )
+
+
+def test_image_clustering_is_omitted_rather_than_faked() -> None:
+    """Partial grader coverage drops the clustered keys instead of inventing them."""
+    posterior, prior = whiten_pair(torch.float64)
+    accumulator = EffectiveRankAccumulator()
+    accumulator.update(posterior, prior, grader=0)  # only one of four graders
+    metrics = accumulator.metrics()
+    assert "effrank_val_mean" in metrics
+    assert "effrank_val_image_std" not in metrics
+    assert "effrank_val_image_count" not in metrics
+
+
+# --------------------------------------------------------------------------- #
+# The prior's own spectrum -- the frame the whitened numbers are measured in
+# --------------------------------------------------------------------------- #
+def test_prior_spectrum_recovers_a_known_geometry() -> None:
+    """Eigenvalues are the sorted variances, and the condition number their ratio."""
+    scales = torch.tensor([3.0, 2.0, 1.0, 1.0, 1.0, 0.5], dtype=torch.float64)
+    prior = MultivariateNormal(
+        torch.zeros(1, WHITEN_DIM, dtype=torch.float64),
+        scale_tril=torch.diag_embed(scales).unsqueeze(0),
+    )
+    spectrum = prior_spectrum(prior)
+
+    expected = (scales**2).sort(descending=True).values
+    for index, value in enumerate(expected):
+        assert spectrum[f"prior_eigval_{index}"] == pytest.approx(float(value))
+    assert spectrum["prior_condition_number"] == pytest.approx(9.0 / 0.25)
+    assert spectrum["prior_condition_number_max"] == pytest.approx(9.0 / 0.25)
+
+
+def test_prior_spectrum_works_on_the_diagonal_path() -> None:
+    """Phase 1's prior has a spectrum too -- it is the baseline for the series."""
+    sigma = torch.tensor([[2.0, 1.0, 0.5, 1.0, 1.0, 1.0]], dtype=torch.float64)
+    prior = Independent(Normal(torch.zeros_like(sigma), sigma), 1)
+    spectrum = prior_spectrum(prior)
+    assert spectrum["prior_eigval_0"] == pytest.approx(4.0)
+    assert spectrum["prior_condition_number"] == pytest.approx(4.0 / 0.25)
+
+
+def test_prior_spectrum_detects_correlation_an_axis_view_would_miss() -> None:
+    """A correlated prior is anisotropic even when its marginals are all unit.
+
+    This is the secondary finding the family exists to catch: a Phase 1 prior is diagonal
+    and can only be axis-aligned, whereas a Phase 2 prior is free to correlate. Marginal
+    variances alone cannot see it -- here they are all exactly 1 -- so a per-coordinate
+    view would report a perfectly ordinary prior.
+    """
+    correlation = 0.9
+    factor = torch.tensor(
+        [[1.0, 0.0], [correlation, (1 - correlation**2) ** 0.5]], dtype=torch.float64
+    ).unsqueeze(0)
+    prior = MultivariateNormal(torch.zeros(1, 2, dtype=torch.float64), scale_tril=factor)
+
+    covariance = (factor @ factor.transpose(-1, -2))[0]
+    assert torch.allclose(covariance.diagonal(), torch.ones(2, dtype=torch.float64))
+
+    spectrum = prior_spectrum(prior)
+    assert spectrum["prior_condition_number"] == pytest.approx(
+        (1 + correlation) / (1 - correlation)
+    )
+    assert spectrum["prior_condition_number"] > 18.0, "correlation went unseen"
 
 
 def test_accumulator_measures_each_image_not_the_mean_covariance() -> None:

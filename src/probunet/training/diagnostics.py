@@ -490,6 +490,56 @@ def whitened_kl_decomposition(
     )
 
 
+def prior_spectrum(prior: LatentDistribution) -> dict[str, float]:
+    """Eigenvalue spectrum and condition number of the prior's own covariance.
+
+    **Why this is needed to read the whitened numbers correctly.** The whitened
+    decomposition is asymmetric by construction: it divides out ``Sigma_p`` and asks how
+    ``Q`` deviates from ``P``. That is the right frame for "how much information does the
+    posterior transmit", and it stays right whatever shape the prior takes -- but it means
+    ``lambda ~ 1`` says **"matches the prior in that direction"**, which is *not* the same
+    claim as "is isotropic". If the prior itself becomes strongly anisotropic, a posterior
+    sitting on it still reads ``lambda ~ 1`` while being far from spherical. Nothing about
+    the collapse measurement breaks; the *English sentence* a reader attaches to it does.
+    This family supplies the missing half, so the whitened spectrum can be reported
+    against the frame it was measured in rather than against an assumed unit ball.
+
+    It is also a secondary finding in its own right. Phase 1's prior is diagonal and can
+    only be axis-aligned; a Phase 2 prior is free to correlate, and **"the prior itself
+    became correlated"** would be a real result -- the prior is what inference actually
+    samples from, so its geometry is closer to the reported metrics than the posterior's
+    is.
+
+    Computed from ``Sigma_p = Lp Lp^T`` via the singular values of ``Lp``, so the
+    eigenvalues are ``s**2`` and non-negative by construction -- the same reasoning as in
+    :func:`whitened_kl_decomposition`, and on the CPU for the same MPS-kernel reason.
+
+    Args:
+        prior: ``P(z | X)``, either latent family. Under the diagonal parameterization the
+            eigenvalues are just the sorted variances, which is the correct Phase 1
+            baseline for this series rather than a degenerate case to skip.
+
+    Returns:
+        ``prior_eigval_{i}`` for each direction (descending, batch-mean), the batch-mean
+        ``prior_condition_number``, and ``prior_condition_number_max`` -- the worst image
+        in the batch, since an average condition number hides the one prior that has gone
+        singular.
+    """
+    _, factor = _loc_and_scale_tril(prior)
+    eigenvalues = torch.linalg.svdvals(factor.cpu()) ** 2
+    # svdvals returns descending, so index 0 is the largest.
+    condition = eigenvalues[..., 0] / eigenvalues[..., -1].clamp_min(
+        torch.finfo(eigenvalues.dtype).tiny
+    )
+    metrics = {
+        f"prior_eigval_{index}": float(value)
+        for index, value in enumerate(eigenvalues.mean(dim=0))
+    }
+    metrics["prior_condition_number"] = float(condition.mean())
+    metrics["prior_condition_number_max"] = float(condition.max())
+    return metrics
+
+
 def whitened_kl_snapshot(decomposition: WhitenedKL) -> dict[str, float]:
     """Flatten a decomposition into the per-epoch snapshot scalars.
 
@@ -539,37 +589,64 @@ class EffectiveRankAccumulator:
     the **diagnostics cadence** rather than every epoch, to keep those transfers off the
     per-epoch path on a multi-day run.
 
-    One image contributes four samples, one per grader, and they are pooled rather than
-    averaged per image: the grader-to-grader variation in how much information the
-    posterior carries is part of the spread being estimated, not a nuisance to average
-    away before measuring it.
+    One image contributes four samples, one per grader. They are **pooled for the mean and
+    clustered by image for the spread**, because those two jobs have different right
+    answers: the grader-to-grader variation in how much information the posterior carries
+    is real signal that belongs in the mean, but the four samples from one image are
+    **not independent** -- they share an image, a prior, and a U-Net encoding. A standard
+    error formed as ``pooled_std / sqrt(4 * images)`` would silently claim twice the
+    precision the data supports. So the spread is also reported at the image level: average
+    the four graders' effective rank within each image first, then take the standard
+    deviation across the image-level values. ``effrank_val_image_std`` is the one to divide
+    by ``sqrt(effrank_val_image_count)``; ``effrank_val_std`` is descriptive only.
     """
 
-    def __init__(self) -> None:
-        """Start an empty accumulator."""
-        self._ranks: list[Tensor] = []
+    def __init__(self, n_graders: int = 4) -> None:
+        """Start an empty accumulator.
+
+        Args:
+            n_graders: Number of graders contributing per image. Used only to check that
+                every grader saw the same images before clustering by image.
+        """
+        self._n_graders = n_graders
+        self._ranks: dict[int, list[Tensor]] = {}
         self._totals: list[Tensor] = []
+        self._per_direction: list[Tensor] = []
+        self._prior_eigenvalues: list[Tensor] = []
 
     def update(
-        self, posterior: LatentDistribution, prior: LatentDistribution
+        self, posterior: LatentDistribution, prior: LatentDistribution, grader: int = 0
     ) -> None:
         """Accumulate one batch, at one grader.
 
         Args:
             posterior: ``Q(z | X, Y)`` for this batch and grader.
             prior: ``P(z | X)`` for this batch.
+            grader: Which grader this posterior came from. Batches must arrive in the same
+                image order for every grader, which is what lets the image-level clustering
+                line the four values of an image up with each other -- true of
+                ``Trainer.validate``, whose grader loop sits *inside* the batch loop.
         """
         decomposition = whitened_kl_decomposition(posterior, prior)
-        self._ranks.append(decomposition.effective_rank)
+        self._ranks.setdefault(grader, []).append(decomposition.effective_rank)
         self._totals.append(decomposition.total)
+        self._per_direction.append(decomposition.per_direction)
+        if grader == 0:
+            # The prior depends on the image alone, so it is identical across the four
+            # graders. Accumulated from grader 0 only: taking it every time would count
+            # each image four times and quietly turn the image count into a pair count.
+            _, factor = _loc_and_scale_tril(prior)
+            self._prior_eigenvalues.append(torch.linalg.svdvals(factor.cpu()) ** 2)
 
     def metrics(self) -> dict[str, float]:
         """Aggregate into report-ready scalars.
 
         Returns:
-            Mean, standard deviation and quartiles of the per-image effective rank, the
-            sample count behind them, and the mean total KL over the same population.
-            Empty if nothing was accumulated, so a caller can merge unconditionally.
+            The pooled mean and its descriptive spread and quartiles, the **image-clustered**
+            standard deviation and the image count behind it, the pooled sample count, and
+            the mean total KL. Empty if nothing was accumulated, so a caller can merge
+            unconditionally. The image-clustered keys are omitted -- rather than faked --
+            when the graders did not all cover the same images.
 
         Note:
             The mean of a per-image effective rank is **not** the effective rank of the
@@ -582,19 +659,55 @@ class EffectiveRankAccumulator:
         """
         if not self._ranks:
             return {}
-        ranks = torch.cat(self._ranks).to(torch.float64)
+        per_grader = {
+            grader: torch.cat(chunks).to(torch.float64)
+            for grader, chunks in sorted(self._ranks.items())
+        }
+        ranks = torch.cat(list(per_grader.values()))
         totals = torch.cat(self._totals).to(torch.float64)
         quartiles = torch.quantile(ranks, torch.tensor([0.25, 0.75], dtype=torch.float64))
-        return {
+        metrics = {
             "effrank_val_mean": float(ranks.mean()),
-            # Sample standard deviation over the pooled population. Divide by
-            # sqrt(effrank_val_count) for the standard error of the mean.
+            # Descriptive only -- these samples are not independent. Do NOT form a standard
+            # error from this; use effrank_val_image_std instead.
             "effrank_val_std": float(ranks.std(unbiased=True)) if ranks.numel() > 1 else 0.0,
             "effrank_val_p25": float(quartiles[0]),
             "effrank_val_p75": float(quartiles[1]),
             "effrank_val_count": float(ranks.numel()),
             "kl_val_total_mean": float(totals.mean()),
         }
+
+        # The full-validation counterpart of the kl_whitened_* snapshot: the spectrum
+        # shape at a population size that can actually carry a before/after comparison.
+        # Still sums to kl_val_total_mean, since every image's parts sum to its own total.
+        spectrum = torch.cat(self._per_direction).to(torch.float64).mean(dim=0)
+        metrics.update(
+            {f"kl_whitened_val_{index}": float(value) for index, value in enumerate(spectrum)}
+        )
+        if self._prior_eigenvalues:
+            prior_eigenvalues = torch.cat(self._prior_eigenvalues).to(torch.float64)
+            condition = prior_eigenvalues[:, 0] / prior_eigenvalues[:, -1].clamp_min(
+                torch.finfo(torch.float64).tiny
+            )
+            metrics.update(
+                {
+                    f"prior_eigval_val_{index}": float(value)
+                    for index, value in enumerate(prior_eigenvalues.mean(dim=0))
+                }
+            )
+            metrics["prior_condition_number_val"] = float(condition.mean())
+            metrics["prior_condition_number_val_max"] = float(condition.max())
+
+        sizes = {value.numel() for value in per_grader.values()}
+        if len(per_grader) == self._n_graders and len(sizes) == 1:
+            # (images, graders) -> mean within image -> spread across images.
+            by_image = torch.stack(list(per_grader.values()), dim=1).mean(dim=1)
+            metrics["effrank_val_image_mean"] = float(by_image.mean())
+            metrics["effrank_val_image_std"] = (
+                float(by_image.std(unbiased=True)) if by_image.numel() > 1 else 0.0
+            )
+            metrics["effrank_val_image_count"] = float(by_image.numel())
+        return metrics
 
 
 def mean_pairwise_iou(samples: Tensor) -> Tensor:

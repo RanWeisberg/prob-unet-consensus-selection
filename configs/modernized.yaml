@@ -1,28 +1,43 @@
-# Modernized variant -- SCAFFOLD, not yet runnable as a distinct variant.
+# Modernized variant (Phase 2): a FULL-COVARIANCE latent Gaussian. Live, not a scaffold.
 #
-# Phase 2 adds a small set of well-motivated post-2018 improvements, each behind its
-# OWN flag so its effect can be isolated. None of those flags exist yet, so running
-# this config today trains exactly the baseline. That is deliberate: an empty scaffold
-# that silently reproduces the baseline is safer than one that half-implements a change.
+# Phase 2 is EXACTLY ONE FLAG: `model.latent_covariance: full`. That is the single line
+# below that differs from configs/baseline.yaml. Diff the two files; if more than one line
+# comes back, the comparison has been confounded and the change is a mistake.
 #
-# The variant is the SAME model class as the baseline with different config values.
-# There is no separate model implementation and there must never be one: duplicated
-# code drifts, and a drifted copy invalidates the claim that a comparison isolates a
-# single variable.
+# What the flag does. The paper's prior and posterior both emit an axis-aligned (diagonal)
+# Gaussian, forcing the N latent dimensions to be mutually independent. With `full` they
+# emit N + N(N+1)/2 numbers instead of 2N (27 instead of 12 at N=6), packed into a
+# lower-triangular Cholesky factor L whose diagonal is exp(0.5*logvar) -- exactly the
+# sigmas the diagonal path produces. The covariance is Sigma = L L^T, positive-definite by
+# construction. Parameter count and step time are effectively unchanged, so this arm costs
+# the same wall-clock as the baseline.
 #
-# Candidate improvements (CLAUDE.md), each to arrive as one flag plus one ablation run:
-#   - Dice / focal / Tversky loss instead of plain cross-entropy.
-#     Motivation is on record: the foreground:background ratio is 1:176 under uniform
-#     grader pairing (see data/splits/SPLIT_NOTES.md and DEVIATIONS.md).
-#   - GroupNorm or InstanceNorm in place of no normalization.
-#   - KL annealing / free bits against posterior collapse.
+# Why this and not something else. Our own measurement, not a borrowed citation: the Phase 1
+# run put 98.8% of the latent KL into ONE of six dimensions from epoch 10 onward
+# (FINDINGS 2.3). A diagonal covariance makes the KL a sum of independent per-axis
+# penalties, so the cheapest solution is to funnel everything into one axis -- which is what
+# happened. A full covariance removes the axis-alignment constraint. Prediction, registered
+# before the run: effective latent dimensionality rises (FINDINGS 3.2).
 #
-# NOT a candidate: data augmentation. It is the paper's own method (Appendix H.1) and
-# belongs to the Phase 1 baseline. Claiming it as a Phase 2 "modernization" would
-# misattribute the authors' work to us.
+# NOTHING ELSE JOINS PHASE 2. An earlier draft of this header listed Dice/focal loss,
+# GroupNorm and KL annealing as co-arriving flags. CLAUDE.md REJECTED all three, and they
+# are not coming: they change the objective in ways that break the ELBO's log-likelihood
+# interpretation and may themselves suppress diversity, and a second improvement would
+# confound the one number this arm exists to produce. They live in the report as
+# considered-and-rejected. Augmentation is likewise NOT a candidate -- it is the paper's own
+# method (Appendix H.1) and belongs to Phase 1; claiming it here would misattribute the
+# authors' work to us. Latent dimension stays at N=6 for the same reason.
 #
-# Everything below is identical to configs/baseline.yaml. Diff the two files: the only
-# lines that should ever differ are the flags under test.
+# The variant is the SAME model class as the baseline with one config value changed. There
+# is no separate model implementation and there must never be one: duplicated code drifts,
+# and a drifted copy invalidates the claim that a comparison isolates a single variable.
+#
+# Flag-off is bit-identical to Phase 1 by construction -- the diagonal case takes the
+# Independent(Normal) path unchanged rather than a MultivariateNormal with a diagonal factor
+# -- and tests/test_variants.py asserts both halves: that flag-off reproduces the baseline
+# exactly, and that this file really does set the flag to `full`.
+#
+# Everything else below is identical to configs/baseline.yaml.
 
 run:
   name: modernized
@@ -32,7 +47,16 @@ run:
   deterministic: true
 
 model:
-  latent_dim: 6
+  latent_dim: 6         # HELD at 6. Bhat et al. tuned the latent dimension per model and
+                        # found 2 best for their full-covariance variant; changing the
+                        # covariance AND the dimension would confound two variables. A
+                        # latent-dimension sweep is a legitimate SEPARATE ablation.
+
+  # >>> THE ONE LINE THAT MAKES THIS PHASE 2 <<<
+  # baseline.yaml has `diagonal` here. This is the only difference between the two configs
+  # and therefore the only variable the headline comparison changes.
+  latent_covariance: full
+
   base_channels: 32
   num_downs: 4
   convs_per_scale: 3
