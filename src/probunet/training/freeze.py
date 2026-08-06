@@ -13,6 +13,7 @@ trainable.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from torch import nn
@@ -63,6 +64,64 @@ def freeze_module(module: nn.Module, name: str = "base model") -> dict[str, obje
         module.training,
     )
     return record
+
+
+def parameter_fingerprint(module: nn.Module) -> str:
+    """Hash a module's parameter values, for before/after comparison across an epoch.
+
+    **This is the check that catches an optimizer accidentally handed
+    ``model.parameters()``.** ``requires_grad = False`` and ``eval()`` are both *intent*:
+    they are what a correct run sets, and asserting them proves only that nobody undid
+    them. Neither notices an optimizer that was built over the wrong parameter set before
+    they were applied, or a stray in-place update. Comparing the actual values before and
+    after a full epoch notices, because it measures the outcome rather than the
+    configuration.
+
+    Hashes values only, not gradients or optimizer state, so it answers exactly one
+    question: did any number in this module move?
+
+    Args:
+        module: The module to fingerprint. Pass the **base only** -- fingerprinting a
+            wrapper that also contains the trainable head would change every epoch by
+            design and the check would have to be thrown away.
+
+    Returns:
+        A hex digest over every parameter, in sorted name order so it is independent of
+        registration order.
+    """
+    digest = hashlib.sha256()
+    for name, parameter in sorted(module.named_parameters(), key=lambda item: item[0]):
+        digest.update(name.encode())
+        # Detach and move to CPU before hashing: the bytes must not depend on device or
+        # on whether the tensor happens to carry grad.
+        digest.update(parameter.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def assert_unchanged(
+    module: nn.Module, fingerprint: str, name: str = "base model", context: str = ""
+) -> None:
+    """Assert a module's parameters still hash to ``fingerprint``.
+
+    Args:
+        module: The module to check -- the **base only**.
+        fingerprint: The digest from :func:`parameter_fingerprint` taken earlier.
+        name: Label used in the error message.
+        context: Optional description of the interval covered, e.g. ``"epoch 3"``.
+
+    Raises:
+        RuntimeError: If any parameter value changed. The most likely cause is by far the
+            most damaging one, so it is named in the message.
+    """
+    current = parameter_fingerprint(module)
+    if current != fingerprint:
+        where = f" during {context}" if context else ""
+        raise RuntimeError(
+            f"{name} parameters CHANGED{where}: the base is not actually frozen. The "
+            "usual cause is an optimizer constructed over model.parameters() instead of "
+            "the head's parameters alone. Every Phase 3 number depends on this not "
+            "happening -- 'distribution metrics unchanged' is false if the base moved."
+        )
 
 
 def assert_frozen(module: nn.Module, name: str = "base model") -> None:

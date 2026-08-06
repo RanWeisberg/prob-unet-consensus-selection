@@ -33,7 +33,12 @@ from probunet.training.checkpoint import (
     save_checkpoint,
 )
 from probunet.training.config import ExperimentConfig
-from probunet.training.freeze import freeze_module
+from probunet.extension.head import SelectionHead
+from probunet.training.freeze import (
+    assert_unchanged,
+    freeze_module,
+    parameter_fingerprint,
+)
 from probunet.training.diagnostics import (
     EffectiveRankAccumulator,
     build_diagnostic_sets,
@@ -105,10 +110,18 @@ class Trainer:
         self.data = build_data(config.data)
         self.model = ProbUNet(config.model).to(self.device)
         self.base_record: dict[str, object] | None = None
+        self.head: SelectionHead | None = None
+        self.base_fingerprint: str | None = None
         if config.train.mode == "selection_head":
             self._prepare_selection_head()
+        # THE line that decides whether the base stays frozen. In selection_head mode the
+        # optimizer is given the scorer's parameters ONLY; handing it self.model
+        # .parameters() would include the frozen base and let it drift.
+        trainable = (
+            self.head.head_parameters() if self.head is not None else self.model.parameters()
+        )
         self.optimizer = torch.optim.Adam(
-            self.model.parameters(),
+            trainable,
             lr=config.optim.lr,
             weight_decay=config.optim.weight_decay,
             betas=tuple(config.optim.betas),
@@ -220,6 +233,12 @@ class Trainer:
         batch_size = self.config.data.batch_size
         if len(dataset) < batch_size or probe_steps < 2:
             return None
+        if self.head is not None:
+            # The probe below is an ELBO forward/backward, which is not this run's step at
+            # all. Skipping is honest; letting it raise into the catch-all would log
+            # "could not estimate runtime" and imply something went wrong.
+            LOGGER.info("no runtime estimate in selection_head mode: the probe is an ELBO step")
+            return None
 
         snapshot = rng_state()
         try:
@@ -314,17 +333,20 @@ class Trainer:
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, factor_at)
 
     def _prepare_selection_head(self) -> None:
-        """Load and freeze the base model for selection-head training.
+        """Load the base checkpoint, freeze it, and wrap it in the selection head.
 
-        The head is Phase 3, so this stops after the part that is defined now: the base
-        checkpoint is loaded, frozen, and the freeze is asserted and logged. Doing the
-        freeze here rather than inside a future head implementation means the contract
-        the extension depends on is already covered by tests.
+        **Stage 3 scope.** The head's structure and the freeze contract exist; its scoring
+        target, regression objective and candidate-sampling loop are Stage 4. Training in
+        this mode today runs a deliberately meaningless placeholder objective
+        (:meth:`_selection_head_step`) whose only purpose is to make the freeze machinery
+        run against a real optimizer step.
+
+        After this returns, ``self.model`` is the :class:`SelectionHead`, and
+        ``self.head`` is the same object under a name that says what it is. The optimizer
+        is built over :meth:`SelectionHead.head_parameters` -- the scorer alone.
 
         Raises:
             ValueError: If no base checkpoint was supplied.
-            NotImplementedError: Always, once the base is frozen -- the head itself does
-                not exist yet.
         """
         if self.base_checkpoint is None:
             raise ValueError(
@@ -337,13 +359,95 @@ class Trainer:
             map_location=self.device,
             restore_rng=False,
         )
-        self.base_record = freeze_module(self.model, name="base Probabilistic U-Net")
-        LOGGER.info("base model frozen: %s", self.base_record)
-        raise NotImplementedError(
-            "the consensus-selection head is Phase 3 and is not implemented yet. The "
-            "base model loads and freezes correctly (see the log line above); what is "
-            "missing is the head module, its scoring target and its training step."
+        # SelectionHead freezes the base in its own constructor, so a head cannot be
+        # built around an unfrozen base even by mistake.
+        self.head = SelectionHead(self.model).to(self.device)
+        self.model = self.head
+        self.base_record = dict(self.head.freeze_record)
+        # The fingerprint the whole stage exists to defend: taken once, here, before any
+        # optimizer exists, and re-checked after the last step of every epoch.
+        self.base_fingerprint = parameter_fingerprint(self.head.base)
+        self.base_record["parameter_fingerprint"] = self.base_fingerprint
+        self.base_record["scorer_parameters"] = self.head.parameter_counts()["scorer"]
+        LOGGER.info(
+            "base frozen and wrapped: %s trainable scorer parameters, base fingerprint %s",
+            f"{self.base_record['scorer_parameters']:,}",
+            self.base_fingerprint[:12],
         )
+        LOGGER.warning(
+            "selection_head is STAGE 3 SCAFFOLD: the objective is a placeholder with no "
+            "scoring target. Metrics from this run mean nothing and no best.pt is written."
+        )
+
+    @property
+    def base_model(self) -> ProbUNet:
+        """The Probabilistic U-Net, whichever mode this run is in.
+
+        In ``selection_head`` mode ``self.model`` is the :class:`SelectionHead` wrapper, so
+        anything that needs the generative model itself -- the channel schedule, the
+        latent diagnostics, sampling -- has to reach through it rather than assume
+        ``self.model`` is a ``ProbUNet``.
+        """
+        return self.head.base if self.head is not None else self.model
+
+    @property
+    def is_selection_head(self) -> bool:
+        """Whether this run trains the selection head rather than the ELBO."""
+        return self.config.train.mode == "selection_head"
+
+    def _elbo_step(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """One ELBO training step: z from the posterior, CE + beta*KL.
+
+        Extracted unchanged from the training loop so ``train_epoch`` can dispatch between
+        objectives without an inline branch. Phases 1 and 2 take this path.
+
+        Args:
+            batch: A training batch carrying ``image`` and one paired grader ``mask``.
+
+        Returns:
+            The ELBO terms; ``total`` is what is minimized.
+        """
+        image = batch["image"].to(self.device, non_blocking=True)
+        mask = batch["mask"].to(self.device, non_blocking=True)
+        output = self.model(image, mask)
+        return elbo_loss(
+            output.logits, mask, output.posterior, output.prior, beta=self.config.loss.beta
+        )
+
+    def _selection_head_step(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """One placeholder training step. **Stage 3 scaffolding, not an objective.**
+
+        Stage 4 replaces this entirely with: draw ``K`` prior candidates per image, score
+        each against the soft consensus, and regress the head's prediction onto that score
+        under a Huber loss. None of that is here -- there is no consensus, no sampling and
+        no target.
+
+        What is here, and why it is not simply a no-op: the objective drives the scorer's
+        output toward zero, which is meaningless but produces **real gradients and real
+        optimizer steps on the head**. A literal no-op would leave every parameter
+        untouched, and then "the base did not move" would be indistinguishable from
+        "nothing moved at all" -- the freeze check would pass vacuously. This way the
+        epoch-boundary fingerprint comparison is a live test: the scorer must change and
+        the base must not.
+
+        The candidate is a zeros mask, shape-correct filler standing in for the sampled
+        candidates Stage 4 supplies. It is deliberately **not** a grader mask: feeding
+        ground truth here would look like a design decision rather than a placeholder.
+
+        Args:
+            batch: A training batch carrying ``image``.
+
+        Returns:
+            The placeholder loss under ``total``, plus the mean predicted score.
+        """
+        image = batch["image"].to(self.device, non_blocking=True)
+        # encode_base is @torch.no_grad and the base is frozen: no path to the base.
+        features = self.head.encode_base(image)
+        candidate = torch.zeros(
+            image.shape[0], *image.shape[-2:], dtype=torch.uint8, device=self.device
+        )
+        scores = self.head(features, candidate)
+        return {"total": scores.pow(2).mean(), "score_mean": scores.mean().detach()}
 
     @property
     def _latent_cadences_align(self) -> bool:
@@ -375,6 +479,7 @@ class Trainer:
             The banner text.
         """
         parameters = sum(p.numel() for p in self.model.parameters())
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         train_config = self.config.train
         budget = (
             f"{train_config.iterations} iterations (paper: 240000)"
@@ -387,8 +492,9 @@ class Trainer:
             f"mode          : {self.config.train.mode}",
             f"device        : {describe_device(self.device)}",
             f"seed          : {self.config.run.seed}",
-            f"parameters    : {parameters:,}",
-            f"channels      : {self.model.unet.widths}"
+            f"parameters    : {parameters:,}"
+            + (f"  ({trainable:,} trainable)" if trainable != parameters else ""),
+            f"channels      : {self.base_model.unet.widths}"
             + ("" if self.config.model.max_channels is None else "  [CAPPED - not baseline]"),
             f"train patches : {len(self.data.datasets['train'])}",
             f"val patches   : {len(self.data.datasets['val'])}",
@@ -412,6 +518,12 @@ class Trainer:
             f"monitor       : {self.config.checkpoint.monitor} ({self.config.checkpoint.mode})",
             f"run dir       : {self.run_dir}",
         ]
+        if self.head is not None:
+            lines.insert(
+                2,
+                "head          : STAGE 3 SCAFFOLD -- placeholder objective, no scoring "
+                "target, no best.pt",
+            )
 
         if estimate_runtime:
             seconds_per_epoch = self.estimate_seconds_per_epoch()
@@ -436,7 +548,14 @@ class Trainer:
         Returns:
             Mean training metrics for the epoch.
         """
+        # In selection_head mode this is SelectionHead.train(), which pins the base to
+        # eval() no matter what mode is requested. That override is load-bearing: the
+        # ordinary recursive train() would otherwise thaw the frozen base's mode here.
         self.model.train()
+        if self.head is not None:
+            # The freeze must hold at the START of the epoch too, so a failure is
+            # attributed to the right epoch rather than to the next one.
+            self.head.assert_base_frozen()
         # Fresh grader pairing for this epoch, reproducible from (pairing_seed, epoch).
         self.data.set_epoch(epoch)
         loader = self.data.loaders["train"]
@@ -449,20 +568,24 @@ class Trainer:
         for index, batch in enumerate(loader):
             if limit and index >= limit:
                 break
-            image = batch["image"].to(self.device, non_blocking=True)
-            mask = batch["mask"].to(self.device, non_blocking=True)
-
             self.optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=self.device.type, enabled=self.config.train.amp):
-                output = self.model(image, mask)
-                terms = elbo_loss(
-                    output.logits, mask, output.posterior, output.prior, beta=self.config.loss.beta
+                terms = (
+                    self._selection_head_step(batch)
+                    if self.head is not None
+                    else self._elbo_step(batch)
                 )
             self.scaler.scale(terms["total"]).backward()
             if self.config.train.grad_clip is not None:
                 self.scaler.unscale_(self.optimizer)
+                # Clip only what is being optimized. Passing self.model.parameters() here
+                # would reach into the frozen base -- harmless today because its grads are
+                # None, but it would silently start clipping the base the moment anything
+                # gave it gradients.
                 torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.train.grad_clip
+                    self.head.head_parameters() if self.head is not None
+                    else self.model.parameters(),
+                    self.config.train.grad_clip,
                 )
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -482,6 +605,19 @@ class Trainer:
                 self.writer.add_scalar(
                     "step/lr", self.optimizer.param_groups[0]["lr"], self.global_step
                 )
+
+        if self.head is not None:
+            # AFTER the last optimizer step, not only before the first. An optimizer built
+            # over the wrong parameter set does its damage DURING the epoch, so a check
+            # that ran only at construction would pass on a thoroughly broken run.
+            self.head.assert_base_frozen()
+            assert self.base_fingerprint is not None
+            assert_unchanged(
+                self.head.base,
+                self.base_fingerprint,
+                name="base Probabilistic U-Net",
+                context=f"epoch {epoch + 1}",
+            )
 
         metrics = {key: value / max(count, 1) for key, value in totals.items()}
         metrics["seconds"] = time.perf_counter() - started
@@ -510,6 +646,12 @@ class Trainer:
         Returns:
             Mean validation metrics.
         """
+        if self.head is not None:
+            # With a frozen base the ELBO is a constant, so computing it would burn a
+            # full validation pass to log a flat line, and monitoring it would mean
+            # selecting checkpoints on noise. Head metrics arrive in Stage 4.
+            return {}
+
         self.model.eval()
         loader = self.data.loaders["val"]
         limit = self.config.train.limit_val_batches
@@ -724,10 +866,15 @@ class Trainer:
                 # report needs its magnitude quantified rather than eyeballed off two
                 # curves. With augmentation on, this is also how we see what the
                 # augmentation bought.
-                record["diag/gap_total"] = record["val/total"] - record["train/total"]
-                record["diag/gap_ce"] = record["val/ce"] - record["train/ce"]
+                # Absent in selection_head mode, where validate() returns no ELBO terms.
+                if "val/total" in record:
+                    record["diag/gap_total"] = record["val/total"] - record["train/total"]
+                    record["diag/gap_ce"] = record["val/ce"] - record["train/ce"]
 
-            if diagnostics_due:
+            # The latent diagnostics describe the BASE, which is frozen here -- they
+            # would repeat the same numbers every epoch. They belong to the run that
+            # produced the base checkpoint, not to the head's run.
+            if diagnostics_due and self.head is None:
                 record.update(
                     {f"diag/{k}": v for k, v in self.run_diagnostics(epoch).items()}
                 )
@@ -782,6 +929,22 @@ class Trainer:
             eta = f" eta={self.format_duration(mean_seconds * (self.planned_epochs - epoch - 1))}"
         LOGGER.info("epoch %d/%d %s%s", epoch + 1, self.planned_epochs, summary, eta)
 
+    def _freeze_metrics(self) -> dict[str, float]:
+        """The freeze record as numeric metrics, for storage in a checkpoint.
+
+        Returns:
+            ``freeze/``-prefixed counts, or empty in ELBO mode where nothing is frozen.
+            The parameter fingerprint is a hex digest rather than a number, so it is not
+            included here; it is re-derivable from the stored weights.
+        """
+        if self.base_record is None:
+            return {}
+        return {
+            f"freeze/{key}": float(value)
+            for key, value in self.base_record.items()
+            if isinstance(value, (int, float, bool))
+        }
+
     def _checkpoint(self, epoch: int, record: dict[str, float]) -> None:
         """Save last, and best when the monitored metric improves.
 
@@ -801,7 +964,11 @@ class Trainer:
             "seed": self.config.run.seed,
             "device": str(self.device),
             "monitor": policy.monitor,
-            "metrics": {k: v for k, v in record.items()},
+            # The freeze record travels WITH the artifact, not just in the log. "The base
+            # was frozen" is a claim the report makes about this checkpoint, so it has to
+            # be checkable from the checkpoint rather than from a log file that may be
+            # long gone. Numeric-only, matching the metrics dict's contract.
+            "metrics": {**{k: v for k, v in record.items()}, **self._freeze_metrics()},
             "loader_generator_state": generator.get_state() if generator is not None else None,
             # The record for this epoch is appended to self.history after _log_epoch but
             # before _checkpoint, so history already includes it.
@@ -814,6 +981,22 @@ class Trainer:
 
         candidate = record.get(policy.monitor)
         if candidate is None:
+            # Loud, not silent, and deliberately no best.pt. In Stage 3 the configured
+            # monitor (val/selected_consensus_dice) does not exist yet, and the objective
+            # is a placeholder -- so any best.pt written here would be a scaffold
+            # checkpoint that a later stage could mistake for a real one. Refusing to
+            # write it is the safe failure; writing one selected on some other metric,
+            # flat or otherwise, is not.
+            LOGGER.warning(
+                "no best.pt at epoch %d: monitored metric %r is absent from this epoch's "
+                "record. %s",
+                epoch + 1,
+                policy.monitor,
+                "selection_head is a Stage 3 scaffold with a placeholder objective; the "
+                "monitor lands with the head's real metrics in Stage 4."
+                if self.head is not None
+                else "Check that the metric name matches what validate() emits.",
+            )
             return
         if is_improvement(candidate, self.best_metric, policy.mode):
             self.best_metric = candidate

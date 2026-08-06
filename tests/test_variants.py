@@ -8,6 +8,7 @@ that -- a scaffold must fail loudly rather than quietly behave like the baseline
 
 from __future__ import annotations
 
+import logging
 import dataclasses
 import json
 from pathlib import Path
@@ -32,6 +33,8 @@ from probunet.training.checkpoint import (
 )
 from probunet.training.config import TRAIN_MODES, ExperimentConfig, RunConfig, TrainConfig
 from probunet.training.freeze import assert_frozen, freeze_module
+from probunet.extension.head import SelectionHead
+from probunet.training.freeze import parameter_fingerprint
 from probunet.training.trainer import Trainer
 from probunet.variants import ProbUNetVariant, SegmentationVariant
 
@@ -224,14 +227,17 @@ def test_selection_head_mode_requires_a_base_checkpoint(
         Trainer(config)
 
 
-def test_selection_head_mode_freezes_then_reports_not_implemented(
+def base_checkpoint_for(
     tiny_experiment: ExperimentConfig, tmp_path: Path
-) -> None:
-    """With a base checkpoint the freeze happens; only the head is missing.
+) -> tuple[Path, ExperimentConfig]:
+    """Write a base checkpoint and return it with a selection_head config to use it.
 
-    The freeze contract is what the extension's central claim depends on, so it is real
-    and tested now. The head is Phase 3 and must fail loudly rather than silently train
-    something else.
+    Args:
+        tiny_experiment: The synthetic experiment fixture.
+        tmp_path: Temporary directory.
+
+    Returns:
+        The checkpoint path and a config in ``selection_head`` mode.
     """
     base = Trainer(tiny_experiment)
     checkpoint = tmp_path / "base.pt"
@@ -249,14 +255,166 @@ def test_selection_head_mode_freezes_then_reports_not_implemented(
         best_metric=1.0,
         metrics={},
     )
-
     config = dataclasses.replace(
         tiny_experiment,
         run=dataclasses.replace(tiny_experiment.run, name="head"),
         train=dataclasses.replace(tiny_experiment.train, mode="selection_head"),
     )
-    with pytest.raises(NotImplementedError, match="Phase 3"):
-        Trainer(config, base_checkpoint=checkpoint)
+    return checkpoint, config
+
+
+def test_selection_head_builds_a_frozen_base_and_a_trainable_scorer(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """Stage 3: the mode no longer raises, and the freeze contract is real."""
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+
+    assert trainer.head is not None
+    assert isinstance(trainer.model, SelectionHead)
+    assert trainer.base_record is not None
+    assert trainer.base_record["trainable_parameters"] == 0
+    assert trainer.base_record["training_mode"] is False
+    assert trainer.base_record["scorer_parameters"] > 0
+    assert trainer.base_fingerprint == parameter_fingerprint(trainer.head.base)
+
+    # Every base parameter frozen, every scorer parameter trainable.
+    assert not any(p.requires_grad for p in trainer.head.base.parameters())
+    assert all(p.requires_grad for p in trainer.head.scorer.parameters())
+
+
+def test_the_optimizer_never_receives_the_base(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """THE structural guarantee: the optimizer holds scorer parameters and nothing else.
+
+    Handing it ``model.parameters()`` is the failure mode that would let the base drift
+    and make "distribution metrics unchanged" false while every log line looked fine.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+
+    optimized = {
+        id(p) for group in trainer.optimizer.param_groups for p in group["params"]
+    }
+    scorer = {id(p) for p in trainer.head.scorer.parameters()}
+    base = {id(p) for p in trainer.head.base.parameters()}
+
+    assert optimized == scorer, "the optimizer is not exactly the scorer"
+    assert optimized.isdisjoint(base), "the optimizer can reach the frozen base"
+
+
+def test_train_cannot_thaw_the_base(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """``model.train()`` must not put the frozen base back into training mode.
+
+    ``nn.Module.train()`` recurses into children, so without the override the training
+    loop's ordinary call would thaw the base's mode. Nothing here has dropout or batch
+    norm today, so the immediate numerical effect would be nil -- which is exactly why it
+    would go unnoticed until something mode-dependent was added.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+
+    trainer.model.train()
+    assert trainer.head.scorer.training is True
+    assert trainer.head.base.training is False, "train() thawed the frozen base"
+
+    trainer.model.train(True)
+    assert trainer.head.base.training is False
+    trainer.head.assert_base_frozen()
+
+
+def test_a_full_epoch_leaves_the_base_bit_identical(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """The check that catches a misconfigured optimizer: compare the BASE before/after.
+
+    ``requires_grad`` and ``eval()`` are intent; this measures the outcome. The scorer
+    must move -- otherwise "the base did not move" would pass vacuously because nothing
+    trained at all.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+
+    before_base = parameter_fingerprint(trainer.head.base)
+    before_scorer = parameter_fingerprint(trainer.head.scorer)
+
+    metrics = trainer.train_epoch(0)
+
+    assert parameter_fingerprint(trainer.head.base) == before_base, "the base moved"
+    assert parameter_fingerprint(trainer.head.scorer) != before_scorer, (
+        "the scorer did not move, so the freeze check passed vacuously"
+    )
+    assert np.isfinite(metrics["total"])
+    assert trainer.global_step > 0
+
+
+def test_a_drifting_base_is_caught_at_the_epoch_boundary(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """Simulate the failure: perturb the base mid-run and confirm the epoch check fires.
+
+    Without this, the fingerprint comparison is only ever exercised on the passing path,
+    and a check that has never failed is not known to work.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+
+    with torch.no_grad():
+        next(iter(trainer.head.base.parameters())).add_(1e-3)
+
+    with pytest.raises(RuntimeError, match="not actually frozen"):
+        trainer.train_epoch(0)
+
+
+def test_scaffold_writes_last_but_refuses_best(
+    tiny_experiment: ExperimentConfig, tmp_path: Path, caplog
+) -> None:
+    """A placeholder objective must not leave a best.pt a later stage could trust.
+
+    The configured monitor (``val/selected_consensus_dice``) does not exist until Stage 4,
+    and the objective here is meaningless. Writing a best.pt selected on anything else --
+    or on a flat curve -- would produce a scaffold checkpoint indistinguishable from a
+    real one. Refusing loudly is the safe failure.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    config = dataclasses.replace(
+        config,
+        checkpoint=dataclasses.replace(
+            config.checkpoint, monitor="val/selected_consensus_dice", mode="max"
+        ),
+    )
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+
+    with caplog.at_level(logging.WARNING):
+        summary = trainer.train()
+
+    assert (trainer.checkpoint_dir / "last.pt").exists()
+    assert not (trainer.checkpoint_dir / "best.pt").exists(), "wrote a scaffold best.pt"
+    assert trainer.best_metric is None
+    messages = " ".join(record.message for record in caplog.records)
+    assert "STAGE 3 SCAFFOLD" in messages
+    assert "no best.pt" in messages
+    # The ELBO is constant under a frozen base, so it is not computed or logged at all.
+    for record in summary["history"]:
+        assert not any(key.startswith("val/") for key in record), record
+
+
+def test_the_freeze_record_reaches_the_checkpoint(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """The freeze record is evidence, so it has to survive into the artifact."""
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+    trainer.train_epoch(0)
+    trainer._checkpoint(0, {"train/total": 1.0})
+
+    state = load_checkpoint(trainer.checkpoint_dir / "last.pt")
+    assert state.metrics["freeze/frozen_parameters"] > 0
+    assert state.metrics["freeze/trainable_parameters"] == 0
+    assert state.metrics["freeze/scorer_parameters"] > 0
 
 
 def test_elbo_mode_is_unaffected(tiny_experiment: ExperimentConfig) -> None:
