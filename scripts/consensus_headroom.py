@@ -62,10 +62,13 @@ from probunet.data.lidc import build_data  # noqa: E402
 from probunet.evaluation.headroom import (  # noqa: E402
     EVAL_SAMPLES,
     measure_ceilings,
+    measure_selection,
     measure_split,
     per_bucket,
     render,
+    render_selection,
 )
+from probunet.extension.head import SelectionHead  # noqa: E402
 from probunet.evaluation.sampling import DEFAULT_EVAL_SEED  # noqa: E402
 from probunet.model.prob_unet import ProbUNet  # noqa: E402
 from probunet.training.checkpoint import load_checkpoint  # noqa: E402
@@ -85,6 +88,12 @@ def main() -> None:
              "all-empty score depend on the grader masks alone, so they need no weights.",
     )
     parser.add_argument(
+        "--head-checkpoint", type=Path, default=None,
+        help="a trained selection-head checkpoint. Switches to the Stage 5 SELECTION "
+             "table: head, its size-prior control, random, oracle and the fraction of the "
+             "oracle-minus-random gap each captured, per ambiguity bucket.",
+    )
+    parser.add_argument(
         "--config", type=Path, default=None,
         help="config supplying the data pipeline. Required in ceiling-only mode; "
              "otherwise the checkpoint's own config is used.",
@@ -93,14 +102,24 @@ def main() -> None:
         "--split", required=True, choices=("val", "test"),
         help="no default: development happens on val, test is touched once at the end",
     )
-    parser.add_argument("--samples", type=int, default=EVAL_SAMPLES)
+    parser.add_argument(
+        "--samples", type=int, default=None,
+        help=f"candidates per image; defaults to head.eval_samples, else {EVAL_SAMPLES}",
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_EVAL_SEED)
     parser.add_argument("--device", default=None)
     parser.add_argument("--out", type=Path, default=None)
     arguments = parser.parse_args()
 
-    if arguments.checkpoint is None and arguments.config is None:
-        parser.error("give --checkpoint, or --config for ceiling-only mode")
+    if (
+        arguments.checkpoint is None
+        and arguments.config is None
+        and arguments.head_checkpoint is None
+    ):
+        parser.error(
+            "give --head-checkpoint for the selection table, --checkpoint for the "
+            "headroom pass, or --config for ceiling-only mode"
+        )
     if arguments.checkpoint is not None and not arguments.checkpoint.exists():
         raise FileNotFoundError(
             f"checkpoint not found: {arguments.checkpoint}. Run this on the machine that "
@@ -108,7 +127,10 @@ def main() -> None:
         )
 
     state = None
-    if arguments.config is not None:
+    if arguments.head_checkpoint is not None:
+        state = load_checkpoint(arguments.head_checkpoint)
+        config = ExperimentConfig.from_dict(state.config)
+    elif arguments.config is not None:
         config = ExperimentConfig.from_yaml(arguments.config)
     else:
         state = load_checkpoint(arguments.checkpoint)
@@ -120,7 +142,21 @@ def main() -> None:
     loader = data.loaders[arguments.split]
 
     freeze_record = None
-    if arguments.checkpoint is None:
+    if arguments.head_checkpoint is not None:
+        base = ProbUNet(config.model).to(device)
+        head = SelectionHead(base, channels=config.head.scorer_channels).to(device)
+        load_checkpoint(arguments.head_checkpoint, model=head, map_location=device)
+        head.eval()
+        head.assert_base_frozen()
+        freeze_record = dict(head.freeze_record)
+        samples = arguments.samples or config.head.eval_samples
+        seed = config.head.eval_seed
+        LOGGER.info(
+            "SELECTION table over %d patches from %s: %d shared candidates, seed %d",
+            len(data.datasets[arguments.split]), arguments.split, samples, seed,
+        )
+        results = measure_selection(head, loader, device, samples, seed)
+    elif arguments.checkpoint is None:
         # Ceiling-only: grader masks are the whole input, so there is nothing to load and
         # nothing that could vary between arms.
         LOGGER.info(
@@ -136,14 +172,19 @@ def main() -> None:
         freeze_record = freeze_module(model, "base model")
         LOGGER.info(
             "scoring %d patches from %s with %d shared candidates per image (seed %d)",
-            len(data.datasets[arguments.split]), arguments.split, arguments.samples,
-            arguments.seed,
+            len(data.datasets[arguments.split]), arguments.split,
+            arguments.samples or EVAL_SAMPLES, arguments.seed,
         )
-        results = measure_split(model, loader, device, arguments.samples, arguments.seed)
+        results = measure_split(
+            model, loader, device, arguments.samples or EVAL_SAMPLES, arguments.seed
+        )
     report = per_bucket(results)
 
     record = {
-        "mode": "ceiling_only" if state is None else "full",
+        "mode": (
+            "selection" if arguments.head_checkpoint
+            else "ceiling_only" if state is None else "full"
+        ),
         "checkpoint": None if state is None else str(arguments.checkpoint),
         "checkpoint_epoch": None if state is None else state.epoch,
         "checkpoint_device": None if state is None else state.device,
@@ -151,7 +192,7 @@ def main() -> None:
         "checkpoint_torch_version": None if state is None else state.torch_version,
         "latent_covariance": config.model.latent_covariance,
         "split": arguments.split,
-        "n_samples": None if state is None else arguments.samples,
+        "n_samples": arguments.samples,
         "sampling_seed": arguments.seed,
         "freeze_record": freeze_record,
         "environment": {
@@ -170,8 +211,10 @@ def main() -> None:
         LOGGER.info("wrote %s", arguments.out)
 
     print()
-    print(render(report))
+    print(render_selection(report) if arguments.head_checkpoint else render(report))
     print()
+    if arguments.head_checkpoint is not None:
+        return
     if state is None:
         print(
             "Ceiling-only: these depend on the grader masks alone, so they are FINAL -- "

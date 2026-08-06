@@ -37,7 +37,7 @@ from probunet.training.freeze import assert_frozen, freeze_module
 from probunet.extension.head import MaskScorer, SelectionHead
 from probunet.training.freeze import parameter_fingerprint
 from probunet.training.trainer import Trainer
-from probunet.variants import ProbUNetVariant, SegmentationVariant
+from probunet.variants import ProbUNetVariant, SegmentationVariant, SelectionHeadVariant
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIGS = REPO_ROOT / "configs"
@@ -299,10 +299,13 @@ def test_the_optimizer_never_receives_the_base(
         id(p) for group in trainer.optimizer.param_groups for p in group["params"]
     }
     scorer = {id(p) for p in trainer.head.scorer.parameters()}
+    area = {id(p) for p in trainer.head.area_baseline.parameters()}
     base = {id(p) for p in trainer.head.base.parameters()}
 
-    assert optimized == scorer, "the optimizer is not exactly the scorer"
+    # The scorer AND its size-prior control -- both trainable, both disjoint from the base.
+    assert optimized == scorer | area, "the optimizer is not exactly the trainable head"
     assert optimized.isdisjoint(base), "the optimizer can reach the frozen base"
+    assert scorer.isdisjoint(area), "control and head share parameters; it is not a control"
 
 
 def test_train_cannot_thaw_the_base(
@@ -1083,3 +1086,215 @@ def test_notebook_is_valid_and_contains_no_training() -> None:
     # It must read the tracked artifacts rather than recompute them.
     assert "COMPARISON_JSON" in joined
     assert "SUBSET_NPZ" in joined
+
+
+# --------------------------------------------------------------------------- #
+# Stage 5: selection through the protocol, the results table, the ablation guard
+# --------------------------------------------------------------------------- #
+def test_ged_is_bit_identical_with_and_without_the_head(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """THE first half of the extension's claim: distribution metrics unchanged.
+
+    Attaching the head must not move GED, diversity, or anything else computed from the
+    sample *set* -- the head only chooses among samples the frozen base already produced.
+    Asserted as **bit-identical**, not close: sampling is literally the same code on the
+    same frozen weights with the same seed, so any difference at all means something is
+    reaching the generative path that should not be.
+
+    Also: the distribution metrics keep using the four SEPARATE grader masks. Consensus is
+    the selection target only; collapsing the graders for GED would discard exactly the
+    spread Phase 1 measures.
+    """
+    from probunet.data.lidc import build_data
+
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+    data = build_data(config.data)
+    sampling = SamplingConfig(sample_counts=(2, 4))
+
+    plain = ProbUNetVariant(
+        trainer.head.base, name="base", generator=torch.Generator().manual_seed(2018)
+    )
+    with_head = SelectionHeadVariant(
+        trainer.head, name="extension", generator=torch.Generator().manual_seed(2018)
+    )
+
+    without = collect_per_patch_metrics(
+        plain, data.loaders["val"], sampling, torch.device("cpu")
+    )
+    with_ = collect_per_patch_metrics(
+        with_head, data.loaders["val"], sampling, torch.device("cpu")
+    )
+
+    for key, values in without.items():
+        assert np.array_equal(np.asarray(values), np.asarray(with_[key])), (
+            f"{key} moved when the head was attached"
+        )
+    # The head adds its own columns and changes nothing else.
+    assert "selected_dice@4" in with_ and "selected_dice@4" not in without
+
+
+def test_only_the_extension_selects(tiny_model: ProbUNet) -> None:
+    """One variant-dependent branch in evaluation: did select() return an index?"""
+    head = SelectionHead(tiny_model)
+    image = torch.rand(2, 1, SIZE, SIZE)
+    plain = ProbUNetVariant(tiny_model)
+    extension = SelectionHeadVariant(head)
+
+    samples = plain.sample(image, 4)
+    assert plain.select(samples, image) is None
+    chosen = extension.select(samples, image)
+    assert isinstance(chosen, torch.Tensor)
+    assert chosen.shape == (2,)
+    assert bool(((chosen >= 0) & (chosen < 4)).all())
+    assert isinstance(extension, SegmentationVariant)
+
+
+def test_the_area_control_selects_on_area_alone(tiny_model: ProbUNet) -> None:
+    """The control must not be able to see the image -- otherwise it is not a control."""
+    head = SelectionHead(tiny_model)
+    control = SelectionHeadVariant(head, by_area=True)
+    samples = torch.zeros(1, 3, SIZE, SIZE, dtype=torch.uint8)
+    samples[0, 0, :2, :2] = 1
+    samples[0, 1, :4, :4] = 1
+    samples[0, 2, :6, :6] = 1
+
+    first = control.select(samples, torch.rand(1, 1, SIZE, SIZE))
+    second = control.select(samples, torch.rand(1, 1, SIZE, SIZE))
+    assert torch.equal(first, second), "the area control's pick depended on the image"
+
+
+def test_selection_table_carries_every_requested_column(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """The Stage 5 table: head beside its control, the gap fraction, and the empty rows."""
+    from probunet.data.lidc import build_data
+    from probunet.evaluation.headroom import measure_selection, per_bucket, render_selection
+
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+    data = build_data(config.data)
+
+    results = measure_selection(
+        trainer.head, data.loaders["val"], torch.device("cpu"), 6, config.head.eval_seed
+    )
+    report = per_bucket(results)
+    row = report["all"]
+
+    for column in ("head", "area_only", "random", "oracle", "ceiling", "emptiest"):
+        assert column in row, column
+    # The number the report leads with, and its control immediately beside it.
+    assert "gap_captured_head" in row
+    assert "gap_captured_area_only" in row
+    # The pre-registered rows.
+    assert 0.0 <= row["all_candidates_empty_fraction"] <= 1.0
+    if row["all_candidates_empty_fraction"] < 1.0:
+        assert "oracle_where_offered" in row
+        assert row["n_offered"] <= row["n"]
+
+    # Bounds that must hold whatever the head learned.
+    assert row["head"]["mean"] <= row["oracle"]["mean"] + 1e-6
+    assert row["area_only"]["mean"] <= row["oracle"]["mean"] + 1e-6
+    assert row["oracle"]["mean"] <= row["ceiling"]["mean"] + 1e-6
+
+    text = render_selection(report)
+    for token in ("head", "area", "gap%", "allmt", "orc|off"):
+        assert token in text
+
+
+def test_all_candidates_empty_is_counted_not_averaged_away() -> None:
+    """Images where the sampler offered nothing are reported, and oracle is split.
+
+    Those images score exactly 0 under every rule, so they cap what any selector can
+    achieve. Separating them makes "the sampler offered nothing" distinguishable from
+    "the sampler offered something poorly localized".
+    """
+    from probunet.evaluation.headroom import per_bucket
+
+    results = {
+        "head": np.array([0.0, 0.4, 0.0, 0.6]),
+        "random": np.array([0.0, 0.2, 0.0, 0.3]),
+        "oracle": np.array([0.0, 0.5, 0.0, 0.7]),
+        "area_only": np.array([0.0, 0.3, 0.0, 0.4]),
+        "all_empty": np.zeros(4),
+        "ceiling": np.array([0.4, 0.4, 1.0, 1.0]),
+        # Two images where every candidate was empty.
+        "nonempty_frac": np.array([0.0, 0.5, 0.0, 1.0]),
+        "n_nonempty": np.array([1, 1, 4, 4]),
+        "index": np.arange(4),
+    }
+    report = per_bucket(results)
+    assert report["all"]["all_candidates_empty_fraction"] == pytest.approx(0.5)
+    assert report["1 grader"]["all_candidates_empty_fraction"] == pytest.approx(0.5)
+    # Oracle over everything is dragged down by the zeros; restricted to images that
+    # offered something it is not.
+    assert report["all"]["oracle"]["mean"] == pytest.approx(0.3)
+    assert report["all"]["oracle_where_offered"] == pytest.approx(0.6)
+    assert report["all"]["n_offered"] == 2
+
+
+def test_ablation_guard_refuses_mismatched_head_runs() -> None:
+    """A refusal, not a warning: a warning at the end of a long run gets read past."""
+    import copy
+
+    from probunet.extension.ablation import ablation_signature, assert_comparable
+
+    arm = {
+        "head": {
+            "train_samples": 8, "eval_samples": 16, "eval_seed": 2018,
+            "huber_delta": 0.1, "scorer_channels": [32, 64, 128],
+            "mean_centered_targets": False,
+        },
+        "model": {"base_channels": 32, "latent_covariance": "diagonal"},
+        "optim": {"name": "adam", "lr": 1e-3, "weight_decay": 0.0,
+                  "betas": [0.9, 0.999], "eps": 1e-8},
+        "schedule": {"name": "constant"},
+        "train": {"epochs": 30, "iterations": None, "mode": "selection_head"},
+        "data": {"batch_size": 32, "split_path": "s.json"},
+        "run": {"seed": 2018},
+    }
+
+    # The variable under test may differ; nothing else may.
+    other = copy.deepcopy(arm)
+    other["model"]["latent_covariance"] = "full"
+    assert_comparable({"p1": ablation_signature(arm), "p2": ablation_signature(other)})
+
+    for path, value in (
+        (("head", "eval_seed"), 99),
+        (("head", "train_samples"), 4),
+        (("head", "eval_samples"), 8),
+        (("head", "huber_delta"), 1.0),
+        (("head", "scorer_channels"), [16, 32]),
+        (("model", "base_channels"), 16),
+        (("optim", "lr"), 1e-4),
+        (("train", "epochs"), 20),
+        (("data", "batch_size"), 16),
+        (("run", "seed"), 7),
+    ):
+        broken = copy.deepcopy(other)
+        broken[path[0]][path[1]] = value
+        with pytest.raises(ValueError, match="REFUSING"):
+            assert_comparable(
+                {"p1": ablation_signature(arm), "p2": ablation_signature(broken)}
+            )
+
+
+def test_ablation_guard_treats_a_missing_field_as_a_difference() -> None:
+    """A checkpoint predating a field must not silently match one that has it."""
+    from probunet.extension.ablation import ablation_signature, assert_comparable
+
+    complete = {"head": {"eval_seed": 2018}, "train": {"mode": "selection_head"}}
+    missing = {"train": {"mode": "selection_head"}}
+    with pytest.raises(ValueError, match="eval_seed"):
+        assert_comparable(
+            {"a": ablation_signature(complete), "b": ablation_signature(missing)}
+        )
+
+
+def test_a_single_arm_is_trivially_comparable() -> None:
+    """One arm cannot disagree with itself; the guard must not block ordinary evaluation."""
+    from probunet.extension.ablation import ablation_signature, assert_comparable
+
+    assert_comparable({"only": ablation_signature({"head": {"eval_seed": 2018}})})
+    assert_comparable({})

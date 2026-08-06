@@ -29,6 +29,7 @@ want. A mask-area-only regressor is kept as a diagnostic baseline instead (Stage
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterator
 
 import torch
@@ -145,6 +146,51 @@ class MaskScorer(nn.Module):
         return self.project(pooled).squeeze(-1)
 
 
+class AreaOnlyScorer(nn.Module):
+    """The control: predicts the same target from the candidate's **area alone**.
+
+    Trained simultaneously with the real scorer, on the same candidates, the same targets
+    and the same loss, so the comparison between them is not confounded by anything except
+    what each one is allowed to see. Its parameters are disjoint from the scorer's, so the
+    two objectives can be summed and still optimize independently.
+
+    **Why it exists.** The head is deliberately denied mask summary statistics, because
+    pooling already recovers area implicitly and handing it over explicitly would make the
+    size-prior shortcut easier to learn than spatial agreement. But "the head did not take
+    the shortcut" is a claim that needs a measurement, not an argument -- and the
+    measurement is: how well can the shortcut alone do? **If the head barely beats this,
+    the head learned size priors, not spatial agreement**, whatever its absolute score
+    looks like. It belongs beside the head in the results table rather than in a separate
+    diagnostic, so that comparison cannot be overlooked.
+
+    Input is ``log1p(area)`` rather than raw area: lesion areas span roughly 1 to 10^3
+    pixels, and a linear layer on a raw count would be dominated by the largest masks.
+    """
+
+    def __init__(self, hidden: int = 32) -> None:
+        """Build the area regressor.
+
+        Args:
+            hidden: Width of the single hidden layer.
+        """
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, 1)
+        )
+
+    def forward(self, candidates: Tensor) -> Tensor:
+        """Score candidates from their foreground area alone.
+
+        Args:
+            candidates: Masks of shape ``(B, n, H, W)``.
+
+        Returns:
+            Unbounded scores of shape ``(B, n)``.
+        """
+        area = (candidates != 0).flatten(start_dim=2).sum(dim=2).to(torch.float32)
+        return self.net(torch.log1p(area).unsqueeze(-1)).squeeze(-1)
+
+
 class SelectionHead(nn.Module):
     """A trainable scorer on top of a **frozen** Probabilistic U-Net.
 
@@ -175,6 +221,9 @@ class SelectionHead(nn.Module):
             mask_channels=mask_channels,
             channels=channels,
         )
+        # The shortcut control, trained alongside under identical conditions. See
+        # AreaOnlyScorer: "the head did not learn a size prior" needs a measurement.
+        self.area_baseline = AreaOnlyScorer()
 
     def train(self, mode: bool = True) -> SelectionHead:
         """Set training mode for the scorer while pinning the base to ``eval()``.
@@ -199,11 +248,15 @@ class SelectionHead(nn.Module):
         """The **only** parameters an optimizer may be given.
 
         Yields:
-            The scorer's parameters. The base's are deliberately absent: passing
-            ``self.parameters()`` to an optimizer is the failure mode that would let the
-            base drift and invalidate "distribution metrics unchanged".
+            The scorer's parameters and the area control's. The base's are deliberately
+            absent: passing ``self.parameters()`` to an optimizer is the failure mode that
+            would let the base drift and invalidate "distribution metrics unchanged".
+
+            The two trainable sets are **disjoint**, so summing their objectives optimizes
+            each independently -- the control cannot borrow gradient from the head or the
+            other way round, which is what keeps it an honest control.
         """
-        return self.scorer.parameters()
+        return itertools.chain(self.scorer.parameters(), self.area_baseline.parameters())
 
     def assert_base_frozen(self) -> None:
         """Re-check the freeze contract at any point in training.
@@ -307,6 +360,28 @@ class SelectionHead(nn.Module):
         ]
         return torch.stack(scores, dim=1)
 
+    def score_by_area(self, candidates: Tensor) -> Tensor:
+        """Control scores from candidate area alone, shape ``(B, n)``.
+
+        Args:
+            candidates: Masks of shape ``(B, n, H, W)``.
+
+        Returns:
+            Unbounded scores of shape ``(B, n)``.
+        """
+        return self.area_baseline(candidates)
+
+    def select_by_area(self, candidates: Tensor) -> Tensor:
+        """What the size-prior shortcut alone would pick, shape ``(B,)``.
+
+        Args:
+            candidates: Masks of shape ``(B, n, H, W)``.
+
+        Returns:
+            Chosen indices of shape ``(B,)``.
+        """
+        return self.score_by_area(candidates).argmax(dim=1)
+
     def select(self, features: Tensor, candidates: Tensor) -> Tensor:
         """Choose one candidate per image, **without ground truth**.
 
@@ -328,4 +403,10 @@ class SelectionHead(nn.Module):
         """
         base = sum(p.numel() for p in self.base.parameters())
         scorer = sum(p.numel() for p in self.scorer.parameters())
-        return {"base": base, "scorer": scorer, "total": base + scorer}
+        area = sum(p.numel() for p in self.area_baseline.parameters())
+        return {
+            "base": base,
+            "scorer": scorer,
+            "area_baseline": area,
+            "total": base + scorer + area,
+        }

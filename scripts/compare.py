@@ -30,6 +30,12 @@ if SRC.exists() and str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from probunet.evaluation.runner import evaluate_checkpoint  # noqa: E402
+from probunet.extension.ablation import (  # noqa: E402
+    VARYING_FIELD,
+    ablation_signature,
+    assert_comparable,
+)
+from probunet.training.checkpoint import load_checkpoint  # noqa: E402
 from probunet.evaluation.sampling import (  # noqa: E402
     DEFAULT_EVAL_SEED,
     DEFAULT_SAMPLE_COUNTS,
@@ -170,6 +176,26 @@ def main(argv: list[str] | None = None) -> int:
     sampling = SamplingConfig(
         sample_counts=tuple(args.samples), seed=args.seed, aggregate=args.aggregate
     )
+
+    # REFUSE before spending a single forward pass. Two head runs that differ in
+    # anything but their base are not an ablation, and discovering that after the
+    # evaluation -- or worse, after the table is in the report -- is the failure this
+    # guards. Arms that are not selection_head runs carry no head signature and are
+    # skipped, so Phase 1 vs Phase 2 comparisons are unaffected.
+    signatures = {}
+    covariance = {}
+    for name, path in args.checkpoint:
+        config = load_checkpoint(path).config
+        if config.get("train", {}).get("mode") == "selection_head":
+            signatures[name] = ablation_signature(config)
+            covariance[name] = config.get("model", {}).get("latent_covariance")
+    if signatures:
+        assert_comparable(signatures)
+        LOGGER.info(
+            "head arms are comparable; the variable under test is %s = %s",
+            VARYING_FIELD,
+            covariance,
+        )
 
     reports: dict[str, Any] = {}
     for name, path in args.checkpoint:

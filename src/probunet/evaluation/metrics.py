@@ -718,8 +718,16 @@ def spearman_per_image(
     if predicted.shape[1] < 2:
         raise ValueError("need at least two candidates to correlate")
 
-    # CPU before float64: MPS has no float64 at all, and ranks want the precision more
-    # than they want the device. These are (B, n) with n = 16, so the transfer is free.
+    # ---------------------------------------------------------------------------------
+    # DEVICE: this MUST leave the accelerator, and the reason is not performance.
+    # torch has NO float64 on MPS -- `.to(torch.float64)` on an MPS tensor raises outright,
+    # which is how this was found (a real run, not the CPU test suite). Ranks want the
+    # precision more than they want the device, and these are (B, n) with n = 16, so the
+    # transfer costs nothing measurable.
+    # DO NOT "optimize" this back onto the device. Doing so reintroduces a crash that only
+    # appears on MPS, and the caller's bucket selector must follow it here for the same
+    # reason -- see Trainer._validate_selection_head.
+    # ---------------------------------------------------------------------------------
     left = _average_ranks(predicted.detach().cpu().to(torch.float64))
     right = _average_ranks(target.detach().cpu().to(torch.float64))
     left = left - left.mean(dim=1, keepdim=True)

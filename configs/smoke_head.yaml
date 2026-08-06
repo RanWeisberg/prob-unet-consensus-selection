@@ -1,0 +1,168 @@
+# HEAD SMOKE TEST -- run this on the TRAINING MACHINE before the real head run.
+#
+#   python scripts/train.py --config configs/smoke_head.yaml \
+#       --base-checkpoint runs/baseline/checkpoints/best.pt
+#
+# WHY THIS EXISTS AS A SEPARATE GATE. Passing on macOS/MPS says nothing about CUDA: the
+# head's paths differ by backend, and two MPS-only bugs in the Spearman path were found by
+# running it rather than by the CPU test suite (float64 ranks are unavailable on MPS, and
+# the bucket selector then has to follow the ranks to the CPU). CUDA has its own kernel
+# coverage, so the same class of failure can appear there and nowhere else. A few seconds
+# here beats discovering it at the end of epoch 1 of a real run.
+#
+# WHAT A PASS LOOKS LIKE -- check all five, they are cheap:
+#   1. It completes without raising.
+#   2. "froze base ... 0 trainable" appears, and no best.pt problem is logged.
+#   3. train/total DECREASES across the four epochs. If it is unstable, drop optim.lr to
+#      3e-4 and RECORD that (configs/extension.yaml says so too).
+#   4. val/selected_consensus_dice, val/oracle_consensus_dice and val/ceiling are all
+#      FINITE and satisfy selected <= oracle <= ceiling.
+#   5. val/spearman is finite, and val/spearman_excluded_fraction is < 1.0 -- if it is
+#      exactly 1.0 the Spearman path never ran on a non-degenerate image and this gate
+#      proved nothing about it.
+#
+# It uses the REAL architecture and the REAL dataset on a handful of batches; only the
+# batch counts are small. Everything else matches configs/extension.yaml.
+
+run:
+  name: smoke_head
+  seed: 2018
+  device: auto
+  out_dir: runs
+  deterministic: true
+
+model:
+  latent_dim: 6
+  base_channels: 32
+  num_downs: 4
+  convs_per_scale: 3
+  num_classes: 2
+  image_channels: 1
+  mask_channels: 1
+  fcomb_convs: 3
+  fcomb_channels: null
+  max_channels: null
+  align_corners: false
+  bias_init_std: 0.001
+
+loss:
+  beta: 1.0               # unused in selection_head mode; the head has its own objective
+
+head:
+  # Prior candidates per image per TRAINING step. Sampling re-runs only f_comb with the
+  # base under no_grad, so 8 candidates cost 8 passes of a 1x1-conv stack, not 8 U-Nets.
+  train_samples: 8
+  # Candidates at VALIDATION -- 16, so the numbers sit beside the Phase 1 table. Train-K
+  # need not equal eval-K because the head scores each candidate INDEPENDENTLY, which is a
+  # genuine advantage of the regression formulation and worth a sentence in the report.
+  # Both are FIXED once: head-on-Phase1 vs head-on-Phase2 requires identical runs. If
+  # 8 GiB OOMs, reduce data.batch_size, NOT these, and record it.
+  eval_samples: 16
+  # Huber, not MSE and not L1. delta is set at the scale of WITHIN-IMAGE score
+  # differences, so the differences the head must actually discriminate sit in the
+  # quadratic region while cross-bucket errors get linear treatment. MSE would
+  # over-weight the few high-target bucket-4 images given a target distribution that is
+  # bounded and bucket-1-heavy near zero; L1's constant gradient near zero jitters at
+  # convergence.
+  huber_delta: 0.1
+  scorer_channels: [32, 64, 128]
+  # PRE-REGISTERED FALLBACK, off by default (FINDINGS 4.4). Achievable scores are strongly
+  # bucket-dependent, so plain regression can score well by predicting each image's typical
+  # value while ignoring the candidate. If val Spearman sits near zero while the Huber loss
+  # looks healthy, switch this on -- targets are then centered within each image, removing
+  # the between-image component the shortcut exploits. Recorded in advance so that taking
+  # it later is a planned contingency, not an unexplained pivot.
+  mean_centered_targets: false
+
+data:
+  npz_path: data/processed/lidc.npz
+  split_path: data/splits/split.json
+  batch_size: 32
+  num_workers: 0
+  pin_memory: false
+  normalization: none
+
+  # AUGMENTATION IS OFF FOR THE HEAD, deliberately. See DEVIATIONS.md entry 13.
+  #
+  #   (a) The base is FROZEN, so augmentation's Phase 1 purpose -- regularizing a 27.5M
+  #       parameter generative model -- does not apply. It would only regularize a ~150k
+  #       parameter head that already sees freshly resampled candidates every epoch, so
+  #       the head's data is not scarce.
+  #   (b) There is no augmentation at inference. Training the head on elastically
+  #       deformed images hands a frozen base a domain shift for zero benefit.
+  #   (c) Extending the shared augmentation path to transform four masks under one
+  #       sampled transform would touch code Phase 1 and Phase 2 both depend on. The risk
+  #       to comparability is not worth it.
+  #
+  # Consequence: the head's training data uses the EVAL-mode four-mask path with
+  # augmentation off -- the existing evaluation dataset shape, used for training. There
+  # is no third dataset mode. This is also enforced from the other side: constructing an
+  # augmented eval dataset raises (tests/test_data.py), so an eval-mode dataset carrying
+  # four masks cannot be augmented even by accident.
+  augmentation:
+    enabled: false
+    seed: 5034
+    pad_to_px: 180
+    random_crop: true
+    rotation_degrees: 22.5
+    scale_range: [0.8, 1.2]
+    shear: 0.1
+    elastic_alpha_px: 5.0
+    elastic_sigma_px: 10.0
+    max_redraws: 3
+
+optim:
+  name: adam
+  # 1e-3, not the baseline's 1e-4: that rate was tuned for a 27.5M-parameter model over
+  # 240k steps. A small regression head on a frozen backbone converges far faster, and
+  # 1e-3 is the standard default for such heads. The smoke test must confirm the loss
+  # decreases; if it is unstable, fall back to 3e-4 and RECORD that.
+  lr: 1.0e-3
+  # 0, not 1e-5: candidates are resampled every epoch, so there is no overfitting
+  # pressure worth regularizing.
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+schedule:
+  name: constant
+  milestones: []
+  values: []
+
+train:
+  mode: selection_head    # requires --base-checkpoint
+  # 30 epochs, justified EMPIRICALLY rather than a priori: the validation curve is the
+  # evidence. If the monitored metric is still climbing at 30, extend and say so. If it
+  # plateaus by 15, report that too -- it is a legitimate finding about how little
+  # capacity this task needs.
+  epochs: 4                 # enough to see the loss move
+  iterations: null        # an epoch count is the natural unit for the head
+  amp: false
+  grad_clip: null
+  val_every_n_epochs: 1
+  limit_train_batches: 8    # a handful of steps, not a training run
+  limit_val_batches: 4
+
+log:
+  tensorboard: false        # a gate leaves no artifacts
+  log_every_n_steps: 20
+  diagnostics_every_n_epochs: 5
+  prior_samples_for_ce: 4
+  diversity_samples: 16
+  diversity_images: 64
+  panel_images: 8
+  panel_samples: 6
+
+checkpoint:
+  save_best: true
+  save_last: true
+  # The DELIVERABLE itself: mean consensus soft-Dice of the HEAD-SELECTED sample.
+  # Deliberately not a proxy -- a constant predictor cannot game it, because a constant
+  # score degenerates to a fixed arbitrary pick and scores about the same as random
+  # selection. val Spearman and val Huber loss are also logged, for diagnosis, but the
+  # thing being optimized is the thing being reported.
+  #
+  # NOT val/total: with a frozen base the ELBO is constant, so selecting on it would be
+  # selecting on a flat curve. In selection_head mode val/total is not computed at all.
+  monitor: val/selected_consensus_dice
+  mode: max

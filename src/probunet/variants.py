@@ -29,6 +29,7 @@ from typing import Protocol, runtime_checkable
 import torch
 from torch import Tensor
 
+from probunet.extension.head import SelectionHead
 from probunet.model.prob_unet import ProbUNet
 from probunet.training.diagnostics import logits_to_mask, reparameterize
 
@@ -133,3 +134,56 @@ class ProbUNetVariant:
             None.
         """
         return None
+
+
+class SelectionHeadVariant(ProbUNetVariant):
+    """The Phase 3 extension: a frozen base plus a head that picks one sample.
+
+    The **only** variant whose :meth:`select` returns an index, which is what gives
+    evaluation exactly one variant-dependent branch instead of per-variant conditionals.
+
+    Sampling is inherited unchanged from :class:`ProbUNetVariant` and runs on the frozen
+    base, so **attaching the head cannot move any distribution metric**. That is not merely
+    intended: with the same generator seed this variant's samples are bit-identical to the
+    plain variant's, and ``test_ged_is_bit_identical_with_and_without_the_head`` asserts
+    the GED numbers agree exactly. "Distribution metrics unchanged, single-sample quality
+    improved" is the claim the extension makes, and its first half is a property of this
+    class rather than a hope about training.
+    """
+
+    def __init__(
+        self,
+        head: SelectionHead,
+        name: str = "extension",
+        generator: torch.Generator | None = None,
+        by_area: bool = False,
+    ) -> None:
+        """Wrap a trained head.
+
+        Args:
+            head: The trained :class:`~probunet.extension.head.SelectionHead`.
+            name: Label used in reports.
+            generator: Optional CPU generator for reproducible sampling noise.
+            by_area: Select with the **size-prior control** instead of the real scorer.
+                Lets the control be evaluated through exactly the same path as the head, so
+                the two columns of the results table differ only in which scorer chose.
+        """
+        super().__init__(head.base, name=name, generator=generator)
+        self.head = head
+        self.by_area = by_area
+
+    @torch.no_grad()
+    def select(self, samples: Tensor, image: Tensor) -> Tensor:
+        """Choose one sample per image, **without ground truth**.
+
+        Args:
+            samples: Candidate masks of shape ``(B, n, H, W)``.
+            image: The images the samples came from, shape ``(B, C, H, W)``.
+
+        Returns:
+            Chosen indices of shape ``(B,)``.
+        """
+        if self.by_area:
+            # The control sees the candidate's area and nothing else -- not even the image.
+            return self.head.select_by_area(samples)
+        return self.head.select(self.head.encode_base(image), samples)

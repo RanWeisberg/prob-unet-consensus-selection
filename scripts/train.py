@@ -38,6 +38,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="YAML config file")
     parser.add_argument("--resume", type=Path, default=None, help="checkpoint to continue from")
+    parser.add_argument(
+        "--base-checkpoint",
+        type=Path,
+        default=None,
+        help="trained Probabilistic U-Net the selection head is fitted on top of. "
+             "REQUIRED when train.mode is selection_head; the base is frozen and the "
+             "freeze is asserted, logged and recorded in the head's checkpoint.",
+    )
     parser.add_argument("--device", default=None, help="override run.device")
     budget = parser.add_mutually_exclusive_group()
     budget.add_argument(
@@ -115,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("config        : %s", args.config)
     logger.info("git revision  : %s", git_revision())
 
-    trainer = Trainer(config)
+    trainer = Trainer(config, base_checkpoint=args.base_checkpoint)
     if args.resume is not None:
         trainer.resume(args.resume)
 

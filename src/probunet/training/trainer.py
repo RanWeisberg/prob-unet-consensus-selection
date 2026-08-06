@@ -535,11 +535,19 @@ class Trainer:
         targets = self._consensus_targets(graders, candidates)
         predicted = self.head.score_candidates(features, candidates)
 
-        loss = torch.nn.functional.huber_loss(
-            predicted, targets, delta=self.config.head.huber_delta
+        delta = self.config.head.huber_delta
+        loss = torch.nn.functional.huber_loss(predicted, targets, delta=delta)
+        # The size-prior control, fitted on the same candidates and the same targets under
+        # the same loss. Its parameters are disjoint from the scorer's, so adding the two
+        # objectives optimizes each independently -- neither can borrow the other's
+        # gradient, which is what keeps the control honest.
+        area_loss = torch.nn.functional.huber_loss(
+            self.head.score_by_area(candidates), targets, delta=delta
         )
         return {
-            "total": loss,
+            "total": loss + area_loss,
+            "head_huber": loss.detach(),
+            "area_huber": area_loss.detach(),
             "target_mean": targets.mean().detach(),
             "predicted_mean": predicted.mean().detach(),
         }
@@ -582,10 +590,14 @@ class Trainer:
             scores = consensus_scores(candidates, graders)
             predicted = self.head.score_candidates(features, candidates)
             chosen = predicted.argmax(dim=1)
+            by_area = self.head.select_by_area(candidates)
 
             batch_totals = {
                 # THE deliverable, and the monitored metric.
                 "selected_consensus_dice": consensus_selected(candidates, graders, chosen),
+                # The size-prior control, reported ADJACENT so the comparison cannot be
+                # overlooked: if the head barely beats this, it learned area, not overlap.
+                "area_only_consensus_dice": consensus_selected(candidates, graders, by_area),
                 "random_consensus_dice": scores.mean(dim=1),
                 "oracle_consensus_dice": scores.amax(dim=1),
                 "ceiling": consensus_ceiling(graders),
@@ -603,8 +615,11 @@ class Trainer:
             rho, valid = spearman_per_image(predicted, scores)
             rho_sum += float(rho[valid].sum()) if bool(valid.any()) else 0.0
             rho_valid += int(valid.sum())
-            # spearman_per_image returns CPU tensors (float64 ranks are unavailable on
-            # MPS), so the bucket selector has to live there too.
+            # DEVICE: spearman_per_image returns CPU tensors because float64 does not
+            # exist on MPS (see the comment in metrics.spearman_per_image). Indexing a CPU
+            # mask with an accelerator-resident selector raises, so the bucket selector
+            # must follow the ranks to the CPU. DO NOT drop this .cpu() to "keep things on
+            # device" -- it only fails on MPS, and only at validation.
             buckets = (graders.flatten(start_dim=2).sum(dim=2) > 0).sum(dim=1).cpu()
             for bucket in range(1, N_GRADERS + 1):
                 selector = buckets == bucket
@@ -620,9 +635,19 @@ class Trainer:
         metrics["selected_fraction_of_ceiling"] = metrics["selected_consensus_dice"] / max(
             metrics["ceiling"], 1e-12
         )
+        # THE number to lead with: scale-free across buckets whose ceilings run 0.40 to
+        # 0.89, so it is the only one comparable between them. Computed from the MEANS
+        # rather than per image, because the per-image denominator (oracle - random) is
+        # zero whenever every candidate scores alike, which on bucket 1 is common.
+        gap = max(
+            metrics["oracle_consensus_dice"] - metrics["random_consensus_dice"], 1e-12
+        )
         metrics["headroom_captured"] = (
             metrics["selected_consensus_dice"] - metrics["random_consensus_dice"]
-        ) / max(metrics["oracle_consensus_dice"] - metrics["random_consensus_dice"], 1e-12)
+        ) / gap
+        metrics["headroom_captured_area_only"] = (
+            metrics["area_only_consensus_dice"] - metrics["random_consensus_dice"]
+        ) / gap
 
         # Spearman over the images where it is DEFINED, with the exclusions counted rather
         # than silently dropped. The excluded fraction is itself a finding: it measures how

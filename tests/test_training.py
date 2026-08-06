@@ -1642,3 +1642,15 @@ def test_data_splits_are_provenance_irrelevant(tmp_path: Path) -> None:
     )
     (tmp_path / "data" / "splits" / "split.json").write_text('{"train": []}\n')
     assert not source_is_dirty(tmp_path)
+
+
+def test_head_eval_seed_matches_the_project_wide_evaluation_seed() -> None:
+    """The head's candidate draw must line up with every other evaluation in the project.
+
+    Duplicated as a literal in ``HeadConfig`` to avoid a config -> evaluation import, so
+    the relationship is pinned here instead of being left to drift.
+    """
+    from probunet.evaluation.sampling import DEFAULT_EVAL_SEED
+    from probunet.training.config import HeadConfig
+
+    assert HeadConfig().eval_seed == DEFAULT_EVAL_SEED

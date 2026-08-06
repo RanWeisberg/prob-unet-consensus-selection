@@ -300,6 +300,11 @@ class HeadConfig:
             zero, so squared error over-weights the few high-target bucket-4 images. Not
             L1: its constant gradient near zero jitters at convergence.
         scorer_channels: Width of each stride-2 convolution in the scorer tower.
+        eval_seed: Seed for the validation candidate draw. **Ablation-critical**: the two
+            arms must draw comparable candidate sets, or the comparison mixes the head's
+            contribution with sampling noise. Defaults to
+            :data:`probunet.evaluation.sampling.DEFAULT_EVAL_SEED` so the head's candidates
+            line up with every other evaluation in the project.
         mean_centered_targets: **Pre-registered fallback, off by default.** Achievable
             scores are strongly bucket-dependent (ceilings 0.40 to 1.00), so plain
             regression can score well by predicting each image's typical value while
@@ -317,6 +322,7 @@ class HeadConfig:
     eval_samples: int = 16
     huber_delta: float = 0.1
     scorer_channels: tuple[int, ...] = (32, 64, 128)
+    eval_seed: int = 2018
     mean_centered_targets: bool = False
 
     def __post_init__(self) -> None:

@@ -21,7 +21,7 @@ report a broken or undertrained checkpoint as a refutation of soft consensus. Th
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -35,8 +35,12 @@ from probunet.evaluation.metrics import (
     emptiest_sample_index,
     summarize,
 )
+from probunet.evaluation.metrics import consensus_scores
 from probunet.evaluation.sampling import draw_prior_samples
 from probunet.model.prob_unet import ProbUNet
+
+if TYPE_CHECKING:  # avoid a runtime cycle: extension.head imports training.diagnostics
+    from probunet.extension.head import SelectionHead
 
 EVAL_SAMPLES = 16
 """Candidates per image. 16 so the numbers sit alongside the existing Phase 1 table."""
@@ -57,6 +61,9 @@ which is what lets the report notebook import the ceiling table without loading 
 
 MODEL_COLUMNS = ("random", "oracle", "emptiest", "nonempty_frac")
 """Columns that require sampling from a model, and therefore a checkpoint."""
+
+BOOKKEEPING_COLUMNS = ("n_nonempty", "index")
+"""Per-patch bookkeeping, grouped on rather than summarized."""
 
 
 @torch.no_grad()
@@ -159,6 +166,112 @@ def measure_split(
     return {key: np.concatenate(parts) for key, parts in columns.items()}
 
 
+@torch.no_grad()
+def measure_selection(
+    head: "SelectionHead",
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    n_samples: int,
+    seed: int,
+) -> dict[str, np.ndarray]:
+    """Score a trained head against every baseline, on one shared candidate set.
+
+    The Stage 5 results table. Every rule -- head, size-prior control, random, oracle,
+    emptiest -- chooses from the **same** candidates for a given image, so the differences
+    between them come from the choice and not from being handed different things to choose
+    between.
+
+    Args:
+        head: The trained selection head, with its frozen base.
+        loader: An eval-mode loader yielding ``image`` and ``masks``.
+        device: Device to run on.
+        n_samples: Candidates per image.
+        seed: Sampling seed, so the arms see comparable draws.
+
+    Returns:
+        Per-patch arrays, one column per selection rule plus ``ceiling``,
+        ``nonempty_frac``, ``n_nonempty`` and ``index``.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    columns: dict[str, list[np.ndarray]] = {}
+
+    for batch in loader:
+        image = batch["image"].to(device)
+        graders = batch["masks"].to(device)
+
+        features, candidates = head.sample_candidates(image, n_samples, generator)
+        scores = consensus_scores(candidates, graders)
+        chosen = head.select(features, candidates)
+        by_area = head.select_by_area(candidates)
+
+        values = {
+            "head": consensus_selected(candidates, graders, chosen),
+            "area_only": consensus_selected(candidates, graders, by_area),
+            "random": scores.mean(dim=1),
+            "oracle": scores.amax(dim=1),
+            "emptiest": consensus_selected(
+                candidates, graders, emptiest_sample_index(candidates)
+            ),
+            "all_empty": all_empty_consensus_dice(graders),
+            "ceiling": consensus_ceiling(graders),
+            "nonempty_frac": (candidates.flatten(start_dim=2) != 0)
+            .any(dim=2)
+            .to(torch.float32)
+            .mean(dim=1),
+            "n_nonempty": (graders.flatten(start_dim=2).sum(dim=2) > 0).sum(dim=1),
+            "index": batch["index"],
+        }
+        for key, value in values.items():
+            columns.setdefault(key, []).append(value.detach().cpu().numpy())
+
+    return {key: np.concatenate(parts) for key, parts in columns.items()}
+
+
+def render_selection(report: dict[str, Any]) -> str:
+    """Render the Stage 5 selection table.
+
+    The ``gap`` column -- the fraction of the oracle-minus-random headroom captured -- is
+    the one to lead with: it is scale-free across buckets whose ceilings run 0.40 to 0.89,
+    so it is the only column comparable between rows. ``area`` sits immediately beside
+    ``head`` on purpose: if the head barely beats its size-prior control, it learned area
+    rather than spatial agreement, and adjacency makes that impossible to miss.
+
+    Args:
+        report: Output of :func:`per_bucket` over :func:`measure_selection`.
+
+    Returns:
+        A plain-text table.
+    """
+    header = (
+        f"{'bucket':<11}{'n':>5}{'random':>8}{'head':>8}{'area':>8}{'oracle':>8}"
+        f"{'ceil':>7}{'gap%':>7}{'area%':>7}{'allmt':>7}{'orc|off':>8}"
+    )
+    lines = [header, "-" * len(header)]
+    for label, row in report.items():
+        lines.append(
+            f"{label:<11}{row['n']:>5}"
+            f"{row['random']['mean']:>8.4f}{row['head']['mean']:>8.4f}"
+            f"{row['area_only']['mean']:>8.4f}{row['oracle']['mean']:>8.4f}"
+            f"{row['ceiling']['mean']:>7.4f}"
+            f"{100 * row['gap_captured_head']:>7.1f}"
+            f"{100 * row['gap_captured_area_only']:>7.1f}"
+            f"{row['all_candidates_empty_fraction']:>7.3f}"
+            f"{row.get('oracle_where_offered', float('nan')):>8.4f}"
+        )
+    lines += [
+        "",
+        "gap%    = fraction of the oracle-minus-random headroom the HEAD captured "
+        "(lead with this: scale-free across buckets)",
+        "area%   = the same for the size-prior CONTROL. If gap% is not well above it, the "
+        "head learned area, not overlap.",
+        "allmt   = fraction of images where EVERY candidate was empty; those score 0 under "
+        "every rule and cap any selector",
+        "orc|off = oracle over only the images where the sampler offered a non-empty "
+        "candidate -- separates 'offered nothing' from 'offered something poorly located'",
+    ]
+    return "\n".join(lines)
+
+
 def per_bucket(results: dict[str, np.ndarray]) -> dict[str, Any]:
     """Break the per-patch arrays down by ambiguity bucket, plus an aggregate row.
 
@@ -176,8 +289,11 @@ def per_bucket(results: dict[str, np.ndarray]) -> dict[str, Any]:
     for label, selector in buckets:
         if not selector.any():
             continue
-        present = [key for key in (*MODEL_COLUMNS, *GRADER_COLUMNS) if key in results]
-        group = {key: results[key][selector] for key in present}
+        group = {
+            key: value[selector]
+            for key, value in results.items()
+            if key not in BOOKKEEPING_COLUMNS
+        }
         if "oracle" not in group:
             # Ceiling-only mode: no model, so no verdict to reach.
             report[label] = {
@@ -197,12 +313,21 @@ def per_bucket(results: dict[str, np.ndarray]) -> dict[str, Any]:
             verdict = "all_empty_wins"
         else:
             verdict = "degenerate_tie"
+        random_mean = group["random"].mean()
+        gap = max(float(oracle - random_mean), 1e-12)
         report[label] = {
             "n": int(selector.sum()),
             **{key: summarize(value) for key, value in group.items()},
-            "headroom_oracle_minus_random": float(
-                oracle - group["random"].mean()
-            ),
+            "headroom_oracle_minus_random": float(oracle - random_mean),
+            # THE number to lead with. Scale-free across buckets whose ceilings run 0.40 to
+            # 0.89, so it is the only column comparable BETWEEN buckets. From the means,
+            # not per image: the per-image denominator is zero whenever every candidate
+            # scores alike, which on bucket 1 is common.
+            **{
+                f"gap_captured_{key}": float((group[key].mean() - random_mean) / gap)
+                for key in ("head", "area_only", "emptiest")
+                if key in group
+            },
             # THE question this pass exists to answer.
             "verdict": verdict,
             "oracle_beats_all_empty": verdict == "ok",
@@ -210,6 +335,16 @@ def per_bucket(results: dict[str, np.ndarray]) -> dict[str, Any]:
                 oracle / max(group["ceiling"].mean(), 1e-12)
             ),
         }
+        if "nonempty_frac" in group:
+            # Images where EVERY candidate is empty. They score exactly 0 under every
+            # rule, so they cap what any selector could achieve and belong in the table
+            # rather than hidden inside an average. This separates "the sampler offered
+            # nothing" from "the sampler offered something poorly localized".
+            offered = group["nonempty_frac"] > 0
+            report[label]["all_candidates_empty_fraction"] = float((~offered).mean())
+            if "oracle" in group and offered.any():
+                report[label]["oracle_where_offered"] = float(group["oracle"][offered].mean())
+                report[label]["n_offered"] = int(offered.sum())
     return report
 
 
