@@ -35,6 +35,7 @@ from probunet.training.checkpoint import (
 from probunet.training.config import ExperimentConfig
 from probunet.training.freeze import freeze_module
 from probunet.training.diagnostics import (
+    EffectiveRankAccumulator,
     build_diagnostic_sets,
     logits_to_mask,
     make_panel,
@@ -45,6 +46,8 @@ from probunet.training.diagnostics import (
     reparameterize,
     save_diagnostic_sets,
     sigma_stats,
+    whitened_kl_decomposition,
+    whitened_kl_snapshot,
 )
 from probunet.utils.runtime import (
     describe_device,
@@ -341,6 +344,25 @@ class Trainer:
             "missing is the head module, its scoring target and its training step."
         )
 
+    @property
+    def _latent_cadences_align(self) -> bool:
+        """Whether every diagnostics epoch is also a validation epoch.
+
+        The full-validation latent geometry (``effrank_val_*``) is computed *inside*
+        ``validate``, because that is where the four posteriors per image already exist.
+        So it can only be emitted on an epoch where both schedules fire. When the
+        diagnostics cadence is not a multiple of the validation cadence the two schedules
+        intersect rarely -- or, if they are coprime, only at their least common multiple --
+        and the headline Phase 2 series would come out sparse or empty for a reason
+        invisible in the logs. Every shipped config satisfies this (validation every
+        epoch), so the check exists to catch an override rather than a shipped mistake.
+        """
+        return (
+            self.config.log.diagnostics_every_n_epochs
+            % self.config.train.val_every_n_epochs
+            == 0
+        )
+
     def describe(self, estimate_runtime: bool = False) -> str:
         """Return a startup banner: config, device, seed and provenance.
 
@@ -384,7 +406,8 @@ class Trainer:
             f"beta          : {self.config.loss.beta}",
             f"lr            : {self.config.optim.lr} ({self.config.schedule.name})",
             f"validation    : every {train_config.val_every_n_epochs} epoch(s)",
-            f"diagnostics   : every {self.config.log.diagnostics_every_n_epochs} epoch(s)",
+            f"diagnostics   : every {self.config.log.diagnostics_every_n_epochs} epoch(s)"
+            + ("" if self._latent_cadences_align else "  [see WARNING above]"),
             f"monitor       : {self.config.checkpoint.monitor} ({self.config.checkpoint.mode})",
             f"run dir       : {self.run_dir}",
         ]
@@ -467,12 +490,21 @@ class Trainer:
         return metrics
 
     @torch.no_grad()
-    def validate(self) -> dict[str, float]:
+    def validate(self, full_latent: bool = False) -> dict[str, float]:
         """Evaluate the objective over **all four graders** per image.
 
         Averaging over graders removes the dependence on the epoch's random pairing, so
         the number that selects checkpoints is comparable from epoch to epoch. One U-Net
         pass and one prior pass are shared across the four posteriors.
+
+        Args:
+            full_latent: Also accumulate the per-image effective rank over the **whole**
+                validation set at all four graders, emitting the ``effrank_val_*`` family.
+                Off by default and driven by the diagnostics cadence: the per-batch cost
+                is one batched ``6 x 6`` SVD on distributions this pass already builds,
+                but it moves small tensors to the CPU on every posterior, and that has no
+                business on the per-epoch path of a multi-day run. The ``*_snapshot``
+                family is emitted either way.
 
         Returns:
             Mean validation metrics.
@@ -484,6 +516,7 @@ class Trainer:
         totals: dict[str, float] = {}
         count = 0
         latent: dict[str, float] = {}
+        accumulator = EffectiveRankAccumulator() if full_latent else None
         for index, batch in enumerate(loader):
             if limit and index >= limit:
                 break
@@ -501,6 +534,8 @@ class Trainer:
                 for key, value in terms.items():
                     totals[key] = totals.get(key, 0.0) + float(value)
                 count += 1
+                if accumulator is not None:
+                    accumulator.update(posterior, encoded.prior)
 
             if index == 0:
                 # Latent statistics from the first batch: cheap, and enough to spot a
@@ -509,11 +544,19 @@ class Trainer:
 
         metrics = {key: value / max(count, 1) for key, value in totals.items()}
         metrics.update(latent)
+        if accumulator is not None:
+            metrics.update(accumulator.metrics())
         return metrics
 
     @torch.no_grad()
     def _latent_stats(self, image: Tensor, masks: Tensor) -> dict[str, float]:
-        """Sigma statistics and per-dimension KL, from one batch.
+        """Sigma statistics and the latent-geometry snapshot, from one batch.
+
+        Grader 0 of the first validation batch only -- 32 images. Cheap enough to run
+        every epoch, and enough to spot a collapsing sigma or a dead latent dimension,
+        but **not** enough to support a claim about a small shift in effective rank; that
+        is what ``validate(full_latent=True)`` is for. The ``_snapshot`` suffix on the
+        keys carries the distinction into the logs and any table built from them.
 
         Args:
             image: Image batch.
@@ -532,8 +575,11 @@ class Trainer:
 
         stats = sigma_stats(prior_stats, "prior")
         stats.update(sigma_stats(posterior_stats, "posterior"))
+        # Coordinate-indexed, for continuity with the Phase 1 series (FINDINGS 2.3).
         for dimension, value in enumerate(per_dim_kl(posterior, prior)):
             stats[f"kl_dim_{dimension}"] = float(value)
+        # Rotation-invariant, and an exact decomposition of kl_snapshot_total.
+        stats.update(whitened_kl_snapshot(whitened_kl_decomposition(posterior, prior)))
         return stats
 
     # ------------------------------------------------------------ diagnostics
@@ -643,6 +689,15 @@ class Trainer:
             A summary with the best monitored value, the epoch it occurred at, and the
             per-epoch history.
         """
+        if not self._latent_cadences_align:
+            LOGGER.warning(
+                "diagnostics_every_n_epochs=%d is not a multiple of val_every_n_epochs=%d, "
+                "so the full-validation latent geometry (effrank_val_*) will only be "
+                "recorded on epochs where both schedules fire. That is the headline Phase 2 "
+                "series -- make the cadences align unless this is deliberate.",
+                self.config.log.diagnostics_every_n_epochs,
+                self.config.train.val_every_n_epochs,
+            )
         LOGGER.info("starting training\n%s", self.describe(estimate_runtime=True))
         (self.run_dir / "config.resolved.yaml").write_text(self.config.to_yaml())
 
@@ -651,8 +706,14 @@ class Trainer:
             train_metrics = self.train_epoch(epoch)
             record = {f"train/{k}": v for k, v in train_metrics.items()}
 
+            diagnostics_due = (
+                epoch + 1
+            ) % self.config.log.diagnostics_every_n_epochs == 0
+
             if (epoch + 1) % self.config.train.val_every_n_epochs == 0:
-                val_metrics = self.validate()
+                # The full-validation latent geometry rides along with the validation
+                # pass it reuses, on the diagnostics schedule.
+                val_metrics = self.validate(full_latent=diagnostics_due)
                 record.update({f"val/{k}": v for k, v in val_metrics.items()})
                 # The overfitting gap as a first-class number: 27.5M parameters on
                 # 9,056 patches is a regime where the gap is the thing to watch, and the
@@ -662,7 +723,7 @@ class Trainer:
                 record["diag/gap_total"] = record["val/total"] - record["train/total"]
                 record["diag/gap_ce"] = record["val/ce"] - record["train/ce"]
 
-            if (epoch + 1) % self.config.log.diagnostics_every_n_epochs == 0:
+            if diagnostics_due:
                 record.update(
                     {f"diag/{k}": v for k, v in self.run_diagnostics(epoch).items()}
                 )

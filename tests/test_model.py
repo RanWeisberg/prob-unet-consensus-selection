@@ -946,16 +946,66 @@ def test_zero_init_kl_equals_the_diagonal_kl(full_config: ProbUNetConfig) -> Non
     assert torch.allclose(full_kl, kl_divergence(hand, hand_prior), atol=1e-5)
 
 
-def test_reparameterize_refuses_full_covariance_until_stage_4(
+def test_reparameterize_draws_through_the_cholesky_factor(
     full_config: ProbUNetConfig,
 ) -> None:
-    """An explicit refusal, not an AttributeError on a missing base_dist."""
+    """Stage 4: the seeded full-covariance branch is exactly ``mu + L @ eps``.
+
+    Replaces the Stage 3 test that asserted this path refused. Checked against the noise
+    the generator produces rather than against ``rsample``, so the test pins the formula
+    itself and not merely agreement with torch's kernel.
+    """
     from probunet.training.diagnostics import reparameterize
 
     torch.manual_seed(0)
-    encoded = ProbUNet(full_config).encode(torch.rand(BATCH, 1, SIZE, SIZE))
-    with pytest.raises(NotImplementedError, match="does not yet support a full-covariance"):
-        reparameterize(encoded.prior, torch.Generator().manual_seed(0))
+    model = ProbUNet(full_config)
+    encoded = model.encode(torch.rand(BATCH, 1, SIZE, SIZE))
+    prior = encoded.prior
+
+    z = reparameterize(prior, torch.Generator().manual_seed(0))
+    noise = torch.randn(BATCH, LATENT_DIM, generator=torch.Generator().manual_seed(0))
+    expected = prior.loc + torch.matmul(
+        prior.scale_tril, noise.unsqueeze(-1)
+    ).squeeze(-1)
+    assert torch.equal(z, expected)
+
+    # The same generator seed reproduces the draw; a different one moves it.
+    assert torch.equal(z, reparameterize(prior, torch.Generator().manual_seed(0)))
+    assert not torch.allclose(z, reparameterize(prior, torch.Generator().manual_seed(1)))
+
+    # Differentiable, so the diagnostics path could not silently sever the posterior's
+    # gradient if it were ever reused for training.
+    assert reparameterize(prior, torch.Generator().manual_seed(0)).requires_grad
+
+
+def test_reparameterize_full_covariance_correlates_the_draws(
+    full_config: ProbUNetConfig,
+) -> None:
+    """A non-zero strict lower triangle must actually reach the sample.
+
+    The Stage 3 positive control made this assertion about ``rsample``; the diagnostics
+    path is a second, hand-written implementation of the same formula, so it needs its own
+    check that ``L`` is not being ignored. Coordinate 0 is invariant by construction (row 0
+    of a lower-triangular factor has no strict entries), which also confirms the factor is
+    lower- and not upper-triangular.
+    """
+    from probunet.training.diagnostics import reparameterize
+
+    torch.manual_seed(0)
+    mu = torch.randn(BATCH, LATENT_DIM)
+    logvar = torch.randn(BATCH, LATENT_DIM) * 0.3
+    lower = torch.randn(BATCH, LATENT_DIM * (LATENT_DIM - 1) // 2)
+    net = PriorNet(image_channels=1, latent_dim=LATENT_DIM, full_covariance=True)
+
+    correlated = net.distribution_from_stats(LatentStats(mu, logvar, lower=lower))
+    independent = net.distribution_from_stats(
+        LatentStats(mu, logvar, lower=torch.zeros_like(lower))
+    )
+    left = reparameterize(correlated, torch.Generator().manual_seed(5))
+    right = reparameterize(independent, torch.Generator().manual_seed(5))
+
+    assert not torch.allclose(left, right, atol=1e-5), "L never reached the sample"
+    assert torch.allclose(left[:, 0], right[:, 0], atol=1e-6), "factor is not lower-triangular"
 
 
 def test_strict_lower_mask_cache_is_keyed_by_device() -> None:

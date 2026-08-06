@@ -28,6 +28,29 @@ observation                            interpretation
 That third row is why ``nonempty_sample_fraction`` exists. Diversity alone cannot
 distinguish "hasn't learned anything yet" from "collapsed", because both read 1.0.
 
+**Latent-geometry diagnostics (Phase 2).** Three quantities measure how many directions
+the posterior actually uses, and they answer three different questions:
+
+============================  ====================================================
+metric                        question
+============================  ====================================================
+``kl_dim_{i}``                Which **coordinate axis** carries information? The
+                              Phase 1 series, kept for continuity. Under a full
+                              covariance it is a marginal and does not sum to the
+                              total -- see :func:`per_dim_kl`.
+``kl_whitened_{i}``           How much does each **informative direction** carry,
+                              regardless of axis? Sums exactly to
+                              ``kl_snapshot_total``. Sorted descending; the index
+                              carries no identity across epochs.
+``effrank_snapshot`` /        How **many** directions are informative? The headline
+``effrank_val_mean``          number for the FINDINGS 3.2 hypothesis.
+============================  ====================================================
+
+The ``_snapshot`` and ``_val`` suffixes are load-bearing and must survive into any report
+table: ``_snapshot`` is 32 images at grader 0, computed every epoch; ``_val`` is every
+validation image at all four graders, computed at the diagnostics cadence. Only the
+second can support a claim about a small shift in effective rank.
+
 The fixed diagnostic sets are **stratified over the ambiguity buckets** rather than
 taken as the first N by index, so the panel always shows single-grader cases -- 33% of
 the data and the hard case for the consensus-selection extension. The chosen indices are
@@ -44,7 +67,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import Tensor
-from torch.distributions import Independent, MultivariateNormal, Normal, kl_divergence
+from torch.distributions import MultivariateNormal, Normal, kl_divergence
 
 from probunet.data.lidc import LidcDataset
 from probunet.evaluation.metrics import binary_iou
@@ -176,27 +199,35 @@ def reparameterize(
     out. The diagnostics need a fixed noise sequence: with only 8 to 64 images, sampling
     noise would otherwise make panels incomparable between epochs.
 
+    Both latent parameterizations are supported, and both are the *same* draw torch
+    would make -- ``z = mu + L @ eps`` with ``L`` diagonal is elementwise
+    ``mu + sigma * eps``, so the diagonal branch below is that formula specialized rather
+    than a second algorithm. The branches stay separate anyway, because the diagonal one
+    is pinned byte-for-byte by ``tests/fingerprints/phase1_latent.json``.
+
     Args:
-        distribution: An ``Independent(Normal(...), 1)``.
-        generator: Optional CPU generator supplying the noise.
+        distribution: An ``Independent(Normal(...), 1)`` (diagonal) or a
+            ``MultivariateNormal(loc, scale_tril=L)`` (full covariance).
+        generator: Optional CPU generator supplying the noise. When None, the
+            distribution's own ``rsample`` is used, which draws from the global RNG.
 
     Returns:
         A sample of shape ``(batch, latent_dim)``.
-
-    Raises:
-        NotImplementedError: For a full-covariance distribution. Stage 4 implements the
-            ``mu + L @ eps`` branch; until then this refuses explicitly rather than
-            failing on a missing ``base_dist`` attribute.
     """
-    if isinstance(distribution, MultivariateNormal):
-        raise NotImplementedError(
-            "reparameterize does not yet support a full-covariance latent "
-            "(model.latent_covariance: full). The seeded z = mu + L @ eps branch lands in "
-            "Stage 4 together with the whitened-KL diagnostics."
-        )
-    base: Normal = distribution.base_dist  # type: ignore[assignment]
     if generator is None:
         return distribution.rsample()
+
+    if isinstance(distribution, MultivariateNormal):
+        loc = distribution.loc
+        factor = distribution.scale_tril
+        # Noise is drawn on the CPU generator and then moved, exactly as the diagonal
+        # branch does, so a seeded diagnostic gives the same z on every backend.
+        noise = torch.randn(loc.shape, generator=generator, dtype=loc.dtype).to(loc.device)
+        # z = mu + L eps. matmul over the last axis; unsqueeze/squeeze rather than einsum
+        # so the shape contract is visible.
+        return loc + torch.matmul(factor, noise.unsqueeze(-1)).squeeze(-1)
+
+    base: Normal = distribution.base_dist  # type: ignore[assignment]
     noise = torch.randn(
         base.loc.shape, generator=generator, dtype=base.loc.dtype
     ).to(base.loc.device)
@@ -226,12 +257,22 @@ def sigma_stats(stats: LatentStats, prefix: str) -> dict[str, float]:
     }
 
 
-def per_dim_kl(posterior: Independent, prior: Independent) -> Tensor:
-    """KL per latent dimension, averaged over the batch.
+def per_dim_kl(posterior: LatentDistribution, prior: LatentDistribution) -> Tensor:
+    """Axis-aligned KL per latent **coordinate**, averaged over the batch.
 
-    The wrapped ``Independent`` sums over latent dims, so the base distributions are
-    used here to see which dimensions carry information. A dimension whose KL sits at
-    zero is inactive.
+    A dimension whose KL sits at zero is inactive along that coordinate axis. This is the
+    series behind the Phase 1 finding that one of six dimensions carried 98.8% of the KL
+    (FINDINGS 2.3), and it is kept for **both** parameterizations so that the Phase 1 and
+    Phase 2 tables are the same measurement rather than two different ones.
+
+    **For a full covariance this is a marginal, not a decomposition -- do not sum it.**
+    The diagonal case is genuinely separable, so the values do add up to the total KL.
+    The full case reports the KL between the two *marginals* along each coordinate, which
+    ignores every cross-coordinate term; the values will not sum to ``kl_divergence`` and
+    presenting them as a breakdown of it would be wrong. The quantity that does decompose
+    the total exactly is :func:`whitened_kl_decomposition`, and it is also the one that
+    does not assume the informative directions are coordinate axes -- which, once the
+    covariance is full, they have no reason to be.
 
     Args:
         posterior: ``Q(z | X, Y)``.
@@ -239,24 +280,321 @@ def per_dim_kl(posterior: Independent, prior: Independent) -> Tensor:
 
     Returns:
         A tensor of shape ``(latent_dim,)``.
-
-    Raises:
-        NotImplementedError: For a full-covariance latent. This is reached from
-            ``Trainer._latent_stats`` via ``validate()``, i.e. **every epoch**, so a
-            full-covariance run stops at the end of epoch 1 rather than limping to the
-            first diagnostics epoch. Stage 4 replaces this with the prior-whitened
-            decomposition, which is the axis-rotation-invariant measurement.
     """
     if isinstance(posterior, MultivariateNormal) or isinstance(prior, MultivariateNormal):
-        raise NotImplementedError(
-            "per_dim_kl is axis-aligned and is not defined for a full-covariance latent "
-            "(model.latent_covariance: full). Stage 4 adds the prior-whitened KL "
-            "decomposition, which measures the same question without assuming the "
-            "informative directions are coordinate axes. Do not start a full-covariance "
-            "run until then."
-        )
+        # Marginals of a multivariate Gaussian: mean i and the i-th diagonal entry of
+        # Sigma = L L^T, whose square root is the marginal standard deviation.
+        marginals = [
+            Normal(
+                loc=distribution.loc,
+                scale=torch.sqrt(
+                    (distribution.scale_tril**2).sum(dim=-1).clamp_min(0.0)
+                ),
+            )
+            for distribution in (posterior, prior)
+        ]
+        return kl_divergence(marginals[0], marginals[1]).mean(dim=0)
+
+    # The wrapped Independent sums over latent dims, so the base distributions are used
+    # here to see which dimensions carry information. Unchanged from Phase 1 and pinned
+    # by tests/fingerprints/phase1_latent.json.
     per_element = kl_divergence(posterior.base_dist, prior.base_dist)
     return per_element.mean(dim=0)
+
+
+def effective_rank(weights: Tensor) -> Tensor:
+    """Entropy-based effective rank ``exp(H)`` of a non-negative weight vector.
+
+    The weights are normalized to sum to one and their Shannon entropy is exponentiated,
+    giving the *effective number of contributing components*: ``1`` when one component
+    carries everything, ``N`` when all ``N`` contribute equally, and a continuous value
+    between. Continuity is the reason for using this rather than counting entries above a
+    threshold -- a threshold would need a magic number, and CLAUDE.md forbids those.
+
+    **What is fed in matters more than the formula, and the naive choice inverts the
+    answer.** Applied to the raw eigenvalues of ``Sigma_q`` this measures how isotropic
+    the posterior is, which is very nearly the opposite of how much information it
+    carries: a posterior that has collapsed onto the prior in five of six directions is
+    *almost isotropic*, so the raw spectrum reports a high rank precisely when the latent
+    is most degenerate. Applied to the prior-whitened per-direction KL from
+    :func:`whitened_kl_decomposition` it measures the number of directions that actually
+    transmit information, which is the quantity FINDINGS 3.2 hypothesizes should rise
+    under a full covariance. On Phase 1's measured geometry the two readings are 5.50 and
+    1.00 respectively; ``test_effective_rank_inverts_on_the_raw_spectrum`` pins that gap
+    so nobody can quietly swap the input back.
+
+    Args:
+        weights: Non-negative weights of shape ``(..., N)``. Negative entries are clamped
+            to zero: the whitened KL terms are non-negative analytically, and any
+            negative value is float round-off at the collapse floor.
+
+    Returns:
+        A tensor of shape ``(...)``, in ``[1, N]``.
+
+    Note:
+        If the weights sum to zero -- total KL underflowing, i.e. the posterior exactly
+        equalling the prior in every direction -- the normalized vector is all zeros,
+        ``H`` is 0 and this returns ``1.0``. That is the reading which argues *against*
+        the Phase 2 hypothesis, so the degenerate case cannot manufacture support for it.
+    """
+    weights = weights.clamp_min(0.0)
+    total = weights.sum(dim=-1, keepdim=True)
+    # clamp_min rather than a branch: at total == 0 every p is 0, xlogy(0, 0) is 0, and
+    # the result falls out as exp(0) == 1. See the note above.
+    probabilities = weights / total.clamp_min(torch.finfo(weights.dtype).tiny)
+    entropy = -torch.special.xlogy(probabilities, probabilities).sum(dim=-1)
+    return torch.exp(entropy)
+
+
+def _loc_and_scale_tril(distribution: LatentDistribution) -> tuple[Tensor, Tensor]:
+    """Return ``(loc, L)`` for either latent parameterization.
+
+    Args:
+        distribution: An ``Independent(Normal(...), 1)`` or a ``MultivariateNormal``.
+
+    Returns:
+        The mean of shape ``(B, N)`` and the lower-triangular factor of shape
+        ``(B, N, N)``. For the diagonal family the factor is ``diag(sigma)``, which is
+        the same covariance written in the form the whitening needs.
+    """
+    if isinstance(distribution, MultivariateNormal):
+        return distribution.loc.detach(), distribution.scale_tril.detach()
+    base: Normal = distribution.base_dist  # type: ignore[assignment]
+    return base.loc.detach(), torch.diag_embed(base.scale.detach())
+
+
+@dataclass(frozen=True)
+class WhitenedKL:
+    """The prior-whitened KL decomposition, per image.
+
+    Attributes:
+        per_direction: ``(B, N)`` non-negative per-direction KL contributions, sorted
+            **descending** within each image. They sum to :attr:`total` exactly.
+        eigenvalues: ``(B, N)`` eigenvalues of the prior-whitened posterior covariance,
+            sorted descending. Dimensionless: ``1.0`` means the posterior matches the
+            prior's spread in that direction.
+        total: ``(B,)`` total KL per image, equal to ``kl_divergence(Q, P)``.
+    """
+
+    per_direction: Tensor
+    eigenvalues: Tensor
+    total: Tensor
+
+    @property
+    def effective_rank(self) -> Tensor:
+        """``(B,)`` effective number of informative directions; see :func:`effective_rank`."""
+        return effective_rank(self.per_direction)
+
+    @property
+    def min_eigenvalue_gap(self) -> Tensor:
+        """``(B,)`` smallest gap between consecutive (descending) eigenvalues.
+
+        The degeneracy companion. The eigendecomposition fixes individual directions only
+        up to rotation *within* an eigenspace, so when two eigenvalues coincide the split
+        of the mean-shift term between them is arbitrary and the individual
+        :attr:`per_direction` values stop being meaningful -- while :attr:`total` and the
+        sorted eigenvalue spectrum both remain exact. A gap near zero is the signal to
+        read the total and the spectrum shape and not the per-direction values.
+
+        Readable without a scale reference because the eigenvalues are ratios to the
+        prior's variance, so ``1.0`` is a natural unit rather than an arbitrary one.
+        """
+        return (self.eigenvalues[..., :-1] - self.eigenvalues[..., 1:]).min(dim=-1).values
+
+
+def whitened_kl_decomposition(
+    posterior: LatentDistribution, prior: LatentDistribution
+) -> WhitenedKL:
+    r"""Decompose ``KL(Q || P)`` into exact, non-negative per-direction contributions.
+
+    Whiten by the prior's Cholesky factor and then diagonalize what is left::
+
+        M     = Lp^-1 Lq                 so   Sigma~ = M M^T = Lp^-1 Sigma_q Lp^-T
+        Delta = Lp^-1 (mu_q - mu_p)
+        Sigma~ = U diag(lambda) U^T      and  d = U^T Delta
+
+        kl_i = 1/2 ( lambda_i + d_i^2 - 1 - ln lambda_i )     with   sum_i kl_i = KL(Q||P)
+
+    Every term is non-negative (``1/2(x - 1 - ln x) >= 0`` for ``x > 0``), so this is a
+    genuine decomposition rather than a signed rearrangement, and it is **invariant to
+    rotations of the latent coordinates** -- which is the whole point once the covariance
+    is full and the informative direction has no reason to lie along a coordinate axis.
+    Unlike :func:`per_dim_kl` under a full covariance, these values really do sum to the
+    total, and ``Trainer`` logs that total alongside them so the identity is checkable
+    from the logs rather than taken on trust.
+
+    **Ordering is by descending ``kl_i`` and there is deliberately no per-direction
+    tracking across epochs.** A persistent per-direction identity does not merely take
+    effort to compute -- under a full covariance it does not exist: the eigenbasis is free
+    to rotate between epochs, so "direction 2" at epoch 100 and at epoch 125 need not
+    describe the same subspace at all. What is comparable across epochs is the *shape* of
+    the sorted spectrum and the effective rank derived from it. ``kl_dim_*`` remains the
+    coordinate-indexed series for continuity with Phase 1.
+
+    Three numerical choices, all load-bearing:
+
+    * **The SVD of ``M``, not an eigendecomposition of ``M M^T``.** Forming the product
+      squares the condition number, and ``eigh`` of a near-singular product can return a
+      small *negative* eigenvalue, whose logarithm is NaN. With the SVD,
+      ``lambda = s**2`` is non-negative by construction. This is the same argument that
+      makes the model parameterize ``L`` rather than ``Sigma`` (Phase 2 spec,
+      constraint 5), applied to the measurement instead of the model.
+    * **``u - log1p(u)`` with ``u = lambda - 1``, never ``lambda - 1 - log(lambda)``.**
+      **Do not "simplify" this back.** ``lambda ~ 1`` means the posterior matches the
+      prior in that direction -- exactly the dead direction this measurement exists to
+      detect -- and there ``lambda - 1`` and ``ln lambda`` are two nearly equal numbers
+      whose difference is ``u**2/2``. Subtracting them independently rounded loses the
+      answer to cancellation; ``log1p`` computes the small difference directly.
+    * **The linear algebra runs on the CPU.** ``torch.linalg.eigh`` has no MPS kernel at
+      all and ``linalg_svd`` only reaches MPS through a CPU fallback that warns on every
+      call, so a device-resident decomposition would either crash or emit noise every
+      validation epoch on the development machine. The matrices are ``N x N`` with
+      ``N = 6``, so the transfer costs nothing and the choice is explicit rather than
+      left to a fallback that ``PYTORCH_ENABLE_MPS_FALLBACK`` can switch off.
+
+    Args:
+        posterior: ``Q(z | X, Y)``, either latent family.
+        prior: ``P(z | X)``, either latent family. The two need not match, though in
+            practice both come from the same model and therefore do.
+
+    Returns:
+        The :class:`WhitenedKL` for the batch, on the CPU, in the input dtype.
+    """
+    mu_q, chol_q = _loc_and_scale_tril(posterior)
+    mu_p, chol_p = _loc_and_scale_tril(prior)
+    mu_q, chol_q, mu_p, chol_p = (
+        tensor.cpu() for tensor in (mu_q, chol_q, mu_p, chol_p)
+    )
+
+    # Lp^-1 Lq and Lp^-1 (mu_q - mu_p) by triangular solve: never form an inverse.
+    whitened_factor = torch.linalg.solve_triangular(chol_p, chol_q, upper=False)
+    shift = torch.linalg.solve_triangular(
+        chol_p, (mu_q - mu_p).unsqueeze(-1), upper=False
+    ).squeeze(-1)
+
+    # Left singular vectors of M diagonalize M M^T; the singular values are already
+    # descending, so lambda comes out descending too.
+    directions, singular_values, _ = torch.linalg.svd(whitened_factor)
+    eigenvalues = singular_values * singular_values
+    projected = torch.matmul(
+        directions.transpose(-1, -2), shift.unsqueeze(-1)
+    ).squeeze(-1)
+
+    offset = eigenvalues - 1.0
+    per_direction = 0.5 * (offset - torch.log1p(offset) + projected * projected)
+    total = per_direction.sum(dim=-1)
+    # Sorting after the sum, so the total is unaffected by the ordering.
+    per_direction = per_direction.sort(dim=-1, descending=True).values
+    return WhitenedKL(
+        per_direction=per_direction, eigenvalues=eigenvalues, total=total
+    )
+
+
+def whitened_kl_snapshot(decomposition: WhitenedKL) -> dict[str, float]:
+    """Flatten a decomposition into the per-epoch snapshot scalars.
+
+    These share the one-batch, grader-0 sampling of :func:`per_dim_kl` as used by
+    ``Trainer._latent_stats``, so they carry the same caveat FINDINGS 2.3 records: they
+    are a *diagnostic snapshot*, not a population estimate. The full-validation-set
+    counterpart is :class:`EffectiveRankAccumulator`, and the two families are named
+    ``*_snapshot`` and ``*_val`` so a report table can never confuse them.
+
+    Args:
+        decomposition: The batch's :class:`WhitenedKL`.
+
+    Returns:
+        ``kl_whitened_{i}`` for each direction (descending), the batch-mean total as
+        ``kl_snapshot_total``, the batch-worst ``whitened_eigengap_min``, and the
+        batch-mean ``effrank_snapshot``.
+    """
+    per_direction = decomposition.per_direction.mean(dim=0)
+    metrics = {
+        f"kl_whitened_{index}": float(value)
+        for index, value in enumerate(per_direction)
+    }
+    metrics["kl_snapshot_total"] = float(decomposition.total.mean())
+    # Minimum over directions AND over images: one degenerate image is enough to make the
+    # batch-mean per-direction values unreliable, so the warning is deliberately the
+    # worst case rather than an average of warnings.
+    metrics["whitened_eigengap_min"] = float(decomposition.min_eigenvalue_gap.min())
+    metrics["effrank_snapshot"] = float(decomposition.effective_rank.mean())
+    return metrics
+
+
+class EffectiveRankAccumulator:
+    """Collects per-image effective rank across a full validation pass.
+
+    **Why this exists rather than reusing the snapshot.** The snapshot is 32 images at one
+    grader. That was adequate for Phase 1's finding, where one dimension carried 98.8% of
+    the KL and the signal dwarfed any sampling error. It is *not* adequate for Phase 2's
+    claim, which is that the effective rank **rose**: a move from 1.0 to 1.3 is exactly
+    the size of thing a 32-image sample cannot distinguish from noise, and reporting it
+    from a snapshot would be the kind of result this project's guardrails exist to
+    prevent. So the headline number comes from every validation image at all four graders,
+    with a dispersion estimate attached.
+
+    The cost is genuinely marginal: ``Trainer.validate`` already computes the prior and
+    all four posteriors for every validation batch, so this adds one batched ``6 x 6`` SVD
+    and a small CPU transfer per posterior over work already done. It nonetheless runs at
+    the **diagnostics cadence** rather than every epoch, to keep those transfers off the
+    per-epoch path on a multi-day run.
+
+    One image contributes four samples, one per grader, and they are pooled rather than
+    averaged per image: the grader-to-grader variation in how much information the
+    posterior carries is part of the spread being estimated, not a nuisance to average
+    away before measuring it.
+    """
+
+    def __init__(self) -> None:
+        """Start an empty accumulator."""
+        self._ranks: list[Tensor] = []
+        self._totals: list[Tensor] = []
+
+    def update(
+        self, posterior: LatentDistribution, prior: LatentDistribution
+    ) -> None:
+        """Accumulate one batch, at one grader.
+
+        Args:
+            posterior: ``Q(z | X, Y)`` for this batch and grader.
+            prior: ``P(z | X)`` for this batch.
+        """
+        decomposition = whitened_kl_decomposition(posterior, prior)
+        self._ranks.append(decomposition.effective_rank)
+        self._totals.append(decomposition.total)
+
+    def metrics(self) -> dict[str, float]:
+        """Aggregate into report-ready scalars.
+
+        Returns:
+            Mean, standard deviation and quartiles of the per-image effective rank, the
+            sample count behind them, and the mean total KL over the same population.
+            Empty if nothing was accumulated, so a caller can merge unconditionally.
+
+        Note:
+            The mean of a per-image effective rank is **not** the effective rank of the
+            mean covariance, and per-image is the deliberate choice. Averaging the
+            covariances first would let images whose informative directions point
+            different ways add up to an isotropic average, reporting a high rank for a
+            population in which every individual posterior is rank-1. The question is how
+            many directions *each* posterior uses, so each posterior is measured and the
+            measurements are then summarized.
+        """
+        if not self._ranks:
+            return {}
+        ranks = torch.cat(self._ranks).to(torch.float64)
+        totals = torch.cat(self._totals).to(torch.float64)
+        quartiles = torch.quantile(ranks, torch.tensor([0.25, 0.75], dtype=torch.float64))
+        return {
+            "effrank_val_mean": float(ranks.mean()),
+            # Sample standard deviation over the pooled population. Divide by
+            # sqrt(effrank_val_count) for the standard error of the mean.
+            "effrank_val_std": float(ranks.std(unbiased=True)) if ranks.numel() > 1 else 0.0,
+            "effrank_val_p25": float(quartiles[0]),
+            "effrank_val_p75": float(quartiles[1]),
+            "effrank_val_count": float(ranks.numel()),
+            "kl_val_total_mean": float(totals.mean()),
+        }
 
 
 def mean_pairwise_iou(samples: Tensor) -> Tensor:

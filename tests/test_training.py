@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from torch.distributions import Independent, MultivariateNormal, Normal, kl_divergence
 
 from probunet.data.lidc import DataConfig, LidcArrays, LidcDataset
 from probunet.data.splits import generate_split
@@ -41,12 +42,16 @@ from probunet.training.config import (
     TrainConfig,
 )
 from probunet.training.diagnostics import (
+    EffectiveRankAccumulator,
     build_diagnostic_sets,
+    effective_rank,
     logits_to_mask,
     make_panel,
     mean_pairwise_iou,
     nonempty_sample_fraction,
+    per_dim_kl,
     stratified_indices,
+    whitened_kl_decomposition,
 )
 from probunet.training.trainer import Trainer
 from probunet.utils.runtime import git_revision, rng_state, select_device, set_rng_state
@@ -391,6 +396,304 @@ def test_panel_layout() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Latent geometry: the prior-whitened KL decomposition (Stage 4)
+# --------------------------------------------------------------------------- #
+WHITEN_BATCH = 5
+WHITEN_DIM = 6
+
+
+def whiten_pair(
+    dtype: torch.dtype, seed: int = 0, full: bool = True
+) -> tuple[object, object]:
+    """Build a (posterior, prior) pair of the requested family and dtype.
+
+    Constructed **in** the target dtype rather than cast afterwards: casting a float32 KL
+    to float64 buys no accuracy, and the point of the two-dtype tests is to measure what
+    each precision can actually deliver end to end.
+
+    Args:
+        dtype: Element type for every parameter.
+        seed: Seed for the parameters.
+        full: Full covariance if True, diagonal otherwise.
+
+    Returns:
+        The posterior and prior.
+    """
+    generator = torch.Generator().manual_seed(seed)
+
+    def draw(shape: tuple[int, ...], scale: float = 1.0) -> torch.Tensor:
+        return torch.randn(*shape, generator=generator, dtype=dtype) * scale
+
+    def build(mean_scale: float, tril_scale: float) -> object:
+        mu = draw((WHITEN_BATCH, WHITEN_DIM), mean_scale)
+        sigma = torch.exp(0.5 * draw((WHITEN_BATCH, WHITEN_DIM), 0.5))
+        if not full:
+            return Independent(Normal(mu, sigma), 1)
+        strict = torch.tril(draw((WHITEN_BATCH, WHITEN_DIM, WHITEN_DIM), tril_scale), -1)
+        return MultivariateNormal(mu, scale_tril=strict + torch.diag_embed(sigma))
+
+    return build(1.0, 0.4), build(0.3, 0.3)
+
+
+@pytest.mark.parametrize("full", [True, False])
+def test_whitened_decomposition_sums_to_the_exact_kl_in_float64(full: bool) -> None:
+    """float64: an ABSOLUTE tolerance, because the arithmetic really is that good.
+
+    ``sum_i kl_i == KL(Q || P)`` is the property that makes this a decomposition rather
+    than a set of loosely related numbers, and it is what licenses logging
+    ``kl_snapshot_total`` next to the parts as a reconciliation partner. In float64 the
+    residual is ~1e-15, so an absolute bound catches any real algebra error; a relative
+    bound here would be needlessly loose.
+    """
+    posterior, prior = whiten_pair(torch.float64, full=full)
+    decomposition = whitened_kl_decomposition(posterior, prior)
+    exact = kl_divergence(posterior, prior)
+    assert torch.allclose(decomposition.total, exact, atol=1e-12, rtol=0.0)
+    assert torch.allclose(
+        decomposition.per_direction.sum(dim=-1), exact, atol=1e-12, rtol=0.0
+    )
+
+
+@pytest.mark.parametrize("full", [True, False])
+def test_whitened_decomposition_sums_to_the_exact_kl_in_float32(full: bool) -> None:
+    """float32: a RELATIVE tolerance, because that is the honest bound in the real dtype.
+
+    Production runs in float32 -- MPS has no float64 at all -- and there the reference KL
+    is itself only accurate to ~1e-7 relative. The absolute residual scales with the KL
+    (it reaches ~4e-6 on these inputs), so an absolute bound would either be vacuous or
+    fail on a larger KL. This is the same identity as the float64 test, stated in the
+    strongest form float32 can actually support.
+    """
+    posterior, prior = whiten_pair(torch.float32, full=full)
+    decomposition = whitened_kl_decomposition(posterior, prior)
+    exact = kl_divergence(posterior, prior)
+    assert torch.allclose(decomposition.total, exact, rtol=1e-5, atol=0.0)
+    assert torch.allclose(
+        decomposition.per_direction.sum(dim=-1), exact, rtol=1e-5, atol=0.0
+    )
+
+
+def test_whitened_decomposition_reduces_to_per_dim_kl_when_diagonal() -> None:
+    """On the diagonal path the rotation-invariant view must recover the Phase 1 series.
+
+    The eigenbasis of a diagonal-vs-diagonal problem IS the coordinate basis, so the two
+    measurements have to agree as sorted multisets. This is what makes the Phase 2 table
+    comparable with FINDINGS 2.3 rather than a differently-defined number that happens to
+    sit nearby.
+    """
+    posterior, prior = whiten_pair(torch.float64, full=False)
+    decomposition = whitened_kl_decomposition(posterior, prior)
+    axis_wise = kl_divergence(posterior.base_dist, prior.base_dist)
+    assert torch.allclose(
+        decomposition.per_direction,
+        axis_wise.sort(dim=-1, descending=True).values,
+        atol=1e-12,
+        rtol=0.0,
+    )
+
+
+def test_whitened_terms_are_non_negative_and_descending() -> None:
+    """Each direction contributes a non-negative amount, and they come out sorted."""
+    for full in (True, False):
+        decomposition = whitened_kl_decomposition(*whiten_pair(torch.float64, full=full))
+        assert (decomposition.per_direction >= 0).all()
+        differences = decomposition.per_direction[:, :-1] - decomposition.per_direction[:, 1:]
+        assert (differences >= 0).all(), "per-direction values are not descending"
+        eigen_differences = decomposition.eigenvalues[:, :-1] - decomposition.eigenvalues[:, 1:]
+        assert (eigen_differences >= 0).all(), "eigenvalues are not descending"
+
+
+def test_whitened_decomposition_survives_the_collapsed_regime() -> None:
+    """lambda ~ 1 is the dead-direction case, and it must not be lost to cancellation.
+
+    This is why the implementation uses ``u - log1p(u)`` rather than
+    ``lambda - 1 - log(lambda)``. With the posterior a hair wider than the prior in every
+    direction, the true per-direction KL is ~1e-8; the naive form subtracts two nearly
+    equal numbers and returns noise of the wrong sign.
+    """
+    offset = 1e-4
+    generator = torch.Generator().manual_seed(3)
+    mu = torch.randn(WHITEN_BATCH, WHITEN_DIM, generator=generator, dtype=torch.float64)
+    sigma = torch.exp(
+        0.5 * torch.randn(WHITEN_BATCH, WHITEN_DIM, generator=generator, dtype=torch.float64)
+    )
+    prior = Independent(Normal(mu, sigma), 1)
+    posterior = Independent(Normal(mu.clone(), sigma * (1 + offset)), 1)
+
+    decomposition = whitened_kl_decomposition(posterior, prior)
+    # 1/2 (u - log1p(u)) with u = (1+offset)^2 - 1, i.e. ~offset^2 per direction.
+    expected = 0.5 * ((1 + offset) ** 2 - 1 - 2 * np.log1p(offset))
+    assert (decomposition.per_direction > 0).all(), "a dead direction went non-positive"
+    assert torch.allclose(
+        decomposition.per_direction,
+        torch.full_like(decomposition.per_direction, expected),
+        rtol=1e-6,
+    )
+    assert torch.allclose(
+        decomposition.total, kl_divergence(posterior, prior), atol=1e-16, rtol=0.0
+    )
+
+
+def test_eigengap_flags_a_degenerate_spectrum() -> None:
+    """An isotropic posterior has no well-defined directions, and the gap says so.
+
+    The total stays exact -- degeneracy costs the *split*, not the sum -- so the companion
+    is what tells a reader which of the two to trust.
+    """
+    identity = torch.eye(WHITEN_DIM, dtype=torch.float64).expand(
+        WHITEN_BATCH, WHITEN_DIM, WHITEN_DIM
+    )
+    mu = torch.randn(
+        WHITEN_BATCH, WHITEN_DIM, generator=torch.Generator().manual_seed(4), dtype=torch.float64
+    )
+    posterior = MultivariateNormal(mu, scale_tril=identity * 1.3)
+    prior = MultivariateNormal(torch.zeros_like(mu), scale_tril=identity)
+
+    degenerate = whitened_kl_decomposition(posterior, prior)
+    assert float(degenerate.min_eigenvalue_gap.max()) == pytest.approx(0.0, abs=1e-12)
+    assert torch.allclose(
+        degenerate.total, kl_divergence(posterior, prior), atol=1e-12, rtol=0.0
+    )
+
+    # A non-degenerate spectrum reports a gap comfortably above zero, so the signal
+    # discriminates rather than always firing.
+    anisotropic = whitened_kl_decomposition(*whiten_pair(torch.float64))
+    assert float(anisotropic.min_eigenvalue_gap.min()) > 1e-6
+
+
+# --------------------------------------------------------------------------- #
+# Effective rank -- and the inversion that motivates the whole design
+# --------------------------------------------------------------------------- #
+def test_effective_rank_endpoints() -> None:
+    """exp(H) is 1 for a one-hot vector, N for a uniform one, and N-invariant to scale."""
+    assert float(effective_rank(torch.tensor([1.0, 0.0, 0.0, 0.0]))) == pytest.approx(1.0)
+    assert float(effective_rank(torch.ones(6))) == pytest.approx(6.0)
+    # Scale-free: only the shape of the distribution matters.
+    assert float(effective_rank(torch.tensor([2.0, 1.0]))) == pytest.approx(
+        float(effective_rank(torch.tensor([200.0, 100.0])))
+    )
+    # Batched, and two active directions read as 2.
+    batched = effective_rank(torch.tensor([[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]]))
+    assert batched.shape == (2,)
+    assert float(batched[0]) == pytest.approx(2.0)
+    assert float(batched[1]) == pytest.approx(1.0)
+
+
+def test_effective_rank_of_an_all_zero_vector_argues_against_us() -> None:
+    """A vanished total KL reports rank 1, never rank N.
+
+    Documented in :func:`effective_rank`: the degenerate case must not be able to
+    manufacture support for the Phase 2 hypothesis that the rank rose.
+    """
+    assert float(effective_rank(torch.zeros(6))) == pytest.approx(1.0)
+
+
+def test_effective_rank_inverts_on_the_raw_spectrum() -> None:
+    """THE measurement behind this design: the naive input reports the OPPOSITE answer.
+
+    Phase 1's measured geometry, idealized: a unit prior, and a posterior that has
+    contracted to sigma ~= 0.42 along exactly one direction while sitting on the prior in
+    the other five. That is a latent using **one** direction -- the finding of
+    FINDINGS 2.3, where one of six dimensions carried 98.8% of the KL.
+
+    Feed the raw eigenvalues of Sigma_q to the same entropy formula and it reports ~5.5
+    of 6 directions active, because five near-equal eigenvalues look beautifully isotropic
+    and the entropy cannot tell "matches the prior" from "carries information". Feed it
+    the prior-whitened per-direction KL and it reports 1.0, which is the truth.
+
+    The gap is not a subtlety, it is an inversion: the naive metric is maximized by
+    exactly the collapse the project is trying to detect. This test exists so that a
+    future simplification back to the raw spectrum fails loudly instead of quietly
+    reversing the headline result.
+    """
+    contracted = 0.42
+    scales = torch.tensor([contracted] + [1.0] * (WHITEN_DIM - 1), dtype=torch.float64)
+    factor = torch.diag_embed(scales).unsqueeze(0)
+    mean = torch.zeros(1, WHITEN_DIM, dtype=torch.float64)
+    posterior = MultivariateNormal(mean, scale_tril=factor)
+    prior = MultivariateNormal(
+        mean, scale_tril=torch.eye(WHITEN_DIM, dtype=torch.float64).unsqueeze(0)
+    )
+
+    # The naive reading: entropy of the raw covariance spectrum.
+    raw = float(effective_rank(scales**2))
+    # The measurement actually used: entropy of the normalized whitened KL.
+    decomposition = whitened_kl_decomposition(posterior, prior)
+    whitened = float(decomposition.effective_rank[0])
+
+    assert raw == pytest.approx(5.50, abs=0.05), f"raw spectrum read {raw}"
+    assert whitened == pytest.approx(1.00, abs=0.01), f"whitened read {whitened}"
+    assert raw > 5.0 > whitened, "the inversion this design exists to avoid has vanished"
+
+    # And the single active direction carries the entire KL, as it must.
+    parts = decomposition.per_direction[0]
+    assert float(parts[0]) > 0.4
+    assert torch.allclose(parts[1:], torch.zeros_like(parts[1:]), atol=1e-12)
+
+
+def test_effective_rank_rises_when_directions_share_the_load() -> None:
+    """The metric moves in the direction the Phase 2 hypothesis predicts.
+
+    Three equally contracted directions must read ~3, against ~1 for one. Without this,
+    "effective rank" could be a constant that the inversion test alone would not catch.
+    """
+    identity = torch.eye(WHITEN_DIM, dtype=torch.float64).unsqueeze(0)
+    mean = torch.zeros(1, WHITEN_DIM, dtype=torch.float64)
+    prior = MultivariateNormal(mean, scale_tril=identity)
+
+    def rank_with(active: int) -> float:
+        scales = torch.tensor(
+            [0.42] * active + [1.0] * (WHITEN_DIM - active), dtype=torch.float64
+        )
+        posterior = MultivariateNormal(mean, scale_tril=torch.diag_embed(scales).unsqueeze(0))
+        return float(whitened_kl_decomposition(posterior, prior).effective_rank[0])
+
+    assert rank_with(1) == pytest.approx(1.0, abs=0.01)
+    assert rank_with(3) == pytest.approx(3.0, abs=0.01)
+    assert rank_with(6) == pytest.approx(6.0, abs=0.01)
+
+
+def test_effective_rank_accumulator_pools_and_summarizes() -> None:
+    """The full-val accumulator reports mean, spread, quartiles and its sample count."""
+    accumulator = EffectiveRankAccumulator()
+    assert accumulator.metrics() == {}, "an empty accumulator must merge as a no-op"
+
+    for seed in range(3):
+        accumulator.update(*whiten_pair(torch.float32, seed=seed))
+    metrics = accumulator.metrics()
+
+    assert metrics["effrank_val_count"] == 3 * WHITEN_BATCH
+    assert 1.0 <= metrics["effrank_val_mean"] <= WHITEN_DIM
+    assert metrics["effrank_val_std"] > 0.0, "a dispersion estimate of zero is not evidence"
+    assert (
+        metrics["effrank_val_p25"] <= metrics["effrank_val_mean"] <= metrics["effrank_val_p75"]
+        or metrics["effrank_val_p25"] <= metrics["effrank_val_p75"]
+    )
+    assert metrics["kl_val_total_mean"] > 0.0
+
+
+def test_accumulator_measures_each_image_not_the_mean_covariance() -> None:
+    """Per-image is the deliberate choice, and it is not the same number.
+
+    Two images, each rank-1 but informative along *different* axes. Averaging the
+    covariances first would report a two-dimensional population; measuring each posterior
+    and then averaging reports 1.0, which is the honest answer to "how many directions
+    does a posterior use".
+    """
+    mean = torch.zeros(2, WHITEN_DIM, dtype=torch.float64)
+    first = torch.tensor([0.42] + [1.0] * (WHITEN_DIM - 1), dtype=torch.float64)
+    second = torch.tensor([1.0, 0.42] + [1.0] * (WHITEN_DIM - 2), dtype=torch.float64)
+    posterior = MultivariateNormal(mean, scale_tril=torch.diag_embed(torch.stack([first, second])))
+    prior = MultivariateNormal(
+        mean, scale_tril=torch.eye(WHITEN_DIM, dtype=torch.float64).expand(2, -1, -1)
+    )
+
+    accumulator = EffectiveRankAccumulator()
+    accumulator.update(posterior, prior)
+    assert accumulator.metrics()["effrank_val_mean"] == pytest.approx(1.0, abs=0.01)
+
+
+# --------------------------------------------------------------------------- #
 # Checkpointing
 # --------------------------------------------------------------------------- #
 def test_is_improvement() -> None:
@@ -501,6 +804,155 @@ def test_per_dim_kl_covers_every_latent_dimension(tiny_experiment: ExperimentCon
     metrics = trainer.validate()
     for dimension in range(tiny_experiment.model.latent_dim):
         assert f"kl_dim_{dimension}" in metrics
+
+
+def test_snapshot_geometry_reconciles_with_its_own_total(
+    tiny_experiment: ExperimentConfig,
+) -> None:
+    """``kl_whitened_*`` must sum to ``kl_snapshot_total`` in the logged scalars.
+
+    FINDINGS 2.3 had to caveat that per-dimension KL does not reconcile with ``val/kl``,
+    because the two are computed over different populations. Logging the snapshot's own
+    total next to the snapshot's own parts resolves that: the identity is now checkable
+    straight from the metrics, and the mismatch with ``val/kl`` becomes an expected
+    difference in scope rather than an unexplained one.
+    """
+    trainer = Trainer(tiny_experiment)
+    metrics = trainer.validate()
+
+    parts = [
+        metrics[f"kl_whitened_{index}"]
+        for index in range(tiny_experiment.model.latent_dim)
+    ]
+    assert sum(parts) == pytest.approx(metrics["kl_snapshot_total"], rel=1e-5)
+    assert parts == sorted(parts, reverse=True), "not logged descending"
+    assert "whitened_eigengap_min" in metrics
+    assert 1.0 <= metrics["effrank_snapshot"] <= tiny_experiment.model.latent_dim
+    # The snapshot is deliberately NOT val/kl: different population, and saying so in a
+    # test stops a future reader from "fixing" the discrepancy.
+    assert "kl" in metrics
+
+
+def test_full_validation_geometry_runs_on_the_diagnostics_cadence(
+    tiny_experiment: ExperimentConfig,
+) -> None:
+    """``effrank_val_*`` appears only when asked for, and pools far more samples."""
+    trainer = Trainer(tiny_experiment)
+
+    cheap = trainer.validate()
+    assert not any(key.startswith("effrank_val") for key in cheap)
+    assert "effrank_snapshot" in cheap, "the per-epoch snapshot must survive either way"
+
+    full = trainer.validate(full_latent=True)
+    assert full["effrank_val_count"] > 0
+    # Every validation image at all four graders, against the snapshot's one batch at
+    # grader 0 -- the whole reason the second family exists.
+    batch_size = tiny_experiment.data.batch_size
+    assert full["effrank_val_count"] >= N_GRADERS * batch_size
+    assert full["effrank_val_std"] >= 0.0
+    assert full["effrank_val_p25"] <= full["effrank_val_p75"]
+    assert 1.0 <= full["effrank_val_mean"] <= tiny_experiment.model.latent_dim
+
+
+def test_cadence_misalignment_is_flagged(tiny_experiment: ExperimentConfig) -> None:
+    """A diagnostics cadence that misses validation epochs must not fail silently.
+
+    ``effrank_val_*`` is computed inside ``validate``, so misaligned cadences would make
+    the headline Phase 2 series sparse for a reason nothing in the logs would explain.
+    """
+    aligned = Trainer(
+        dataclasses.replace(
+            tiny_experiment,
+            train=dataclasses.replace(tiny_experiment.train, val_every_n_epochs=2),
+            log=dataclasses.replace(tiny_experiment.log, diagnostics_every_n_epochs=4),
+        )
+    )
+    assert aligned._latent_cadences_align
+
+    misaligned = Trainer(
+        dataclasses.replace(
+            tiny_experiment,
+            train=dataclasses.replace(tiny_experiment.train, val_every_n_epochs=2),
+            log=dataclasses.replace(tiny_experiment.log, diagnostics_every_n_epochs=3),
+        )
+    )
+    assert not misaligned._latent_cadences_align
+    assert "WARNING" in misaligned.describe()
+
+    # Every shipped config gets this right.
+    for name in ("baseline", "modernized", "extension", "ablation_no_augmentation"):
+        config = ExperimentConfig.from_yaml(CONFIGS / f"{name}.yaml")
+        assert (
+            config.log.diagnostics_every_n_epochs % config.train.val_every_n_epochs == 0
+        ), name
+
+
+def test_a_full_covariance_run_completes_end_to_end(
+    tiny_experiment: ExperimentConfig,
+) -> None:
+    """THE Stage 4 deliverable: a full-covariance run survives a whole training loop.
+
+    Before Stage 4 this raised ``NotImplementedError`` from ``per_dim_kl`` at the end of
+    the first validation pass, and again from ``reparameterize`` in the diagnostics --
+    which is why Stage 3 shipped with an explicit refusal rather than a latent crash.
+    Every latent diagnostic must now produce finite numbers on the full-covariance path,
+    because a Phase 2 run that dies at epoch 1 of 848 is discovered a day late.
+    """
+    config = dataclasses.replace(
+        tiny_experiment,
+        model=dataclasses.replace(tiny_experiment.model, latent_covariance="full"),
+    )
+    trainer = Trainer(config)
+    assert trainer.model.prior_net.full_covariance
+
+    summary = trainer.train()
+    assert summary["epochs"] == 2
+
+    for record in summary["history"]:
+        for key, value in record.items():
+            assert np.isfinite(value), f"{key} is not finite on the full-covariance path"
+        for key in (
+            "val/kl_dim_0",
+            "val/kl_whitened_0",
+            "val/kl_snapshot_total",
+            "val/whitened_eigengap_min",
+            "val/effrank_snapshot",
+            "val/effrank_val_mean",
+            "val/effrank_val_std",
+            "diag/sample_diversity_iou",
+            "diag/prior_posterior_ce_ratio",
+        ):
+            assert key in record, f"{key} missing from a full-covariance run"
+
+    # At zero-init the correlations start at zero, so the geometry must still be sane
+    # rather than degenerate-by-construction.
+    last = summary["history"][-1]
+    assert 1.0 <= last["val/effrank_val_mean"] <= config.model.latent_dim
+
+
+def test_per_dim_kl_marginals_do_not_pretend_to_decompose() -> None:
+    """Under a full covariance, ``kl_dim_*`` is a marginal and says so by not summing.
+
+    Kept as an explicit test because the tempting misreading -- treating the coordinate
+    series as a breakdown of the total, exactly as Phase 1 legitimately did -- would
+    silently misattribute the KL once the covariance is full. The whitened decomposition
+    is the one that adds up.
+    """
+    posterior, prior = whiten_pair(torch.float64, full=True)
+    marginal_total = float(per_dim_kl(posterior, prior).sum())
+    exact_total = float(kl_divergence(posterior, prior).mean())
+    assert marginal_total != pytest.approx(exact_total, rel=1e-3), (
+        "the marginals summed to the total, so this test no longer proves anything"
+    )
+    # The whitened decomposition, on the same pair, does reconcile.
+    whitened = whitened_kl_decomposition(posterior, prior)
+    assert float(whitened.total.mean()) == pytest.approx(exact_total, rel=1e-9)
+
+    # On the diagonal path the coordinate series IS separable, and still is.
+    diagonal_posterior, diagonal_prior = whiten_pair(torch.float64, full=False)
+    assert float(per_dim_kl(diagonal_posterior, diagonal_prior).sum()) == pytest.approx(
+        float(kl_divergence(diagonal_posterior, diagonal_prior).mean()), rel=1e-9
+    )
 
 
 def test_best_checkpoint_tracks_validation_loss(tiny_experiment: ExperimentConfig) -> None:
