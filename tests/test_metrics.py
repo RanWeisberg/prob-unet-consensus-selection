@@ -8,6 +8,8 @@ not an edge case.
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 import torch
 
@@ -364,3 +366,78 @@ def test_consensus_scores_validate_shapes() -> None:
         consensus_scores(torch.zeros(2, 3, 8, 8, dtype=torch.uint8), graders)
     with pytest.raises(ValueError, match=r"\(B, k, H, W\)"):
         consensus_scores(torch.zeros(1, 8, 8, dtype=torch.uint8), graders)
+
+
+def test_consensus_ceiling_is_the_exact_maximum_by_brute_force() -> None:
+    """The ceiling equals the true max of soft Dice over ALL binary masks.
+
+    The optimum of ``2*sum(s*c)/(sum(s)+sum(c))`` over binary ``s`` is always a superlevel
+    set of ``c``, and ``c`` takes only the four positive values {0.25, 0.5, 0.75, 1.0}, so
+    thresholding at each of them and taking the max is exact rather than approximate.
+    (The all-ones mask -- threshold 0 -- can never win: zero-consensus pixels add to the
+    denominator and nothing to the numerator.)
+
+    Verified here the only way that leaves no doubt: enumerate all 2^9 binary masks on a
+    3x3 tile and compare. This is what licenses reporting every soft-consensus number as a
+    fraction of the ceiling.
+    """
+    side = 3
+    every_mask = torch.tensor(
+        list(itertools.product([0, 1], repeat=side * side)), dtype=torch.uint8
+    ).view(-1, side, side)
+
+    generator = torch.Generator().manual_seed(0)
+    checked = 0
+    for _ in range(60):
+        graders = (
+            torch.rand(1, N_GRADERS, side, side, generator=generator)
+            > torch.rand(1, N_GRADERS, 1, 1, generator=generator) * 0.9
+        ).to(torch.uint8)
+        if int(graders.sum()) == 0:
+            continue  # all-empty is the convention's job, not the optimizer's
+        soft = consensus(graders)
+        brute = soft_dice(every_mask, soft.expand(every_mask.shape[0], -1, -1)).max()
+        assert float(consensus_ceiling(graders)[0]) == pytest.approx(float(brute), abs=1e-6)
+        checked += 1
+    assert checked > 40, "the random draw produced too few non-degenerate cases to mean much"
+
+
+def test_consensus_ceiling_beats_the_two_tempting_wrong_definitions() -> None:
+    """It is not best-of-the-four-graders and not the union, and it dominates both.
+
+    Both are plausible-looking stand-ins that would silently UNDERSTATE the ceiling on
+    buckets 2-4 -- and understating the denominator would overstate every result reported
+    as a fraction of it. Bucket 1 cannot catch this: there the ceiling is 0.40 either way.
+    """
+    generator = torch.Generator().manual_seed(3)
+    graders = (torch.rand(1, N_GRADERS, 6, 6, generator=generator) > 0.5).to(torch.uint8)
+    soft = consensus(graders)
+
+    ceiling = float(consensus_ceiling(graders))
+    best_grader = float(soft_dice(graders, soft.expand(1, N_GRADERS, -1, -1)).max())
+    union = (graders.sum(dim=1) > 0).to(torch.uint8).unsqueeze(1)
+    union_score = float(soft_dice(union, soft.unsqueeze(1)))
+
+    assert ceiling > best_grader, "ceiling collapsed to best-of-the-graders"
+    assert ceiling > union_score, "ceiling collapsed to the union"
+
+
+def test_no_mask_can_exceed_the_ceiling() -> None:
+    """The property the name claims: soft Dice never exceeds consensus_ceiling.
+
+    Randomized over both the candidate masks and the grader configurations, including
+    lopsided ones where only some graders saw a lesion.
+    """
+    generator = torch.Generator().manual_seed(11)
+    for _ in range(50):
+        density = float(torch.rand(1, generator=generator)) * 0.9
+        graders = (
+            torch.rand(1, N_GRADERS, 8, 8, generator=generator)
+            > torch.rand(1, N_GRADERS, 1, 1, generator=generator) * 0.9
+        ).to(torch.uint8)
+        samples = (torch.rand(1, 12, 8, 8, generator=generator) > density).to(torch.uint8)
+        scores = consensus_scores(samples, graders)
+        ceiling = consensus_ceiling(graders)
+        assert (scores <= ceiling.unsqueeze(1) + 1e-6).all(), (
+            f"a sample beat the ceiling: max {float(scores.max())} vs {float(ceiling)}"
+        )

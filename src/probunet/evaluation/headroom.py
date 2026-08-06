@@ -46,6 +46,53 @@ BUCKET_LABELS = {1: "1 grader", 2: "2 graders", 3: "3 graders", 4: "4 graders"}
 VERDICT_TOLERANCE = 1e-9
 """Below this, oracle and all-empty are a tie rather than a winner and a loser."""
 
+GRADER_COLUMNS = ("ceiling", "all_empty")
+"""Columns that depend on the grader masks ALONE -- no model, no checkpoint, no weights.
+
+These are properties of the dataset and the split, so they are **final**: they do not move
+when the pass is rerun on a different checkpoint, and comparing them across arms is
+meaningless because they cannot differ. :func:`measure_ceilings` computes exactly these,
+which is what lets the report notebook import the ceiling table without loading weights.
+"""
+
+MODEL_COLUMNS = ("random", "oracle", "emptiest", "nonempty_frac")
+"""Columns that require sampling from a model, and therefore a checkpoint."""
+
+
+@torch.no_grad()
+def measure_ceilings(
+    loader: torch.utils.data.DataLoader, device: torch.device | None = None
+) -> dict[str, np.ndarray]:
+    """Compute the grader-only columns: the achievable ceiling and the all-empty score.
+
+    **No model, no checkpoint, no weights.** Both quantities are functions of the four
+    grader masks alone, so this runs anywhere the data is -- which is what lets the report
+    notebook produce the ceiling table on CPU without downloading a checkpoint, and what
+    makes the ceilings final rather than per-run.
+
+    Args:
+        loader: An eval-mode loader yielding ``masks``.
+        device: Optional device for the arithmetic; CPU is fine and is the default.
+
+    Returns:
+        Per-patch ``ceiling``, ``all_empty``, ``n_nonempty`` and ``index``.
+    """
+    device = device or torch.device("cpu")
+    columns: dict[str, list[np.ndarray]] = {
+        key: [] for key in ("ceiling", "all_empty", "n_nonempty", "index")
+    }
+    for batch in loader:
+        graders = batch["masks"].to(device)
+        values = {
+            "ceiling": consensus_ceiling(graders),
+            "all_empty": all_empty_consensus_dice(graders),
+            "n_nonempty": (graders.flatten(start_dim=2).sum(dim=2) > 0).sum(dim=1),
+            "index": batch["index"],
+        }
+        for key, value in values.items():
+            columns[key].append(value.detach().cpu().numpy())
+    return {key: np.concatenate(parts) for key, parts in columns.items()}
+
 
 @torch.no_grad()
 def measure_split(
@@ -129,9 +176,15 @@ def per_bucket(results: dict[str, np.ndarray]) -> dict[str, Any]:
     for label, selector in buckets:
         if not selector.any():
             continue
-        group = {key: results[key][selector]
-                 for key in ("random", "oracle", "all_empty", "emptiest", "ceiling",
-                             "nonempty_frac")}
+        present = [key for key in (*MODEL_COLUMNS, *GRADER_COLUMNS) if key in results]
+        group = {key: results[key][selector] for key in present}
+        if "oracle" not in group:
+            # Ceiling-only mode: no model, so no verdict to reach.
+            report[label] = {
+                "n": int(selector.sum()),
+                **{key: summarize(value) for key, value in group.items()},
+            }
+            continue
         oracle, all_empty = group["oracle"].mean(), group["all_empty"].mean()
         # Three-way, not two. A TIE is not a win for all-empty, and it has a completely
         # different cause: it is what a model that emits only empty candidates produces,
@@ -174,6 +227,16 @@ def render(report: dict[str, Any]) -> str:
         "all_empty_wins": "*** ALL-EMPTY WINS ***",
         "degenerate_tie": "tie -- see nonempty",
     }
+    if report and "verdict" not in next(iter(report.values())):
+        header = f"{'bucket':<12}{'n':>6}{'ceiling':>10}{'all-empty':>11}"
+        lines = [header, "-" * len(header)]
+        for label, row in report.items():
+            lines.append(
+                f"{label:<12}{row['n']:>6}"
+                f"{row['ceiling']['mean']:>10.4f}{row['all_empty']['mean']:>11.4f}"
+            )
+        return "\n".join(lines)
+
     header = (
         f"{'bucket':<12}{'n':>6}{'random':>9}{'oracle':>9}{'all-empty':>10}"
         f"{'emptiest':>9}{'ceiling':>9}{'headroom':>9}{'nonempty':>9}  verdict"

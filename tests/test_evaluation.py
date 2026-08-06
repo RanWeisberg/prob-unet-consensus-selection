@@ -14,7 +14,14 @@ import numpy as np
 import pytest
 import torch
 
-from probunet.evaluation.headroom import per_bucket, render
+from probunet.evaluation.metrics import consensus_ceiling
+from probunet.evaluation.headroom import (
+    GRADER_COLUMNS,
+    MODEL_COLUMNS,
+    measure_ceilings,
+    per_bucket,
+    render,
+)
 from probunet.evaluation.metrics import (
     aggregate_over_graders,
     dice,
@@ -579,3 +586,51 @@ def test_headroom_table_renders_every_bucket() -> None:
     for label in ("1 grader", "2 graders", "3 graders", "4 graders", "all"):
         assert label in text
     assert "nonempty" in text and "ceiling" in text and "headroom" in text
+
+
+def test_grader_and_model_columns_are_disjoint() -> None:
+    """The split between what needs weights and what does not is explicit.
+
+    ``ceiling`` and ``all_empty`` are functions of the grader masks alone, so they are
+    properties of the dataset and the split -- final, and identical across every arm and
+    every checkpoint. Nothing that varies with a model may leak into that set.
+    """
+    assert set(GRADER_COLUMNS).isdisjoint(MODEL_COLUMNS)
+    assert set(GRADER_COLUMNS) == {"ceiling", "all_empty"}
+
+
+def test_measure_ceilings_needs_no_model() -> None:
+    """The ceiling table is computable from grader masks alone, on CPU, with no weights.
+
+    This is what lets the report notebook build the table without downloading a
+    checkpoint, and it is why the four ceilings cannot move between runs.
+    """
+    generator = torch.Generator().manual_seed(5)
+    graders = torch.stack(
+        [
+            torch.stack(
+                [
+                    (torch.rand(8, 8, generator=generator) > 0.6).to(torch.uint8)
+                    if grader < count
+                    else torch.zeros(8, 8, dtype=torch.uint8)
+                    for grader in range(4)
+                ]
+            )
+            for count in (1, 2, 3, 4)
+        ]
+    )
+    batches = [{"masks": graders, "index": torch.arange(4)}]
+
+    results = measure_ceilings(batches)
+    assert set(results) == {"ceiling", "all_empty", "n_nonempty", "index"}
+    assert results["n_nonempty"].tolist() == [1, 2, 3, 4]
+    # Identical to calling the primitive directly -- one definition, not two.
+    assert np.allclose(results["ceiling"], consensus_ceiling(graders).numpy())
+    # Every patch here has a non-empty grader, so all-empty is mechanically 0.
+    assert np.allclose(results["all_empty"], 0.0)
+
+    # per_bucket handles the model-free columns without inventing a verdict.
+    report = per_bucket(results)
+    assert "ceiling" in report["1 grader"]
+    assert "verdict" not in report["1 grader"]
+    assert "ceiling" in render(report)

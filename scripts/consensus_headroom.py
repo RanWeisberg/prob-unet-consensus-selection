@@ -61,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from probunet.data.lidc import build_data  # noqa: E402
 from probunet.evaluation.headroom import (  # noqa: E402
     EVAL_SAMPLES,
+    measure_ceilings,
     measure_split,
     per_bucket,
     render,
@@ -78,7 +79,16 @@ def main() -> None:
     """Parse arguments, run the pass, print and optionally save the table."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint", type=Path, default=None,
+        help="checkpoint to sample from. Omit for CEILING-ONLY mode: the ceiling and the "
+             "all-empty score depend on the grader masks alone, so they need no weights.",
+    )
+    parser.add_argument(
+        "--config", type=Path, default=None,
+        help="config supplying the data pipeline. Required in ceiling-only mode; "
+             "otherwise the checkpoint's own config is used.",
+    )
     parser.add_argument(
         "--split", required=True, choices=("val", "test"),
         help="no default: development happens on val, test is touched once at the end",
@@ -89,42 +99,59 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=None)
     arguments = parser.parse_args()
 
-    if not arguments.checkpoint.exists():
+    if arguments.checkpoint is None and arguments.config is None:
+        parser.error("give --checkpoint, or --config for ceiling-only mode")
+    if arguments.checkpoint is not None and not arguments.checkpoint.exists():
         raise FileNotFoundError(
             f"checkpoint not found: {arguments.checkpoint}. Run this on the machine that "
             "trained it."
         )
 
-    state = load_checkpoint(arguments.checkpoint)
-    config = ExperimentConfig.from_dict(state.config)
+    state = None
+    if arguments.config is not None:
+        config = ExperimentConfig.from_yaml(arguments.config)
+    else:
+        state = load_checkpoint(arguments.checkpoint)
+        config = ExperimentConfig.from_dict(state.config)
     device = select_device(arguments.device or config.run.device)
     seed_everything(config.run.seed, deterministic=config.run.deterministic)
 
-    model = ProbUNet(config.model).to(device)
-    load_checkpoint(arguments.checkpoint, model=model)
-    # No head here, but the base must be frozen and in eval mode for the same reason it
-    # will be in Phase 3: a base still in training mode would give different samples.
-    freeze_record = freeze_module(model, "base model")
-
     data = build_data(config.data)
     loader = data.loaders[arguments.split]
-    LOGGER.info(
-        "scoring %d patches from %s with %d shared candidates per image (seed %d)",
-        len(data.datasets[arguments.split]), arguments.split, arguments.samples, arguments.seed,
-    )
 
-    results = measure_split(model, loader, device, arguments.samples, arguments.seed)
+    freeze_record = None
+    if arguments.checkpoint is None:
+        # Ceiling-only: grader masks are the whole input, so there is nothing to load and
+        # nothing that could vary between arms.
+        LOGGER.info(
+            "CEILING-ONLY over %d patches from %s: no model, no weights",
+            len(data.datasets[arguments.split]), arguments.split,
+        )
+        results = measure_ceilings(loader, device)
+    else:
+        model = ProbUNet(config.model).to(device)
+        load_checkpoint(arguments.checkpoint, model=model)
+        # No head here, but the base must be frozen and in eval mode for the same reason
+        # it will be in Phase 3: a base still in training mode would give other samples.
+        freeze_record = freeze_module(model, "base model")
+        LOGGER.info(
+            "scoring %d patches from %s with %d shared candidates per image (seed %d)",
+            len(data.datasets[arguments.split]), arguments.split, arguments.samples,
+            arguments.seed,
+        )
+        results = measure_split(model, loader, device, arguments.samples, arguments.seed)
     report = per_bucket(results)
 
     record = {
-        "checkpoint": str(arguments.checkpoint),
-        "checkpoint_epoch": state.epoch,
-        "checkpoint_device": state.device,
-        "checkpoint_git_revision": state.git_revision,
-        "checkpoint_torch_version": state.torch_version,
+        "mode": "ceiling_only" if state is None else "full",
+        "checkpoint": None if state is None else str(arguments.checkpoint),
+        "checkpoint_epoch": None if state is None else state.epoch,
+        "checkpoint_device": None if state is None else state.device,
+        "checkpoint_git_revision": None if state is None else state.git_revision,
+        "checkpoint_torch_version": None if state is None else state.torch_version,
         "latent_covariance": config.model.latent_covariance,
         "split": arguments.split,
-        "n_samples": arguments.samples,
+        "n_samples": None if state is None else arguments.samples,
         "sampling_seed": arguments.seed,
         "freeze_record": freeze_record,
         "environment": {
@@ -145,6 +172,12 @@ def main() -> None:
     print()
     print(render(report))
     print()
+    if state is None:
+        print(
+            "Ceiling-only: these depend on the grader masks alone, so they are FINAL -- "
+            "they cannot move when the pass is rerun on a checkpoint."
+        )
+        return
     failed = [k for k, row in report.items() if row["verdict"] == "all_empty_wins"]
     tied = [k for k, row in report.items() if row["verdict"] == "degenerate_tie"]
     if failed:
