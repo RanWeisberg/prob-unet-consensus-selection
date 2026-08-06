@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from probunet.evaluation.headroom import per_bucket, render
 from probunet.evaluation.metrics import (
     aggregate_over_graders,
     dice,
@@ -499,3 +500,82 @@ def test_collect_rejects_a_raw_model(tiny_model_and_loader) -> None:
         collect_per_patch_metrics(
             model, data.loaders["val"], SamplingConfig(sample_counts=(1,)), torch.device("cpu")
         )
+
+
+# --------------------------------------------------------------------------- #
+# Consensus headroom: the Phase 3 pre-registration pass
+# --------------------------------------------------------------------------- #
+def headroom_arrays(**overrides: np.ndarray) -> dict[str, np.ndarray]:
+    """Build per-patch arrays for :func:`per_bucket`, one patch per bucket.
+
+    Args:
+        **overrides: Columns to replace.
+
+    Returns:
+        A mapping matching ``measure_split``'s output contract.
+    """
+    base = {
+        "random": np.array([0.10, 0.20, 0.30, 0.40]),
+        "oracle": np.array([0.25, 0.40, 0.55, 0.70]),
+        "all_empty": np.zeros(4),
+        "emptiest": np.zeros(4),
+        "ceiling": np.array([0.40, 0.667, 0.857, 1.0]),
+        "nonempty_frac": np.ones(4),
+        "n_nonempty": np.array([1, 2, 3, 4]),
+        "index": np.arange(4),
+    }
+    base.update(overrides)
+    return base
+
+
+def test_headroom_reports_ok_when_the_pathology_is_gone() -> None:
+    """oracle above all-empty on every bucket is the result Phase 3 needs."""
+    report = per_bucket(headroom_arrays())
+    assert set(report) == {"1 grader", "2 graders", "3 graders", "4 graders", "all"}
+    for label, row in report.items():
+        assert row["verdict"] == "ok", label
+        assert row["oracle_beats_all_empty"] is True
+    assert report["1 grader"]["headroom_oracle_minus_random"] == pytest.approx(0.15)
+    # Reported as a fraction of what any mask could achieve, never against 1.0.
+    assert report["1 grader"]["oracle_fraction_of_ceiling"] == pytest.approx(0.25 / 0.40)
+
+
+def test_headroom_flags_a_genuine_all_empty_win() -> None:
+    """If all-empty still beats oracle, the target is not fixed and the run must stop."""
+    report = per_bucket(
+        headroom_arrays(all_empty=np.array([0.75, 0.0, 0.0, 0.0]))
+    )
+    assert report["1 grader"]["verdict"] == "all_empty_wins"
+    assert report["1 grader"]["oracle_beats_all_empty"] is False
+    assert report["4 graders"]["verdict"] == "ok"
+
+
+def test_headroom_separates_a_degenerate_tie_from_a_failure() -> None:
+    """A model emitting only empty candidates ties at 0 -- that is NOT all-empty winning.
+
+    Both score exactly 0 because there is nothing to choose between, so the pass says
+    nothing about the target. Reporting it as a refutation of soft consensus would blame
+    the target for an undertrained checkpoint. Observed for real on a 2-step smoke
+    checkpoint, which is what prompted the three-way verdict.
+    """
+    report = per_bucket(
+        headroom_arrays(
+            random=np.zeros(4),
+            oracle=np.zeros(4),
+            emptiest=np.zeros(4),
+            nonempty_frac=np.zeros(4),
+        )
+    )
+    for label, row in report.items():
+        assert row["verdict"] == "degenerate_tie", label
+        assert row["oracle_beats_all_empty"] is False
+        # The column that explains why.
+        assert row["nonempty_frac"]["mean"] == 0.0
+
+
+def test_headroom_table_renders_every_bucket() -> None:
+    """The rendered table carries one row per bucket plus the aggregate."""
+    text = render(per_bucket(headroom_arrays()))
+    for label in ("1 grader", "2 graders", "3 graders", "4 graders", "all"):
+        assert label in text
+    assert "nonempty" in text and "ceiling" in text and "headroom" in text
