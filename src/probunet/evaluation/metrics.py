@@ -35,12 +35,23 @@ from torch import Tensor
 AGGREGATIONS = ("mean", "median", "min", "max")
 """Ways to reduce a sample's per-grader scores into one number.
 
-The consensus-selection extension's target is still open (CLAUDE.md), so the choice is
-exposed rather than hard-coded. ``mean`` is the default everywhere.
+Retained for the **distribution** metrics, where the four graders stay separate. It is
+**not** the selection target: Phase 3 selects on soft consensus (see :func:`consensus`),
+because every one of these aggregations is broken by the empty-grader structure of this
+data -- ``mean`` scores an empty mask 0.75 against 0.25 for a correct one on the 33% of
+patches with three empty graders, ``median`` scores it 1.0, and ``min`` is degenerate
+across three of four buckets. ``mean`` remains the default for reporting.
 """
 
 EMPTY_VS_EMPTY_SCORE = 1.0
-"""Score for comparing two empty masks: perfect agreement on lesion absence."""
+"""Score for comparing two empty masks: perfect agreement on lesion absence.
+
+**The single empty-mask convention.** Used by :func:`binary_iou`, :func:`dice` and
+:func:`soft_dice` alike; there must never be a second one.
+"""
+
+N_GRADERS = 4
+"""Independent expert annotations per patch in LIDC-IDRI."""
 
 
 def _as_bool(mask: Tensor) -> Tensor:
@@ -137,6 +148,222 @@ def dice(a: Tensor, b: Tensor) -> Tensor:
         2.0 * intersection / total.clamp(min=1.0),
         torch.full_like(total, EMPTY_VS_EMPTY_SCORE),
     )
+
+
+def consensus(graders: Tensor) -> Tensor:
+    """Soft consensus map: the equal-weighted average of the grader masks.
+
+    ``c = (1/4) * sum_k m_k``, so each pixel lands in ``{0, 0.25, 0.5, 0.75, 1.0}`` and
+    reads as **the fraction of graders who included this pixel**. This is the Phase 3
+    selection target (FINDINGS 4.4).
+
+    **Equal weighting is an explicit assumption, not an inferred one.** The four LIDC
+    annotators are anonymous and carry no identity across patches, so per-grader
+    reliability cannot be estimated from this data -- which is also why STAPLE has nothing
+    to fit here and is cited as considered-and-rejected rather than used.
+
+    **This is the SELECTION target only.** GED, sample diversity and every other
+    distribution metric keep the four masks separate; collapsing them into one average for
+    those would discard exactly the grader spread Phase 1 exists to measure.
+
+    Args:
+        graders: Binary grader masks of shape ``(B, m, H, W)``, any integer, boolean or
+            binary floating dtype.
+
+    Returns:
+        Float32 consensus of shape ``(B, H, W)``.
+
+    Raises:
+        ValueError: If the input is not 4-D, or is not binary. The binarity check is what
+            stops an **already-averaged** map from being averaged a second time -- the
+            values would still look plausible, so nothing downstream would catch it.
+    """
+    if graders.dim() != 4:
+        raise ValueError(
+            f"expected grader masks of shape (B, m, H, W), got {tuple(graders.shape)}"
+        )
+    # _as_bool raises on a floating tensor holding anything outside {0, 1}, which is the
+    # double-averaging guard: a consensus map arriving here fails loudly.
+    return _as_bool(graders).to(torch.float32).mean(dim=1)
+
+
+def soft_dice(samples: Tensor, target: Tensor) -> Tensor:
+    """Dice between **binary** samples and a **soft** target, over the last two dims.
+
+    ``2 * sum(s * c) / (sum(s) + sum(c))``. The sample stays hard -- it is the artifact
+    that would actually be delivered -- while the target carries the graders' partial
+    agreement.
+
+    Deliberately a separate function rather than a relaxation of :func:`dice`: ``dice``
+    routes through :func:`_as_bool`, which **raises** on a floating mask holding values
+    outside ``{0, 1}``, and that guard is correct and stays. What is shared is the thing
+    that must be shared -- :data:`EMPTY_VS_EMPTY_SCORE`, so there is still exactly one
+    empty-mask convention.
+
+    **Scores are bounded well below 1 by construction.** Against a consensus built from
+    one non-empty grader of area ``A``, a *perfect* mask scores
+    ``2(0.25A) / (A + 0.25A) = 0.40``. The per-bucket ceilings are 0.40 / 0.667 / 0.857 /
+    1.00 for 1/2/3/4 non-empty graders. Report against those, never against 1.0.
+
+    Args:
+        samples: Binary masks of shape ``(..., H, W)``.
+        target: Soft target of the same shape, values in ``[0, 1]``.
+
+    Returns:
+        Float32 scores of shape ``samples.shape[:-2]``.
+
+    Raises:
+        ValueError: If the shapes differ, the samples are not binary, or the target falls
+            outside ``[0, 1]``.
+    """
+    _check_shapes(samples, target)
+    if not target.is_floating_point():
+        raise ValueError(
+            f"soft target must be floating point, got {target.dtype}. For a binary "
+            "target use dice()."
+        )
+    if bool((target < 0).any() or (target > 1).any()):
+        raise ValueError("soft target holds values outside [0, 1]")
+
+    hard = _as_bool(samples).to(torch.float32)
+    soft = target.to(torch.float32)
+    dims = (-2, -1)
+    intersection = (hard * soft).sum(dim=dims)
+    total = hard.sum(dim=dims) + soft.sum(dim=dims)
+    # total == 0 means an empty sample against an all-zero consensus, i.e. every grader
+    # saw no lesion and the model agreed. Same convention as binary_iou and dice.
+    #
+    # MEASURED 2026-08-06: no patch in this dataset has zero non-empty graders (counts are
+    # 1 -> 4963, 2 -> 2756, 3 -> 2626, 4 -> 4751 over all 15,096; and 0 in each of train,
+    # val and test). So this branch is DEFENSIVE -- it is tested synthetically and plays
+    # no part in any reported number. An empty sample against a non-empty consensus scores
+    # 0, which is the whole point of the target.
+    return torch.where(
+        total > 0,
+        2.0 * intersection / total.clamp(min=1e-12),
+        torch.full_like(total, EMPTY_VS_EMPTY_SCORE),
+    )
+
+
+def consensus_ceiling(graders: Tensor) -> Tensor:
+    """The best soft-consensus Dice any binary mask could achieve on this image.
+
+    The maximum of ``2*sum(s*c) / (sum(s) + sum(c))`` over binary ``s`` is attained by
+    thresholding ``c`` at its most favourable level, so it is computed exactly by trying
+    each distinct non-zero value of ``c`` as a threshold. For ``k`` identical non-empty
+    graders this reduces to the familiar ladder 0.40 / 0.667 / 0.857 / 1.00.
+
+    Reported alongside every soft-consensus number, because absolute values are low by
+    design and are meaningless without the ceiling beside them.
+
+    Args:
+        graders: Binary grader masks of shape ``(B, m, H, W)``.
+
+    Returns:
+        Float32 ceiling of shape ``(B,)``.
+    """
+    soft = consensus(graders)
+    levels = torch.arange(1, N_GRADERS + 1, device=soft.device, dtype=torch.float32)
+    levels = levels / N_GRADERS
+    # (B, L, H, W): one candidate mask per threshold level.
+    candidates = (soft.unsqueeze(1) >= levels.view(1, -1, 1, 1)).to(torch.uint8)
+    scores = soft_dice(candidates, soft.unsqueeze(1).expand_as(candidates))
+    return scores.amax(dim=1)
+
+
+def consensus_scores(samples: Tensor, graders: Tensor) -> Tensor:
+    """Soft-consensus Dice of every sample against its image's consensus.
+
+    The single scoring primitive Phase 3 is built on: the head's regression target, and
+    the quantity every consensus baseline below reduces.
+
+    Args:
+        samples: Binary masks of shape ``(B, n, H, W)``.
+        graders: Binary grader masks of shape ``(B, m, H, W)``.
+
+    Returns:
+        Float32 scores of shape ``(B, n)``.
+
+    Raises:
+        ValueError: If either input is not 4-D or their batch/spatial dims differ.
+    """
+    if samples.dim() != 4 or graders.dim() != 4:
+        raise ValueError(
+            f"expected (B, k, H, W) for both, got {tuple(samples.shape)} and "
+            f"{tuple(graders.shape)}"
+        )
+    if samples.shape[0] != graders.shape[0] or samples.shape[-2:] != graders.shape[-2:]:
+        raise ValueError(
+            f"incompatible shapes {tuple(samples.shape)} and {tuple(graders.shape)}"
+        )
+    soft = consensus(graders).unsqueeze(1).expand(-1, samples.shape[1], -1, -1)
+    return soft_dice(samples, soft)
+
+
+def consensus_oracle(samples: Tensor, graders: Tensor) -> Tensor:
+    """Best achievable soft-consensus Dice over the sample set: the ceiling the head chases.
+
+    Args:
+        samples: Binary masks of shape ``(B, n, H, W)``.
+        graders: Binary grader masks of shape ``(B, m, H, W)``.
+
+    Returns:
+        Float32 per-patch scores of shape ``(B,)``.
+    """
+    return consensus_scores(samples, graders).amax(dim=1)
+
+
+def consensus_random(samples: Tensor, graders: Tensor) -> Tensor:
+    """Expected soft-consensus Dice of an unselected sample: the floor the head must beat.
+
+    The mean over all ``n`` draws rather than one literal draw -- same expectation, far
+    less variance.
+
+    Args:
+        samples: Binary masks of shape ``(B, n, H, W)``.
+        graders: Binary grader masks of shape ``(B, m, H, W)``.
+
+    Returns:
+        Float32 per-patch scores of shape ``(B,)``.
+    """
+    return consensus_scores(samples, graders).mean(dim=1)
+
+
+def consensus_selected(samples: Tensor, graders: Tensor, selection: Tensor) -> Tensor:
+    """Soft-consensus Dice of one chosen sample per patch.
+
+    The generic path for any selection rule -- the emptiest-sample baseline now, the
+    trained head later.
+
+    Args:
+        samples: Binary masks of shape ``(B, n, H, W)``.
+        graders: Binary grader masks of shape ``(B, m, H, W)``.
+        selection: Chosen sample index per patch, shape ``(B,)``.
+
+    Returns:
+        Float32 per-patch scores of shape ``(B,)``.
+    """
+    scores = consensus_scores(samples, graders)
+    return scores.gather(1, selection.to(torch.int64).unsqueeze(1)).squeeze(1)
+
+
+def all_empty_consensus_dice(graders: Tensor) -> Tensor:
+    """Soft-consensus Dice of the degenerate all-empty predictor.
+
+    **0.0 on every patch that has at least one non-empty grader**, which in this dataset
+    is every patch. Under the old per-grader *mean* Dice the same predictor scored 0.75 on
+    bucket 1 and beat best-of-16; that inversion is what soft consensus removes, and this
+    function is how the pre-registration pass demonstrates it rather than asserting it.
+
+    Args:
+        graders: Binary grader masks of shape ``(B, m, H, W)``.
+
+    Returns:
+        Float32 per-patch scores of shape ``(B,)``.
+    """
+    soft = consensus(graders)
+    empty = torch.zeros_like(soft, dtype=torch.uint8)
+    return soft_dice(empty, soft)
 
 
 def distance(a: Tensor, b: Tensor) -> Tensor:
@@ -282,10 +509,13 @@ def aggregate_over_graders(scores: Tensor, aggregate: str = "mean") -> Tensor:
 def oracle_dice(samples: Tensor, graders: Tensor, aggregate: str = "mean") -> Tensor:
     """Dice of the best single sample: ``max_i [ agg_j Dice(S_i, Y_j) ]``.
 
-    This is the ceiling the consensus-selection head targets, because it selects **one**
-    sample -- exactly what the head must do without ground truth. Contrast
-    :func:`per_grader_oracle_dice`, which lets every grader pick its own best sample and
-    is therefore more permissive.
+    The per-grader-aggregate oracle, reported for continuity with the Phase 1 table.
+    **It is no longer the quantity the head targets** -- Phase 3 selects on soft consensus,
+    so :func:`consensus_oracle` is the ceiling the head chases. Under the default
+    ``aggregate="mean"`` this one is in fact unreachable in bucket 1, where it measures
+    0.7458 against an all-empty mask's 0.7500 (FINDINGS 4.4); that is the arithmetic that
+    ruled the per-grader aggregates out. Contrast :func:`per_grader_oracle_dice`, which
+    lets every grader pick its own best sample and is therefore more permissive still.
 
     Args:
         samples: Model samples of shape ``(B, n, H, W)``.

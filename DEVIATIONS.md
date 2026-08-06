@@ -458,6 +458,44 @@ operation to a single interpolation per array.
 
 ---
 
+## 13. Selection-head training runs without augmentation
+
+**Phase 3 only.** `configs/extension.yaml` sets `data.augmentation.enabled: false`, where
+every Phase 1 and Phase 2 config has it on. Phases 1 and 2 are untouched.
+
+The paper has nothing to say here — it has no selection head — so this is a deviation from
+*our own* Phase 1 pipeline rather than from Appendix H.1, recorded because a reader
+diffing the configs will see augmentation on in two arms and off in the third.
+
+**Why.**
+
+1. **The base is frozen.** Augmentation exists in Phase 1 to regularize a 27.5M-parameter
+   generative model. The head is ~150k parameters on a frozen backbone, and it sees
+   **freshly resampled candidates every epoch** — 8 new prior draws per image per pass —
+   so its effective dataset is already far larger than the patch count. The head's data is
+   not scarce, which is the only condition under which augmentation would earn its cost.
+2. **There is no augmentation at inference.** The head is deployed on untransformed
+   images. Training it on elastically deformed ones hands the frozen base a domain shift
+   it was never adapted to, for no compensating benefit.
+3. **The risk is asymmetric.** Making augmentation carry four masks under one shared
+   sampled transform means editing the augmentation path that Phase 1 and Phase 2 both
+   depend on. A regression there would silently damage the comparability of two completed
+   phases. Not worth it for a benefit already argued away by (1) and (2).
+
+**Consequence for the data pipeline, and why it costs nothing.** The head needs all four
+grader masks per image, which is the **eval-mode** dataset shape. With augmentation off,
+that existing shape is used directly for training — there is no third dataset mode and no
+new code path. This is also enforced from the other direction: constructing an augmented
+eval dataset already **raises** (`tests/test_data.py::test_enabling_augmentation_on_an_eval_dataset_is_an_error`),
+so the combination this entry rules out is one the code refuses to build anyway.
+
+**Report framing.** State it as a deliberate scope decision with the frozen base as the
+reason, not as an omission. The honest caveat is that the head is therefore trained on
+~9,056 distinct images with resampled candidates rather than on an augmented image
+distribution; if the head overfits, this is the first thing to revisit.
+
+---
+
 ## Non-deviations worth recording
 
 Things that *look* like they could differ but were checked and match:

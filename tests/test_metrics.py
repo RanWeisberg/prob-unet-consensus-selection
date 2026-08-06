@@ -11,7 +11,22 @@ from __future__ import annotations
 import pytest
 import torch
 
-from probunet.evaluation.metrics import EMPTY_VS_EMPTY_SCORE, binary_iou, dice
+from probunet.evaluation.metrics import (
+    EMPTY_VS_EMPTY_SCORE,
+    N_GRADERS,
+    aggregate_over_graders,
+    all_empty_consensus_dice,
+    binary_iou,
+    consensus,
+    consensus_ceiling,
+    consensus_oracle,
+    consensus_random,
+    consensus_scores,
+    consensus_selected,
+    dice,
+    pairwise_dice,
+    soft_dice,
+)
 
 
 def mask(rows: list[list[int]]) -> torch.Tensor:
@@ -186,3 +201,166 @@ def test_one_pixel_disagreement_dominates_iou() -> None:
     bigger = big.clone()
     bigger[5, 0] = 1
     assert binary_iou(big, bigger).item() == pytest.approx(40.0 / 41.0)
+
+
+# --------------------------------------------------------------------------- #
+# Soft consensus: the Phase 3 selection target
+# --------------------------------------------------------------------------- #
+def graders_with(n_nonempty: int, area: int = 8, size: int = 8) -> torch.Tensor:
+    """Build ``(1, 4, size, size)`` graders where ``n_nonempty`` share one identical mask.
+
+    The idealized bucket geometry the per-bucket ceilings are derived from: the non-empty
+    graders agree exactly, so the ceiling is analytic.
+
+    Args:
+        n_nonempty: How many of the four graders see a lesion.
+        area: Foreground pixels in each non-empty grader.
+        size: Tile side length.
+
+    Returns:
+        A uint8 tensor of shape ``(1, 4, size, size)``.
+    """
+    masks = torch.zeros(1, N_GRADERS, size, size, dtype=torch.uint8)
+    flat = masks.view(1, N_GRADERS, -1)
+    for grader in range(n_nonempty):
+        flat[0, grader, :area] = 1
+    return masks
+
+
+def test_consensus_is_the_grader_fraction() -> None:
+    """Each pixel of c is the fraction of graders that included it."""
+    graders = graders_with(3, area=4)
+    soft = consensus(graders)
+    assert soft.shape == (1, 8, 8)
+    assert soft.dtype == torch.float32
+    flat = soft.view(-1)
+    assert torch.allclose(flat[:4], torch.full((4,), 0.75))
+    assert torch.allclose(flat[4:], torch.zeros(60))
+    # Every attainable value lies on the quarter grid.
+    for count in range(N_GRADERS + 1):
+        values = torch.unique(consensus(graders_with(count, area=4)))
+        assert torch.isin(
+            values, torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0])
+        ).all(), f"{count} graders produced off-grid values {values}"
+
+
+def test_consensus_refuses_to_average_an_average() -> None:
+    """A consensus map fed back in must fail loudly, not silently halve.
+
+    The values would still look plausible, so nothing downstream would catch it.
+    """
+    soft = consensus(graders_with(2)).unsqueeze(1).expand(-1, N_GRADERS, -1, -1)
+    with pytest.raises(ValueError, match="outside"):
+        consensus(soft)
+
+
+def test_consensus_rejects_the_wrong_rank() -> None:
+    """A (B, H, W) map is not a grader stack."""
+    with pytest.raises(ValueError, match=r"\(B, m, H, W\)"):
+        consensus(torch.zeros(1, 8, 8, dtype=torch.uint8))
+
+
+@pytest.mark.parametrize(
+    ("n_nonempty", "expected"),
+    [(1, 0.4), (2, 2 / 3), (3, 6 / 7), (4, 1.0)],
+)
+def test_perfect_mask_hits_the_bucket_ceiling(n_nonempty: int, expected: float) -> None:
+    """THE bounded-score fact: a perfect mask scores 0.40 in bucket 1, not 1.0.
+
+    ``2(kA/4) / (A + kA/4)`` for ``k`` agreeing graders, i.e. 0.40 / 0.667 / 0.857 / 1.00.
+    Absolute values are low BY CONSTRUCTION and must never be read against 1.0 -- this
+    test is where that ladder is pinned.
+    """
+    graders = graders_with(n_nonempty, area=8)
+    perfect = graders[:, :1, :, :]  # exactly grader 0's mask
+    score = consensus_scores(perfect, graders)
+    assert score.shape == (1, 1)
+    assert float(score) == pytest.approx(expected, abs=1e-6)
+    # And it is genuinely the best any binary mask could do here.
+    assert float(consensus_ceiling(graders)) == pytest.approx(expected, abs=1e-6)
+
+
+def test_empty_scores_zero_wherever_a_grader_saw_something() -> None:
+    """The pathology is gone: empty is worthless on every real patch.
+
+    Under per-grader MEAN Dice an empty mask scored 0.75 on a 3-empty image against 0.25
+    for a correct one, so a head trained on it learned to prefer empty. Both halves are
+    asserted here so the inversion cannot quietly return.
+    """
+    for n_nonempty in (1, 2, 3, 4):
+        graders = graders_with(n_nonempty, area=8)
+        assert float(all_empty_consensus_dice(graders)) == 0.0, n_nonempty
+
+    # The old target, for contrast: empty beats correct in bucket 1.
+    graders = graders_with(1, area=8)
+    empty = torch.zeros(1, 1, 8, 8, dtype=torch.uint8)
+    perfect = graders[:, :1, :, :]
+    old_empty = float(aggregate_over_graders(pairwise_dice(empty, graders), "mean"))
+    old_perfect = float(aggregate_over_graders(pairwise_dice(perfect, graders), "mean"))
+    assert old_empty == pytest.approx(0.75) and old_perfect == pytest.approx(0.25)
+    assert old_empty > old_perfect, "the documented inversion is not reproduced"
+
+    # Under soft consensus the ordering is the right way round.
+    new_empty = float(consensus_scores(empty, graders))
+    new_perfect = float(consensus_scores(perfect, graders))
+    assert new_perfect > new_empty == 0.0
+
+
+def test_all_empty_consensus_uses_the_shared_convention() -> None:
+    """Synthetic only: no patch in this dataset has zero non-empty graders.
+
+    Measured 2026-08-06 over all 15,096 patches (counts 1->4963, 2->2756, 3->2626,
+    4->4751, and 0 in every split), so this branch is DEFENSIVE. It still must not invent
+    a second convention.
+    """
+    graders = graders_with(0)
+    assert float(consensus(graders).sum()) == 0.0
+    assert float(all_empty_consensus_dice(graders)) == EMPTY_VS_EMPTY_SCORE == 1.0
+    # A non-empty sample against an all-zero consensus is pure false positive: 0.
+    nonempty = torch.ones(1, 1, 8, 8, dtype=torch.uint8)
+    assert float(consensus_scores(nonempty, graders)) == 0.0
+
+
+def test_soft_dice_keeps_the_hard_mask_hard() -> None:
+    """Soft target, binary sample -- a soft sample is rejected, not silently thresholded."""
+    graders = graders_with(2, area=8)
+    soft = consensus(graders)
+    with pytest.raises(ValueError, match="outside"):
+        soft_dice(soft, soft)  # sample must be binary
+    with pytest.raises(ValueError, match="floating point"):
+        soft_dice(graders[:, 0], graders[:, 0])  # target must be soft
+    # x3, not x2: consensus here holds {0, 0.5}, and doubling that lands on {0, 1.0},
+    # which is legitimately in range.
+    with pytest.raises(ValueError, match=r"outside \[0, 1\]"):
+        soft_dice(graders[:, 0], soft * 3.0)
+    with pytest.raises(ValueError, match=r"outside \[0, 1\]"):
+        soft_dice(graders[:, 0], soft - 1.0)
+
+
+def test_consensus_baselines_reduce_the_same_scores() -> None:
+    """oracle / random / selected are three reductions of one score matrix."""
+    torch.manual_seed(0)
+    graders = torch.zeros(2, N_GRADERS, 8, 8, dtype=torch.uint8)
+    graders[:, :3, :4, :4] = 1
+    samples = (torch.rand(2, 5, 8, 8) > 0.5).to(torch.uint8)
+
+    scores = consensus_scores(samples, graders)
+    assert scores.shape == (2, 5)
+    assert torch.allclose(consensus_oracle(samples, graders), scores.amax(dim=1))
+    assert torch.allclose(consensus_random(samples, graders), scores.mean(dim=1))
+    choice = torch.tensor([2, 4])
+    assert torch.allclose(
+        consensus_selected(samples, graders, choice),
+        torch.stack([scores[0, 2], scores[1, 4]]),
+    )
+    # The oracle is bounded by what any mask could achieve.
+    assert (consensus_oracle(samples, graders) <= consensus_ceiling(graders) + 1e-6).all()
+
+
+def test_consensus_scores_validate_shapes() -> None:
+    """Mismatched batch or spatial dims fail rather than broadcast."""
+    graders = graders_with(2)
+    with pytest.raises(ValueError, match="incompatible"):
+        consensus_scores(torch.zeros(2, 3, 8, 8, dtype=torch.uint8), graders)
+    with pytest.raises(ValueError, match=r"\(B, k, H, W\)"):
+        consensus_scores(torch.zeros(1, 8, 8, dtype=torch.uint8), graders)
