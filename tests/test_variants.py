@@ -1298,3 +1298,83 @@ def test_a_single_arm_is_trivially_comparable() -> None:
 
     assert_comparable({"only": ablation_signature({"head": {"eval_seed": 2018}})})
     assert_comparable({})
+
+
+def test_the_training_step_really_is_the_consensus_regression(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """The live objective must BE Huber-on-soft-consensus, recomputed independently.
+
+    This test exists because it was missing. A Stage 3 placeholder objective
+    (``scores.pow(2).mean()``) survived as a second ``_selection_head_step`` definition
+    later in the class body, shadowed the Stage 4 implementation, and ran on the CUDA
+    smoke gate -- while every existing test passed, because they only checked that the
+    validation record contained the right *keys*. Keys come from ``validate``; the
+    objective comes from here. Asserting the loss VALUE against an independent
+    recomputation is the only version of this test that could have caught it.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+    batch = next(iter(trainer.train_loader))
+
+    torch.manual_seed(0)
+    terms = trainer._selection_head_step(batch)
+
+    # The Stage 4 objective reports both losses; the placeholder reported score_mean.
+    assert set(terms) == {
+        "total", "head_huber", "area_huber", "target_mean", "predicted_mean"
+    }, "the live step is not the Stage 4 objective"
+    assert "score_mean" not in terms
+
+    # Recompute independently from the same seed and compare the value.
+    torch.manual_seed(0)
+    image = batch["image"].to(trainer.device)
+    graders = batch["masks"].to(trainer.device)
+    features, candidates = trainer.head.sample_candidates(
+        image, config.head.train_samples
+    )
+    expected_target = consensus_scores(candidates, graders)
+    expected_head = torch.nn.functional.huber_loss(
+        trainer.head.score_candidates(features, candidates),
+        expected_target,
+        delta=config.head.huber_delta,
+    )
+    expected_area = torch.nn.functional.huber_loss(
+        trainer.head.score_by_area(candidates),
+        expected_target,
+        delta=config.head.huber_delta,
+    )
+    # detach before float(): `total` is still attached to the graph, and reading a
+    # requires_grad tensor as a scalar warns.
+    assert float(terms["head_huber"]) == pytest.approx(float(expected_head.detach()), rel=1e-6)
+    assert float(terms["area_huber"]) == pytest.approx(float(expected_area.detach()), rel=1e-6)
+    assert float(terms["total"].detach()) == pytest.approx(
+        float((expected_head + expected_area).detach()), rel=1e-6
+    )
+    assert float(terms["target_mean"]) == pytest.approx(
+        float(expected_target.mean()), rel=1e-6
+    )
+    # The candidates really are the K the config asks for.
+    assert candidates.shape[1] == config.head.train_samples
+
+
+def test_no_method_is_defined_twice_in_the_trainer() -> None:
+    """A shadowed duplicate is silent in Python and cost this project a wasted run.
+
+    A second definition of the same method later in a class body simply wins, with no
+    warning from the interpreter, no failure from the type checker and no test failure
+    unless a test asserts behaviour rather than shape.
+    """
+    import ast
+
+    source = (REPO_ROOT / "src" / "probunet" / "training" / "trainer.py").read_text()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        names = [
+            child.name
+            for child in node.body
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        duplicates = {name for name in names if names.count(name) > 1}
+        assert not duplicates, f"{node.name} defines {sorted(duplicates)} more than once"

@@ -663,76 +663,6 @@ class Trainer:
         return metrics
 
     @property
-    def base_model(self) -> ProbUNet:
-        """The Probabilistic U-Net, whichever mode this run is in.
-
-        In ``selection_head`` mode ``self.model`` is the :class:`SelectionHead` wrapper, so
-        anything that needs the generative model itself -- the channel schedule, the
-        latent diagnostics, sampling -- has to reach through it rather than assume
-        ``self.model`` is a ``ProbUNet``.
-        """
-        return self.head.base if self.head is not None else self.model
-
-    @property
-    def is_selection_head(self) -> bool:
-        """Whether this run trains the selection head rather than the ELBO."""
-        return self.config.train.mode == "selection_head"
-
-    def _elbo_step(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        """One ELBO training step: z from the posterior, CE + beta*KL.
-
-        Extracted unchanged from the training loop so ``train_epoch`` can dispatch between
-        objectives without an inline branch. Phases 1 and 2 take this path.
-
-        Args:
-            batch: A training batch carrying ``image`` and one paired grader ``mask``.
-
-        Returns:
-            The ELBO terms; ``total`` is what is minimized.
-        """
-        image = batch["image"].to(self.device, non_blocking=True)
-        mask = batch["mask"].to(self.device, non_blocking=True)
-        output = self.model(image, mask)
-        return elbo_loss(
-            output.logits, mask, output.posterior, output.prior, beta=self.config.loss.beta
-        )
-
-    def _selection_head_step(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        """One placeholder training step. **Stage 3 scaffolding, not an objective.**
-
-        Stage 4 replaces this entirely with: draw ``K`` prior candidates per image, score
-        each against the soft consensus, and regress the head's prediction onto that score
-        under a Huber loss. None of that is here -- there is no consensus, no sampling and
-        no target.
-
-        What is here, and why it is not simply a no-op: the objective drives the scorer's
-        output toward zero, which is meaningless but produces **real gradients and real
-        optimizer steps on the head**. A literal no-op would leave every parameter
-        untouched, and then "the base did not move" would be indistinguishable from
-        "nothing moved at all" -- the freeze check would pass vacuously. This way the
-        epoch-boundary fingerprint comparison is a live test: the scorer must change and
-        the base must not.
-
-        The candidate is a zeros mask, shape-correct filler standing in for the sampled
-        candidates Stage 4 supplies. It is deliberately **not** a grader mask: feeding
-        ground truth here would look like a design decision rather than a placeholder.
-
-        Args:
-            batch: A training batch carrying ``image``.
-
-        Returns:
-            The placeholder loss under ``total``, plus the mean predicted score.
-        """
-        image = batch["image"].to(self.device, non_blocking=True)
-        # encode_base is @torch.no_grad and the base is frozen: no path to the base.
-        features = self.head.encode_base(image)
-        candidate = torch.zeros(
-            image.shape[0], *image.shape[-2:], dtype=torch.uint8, device=self.device
-        )
-        scores = self.head(features, candidate)
-        return {"total": scores.pow(2).mean(), "score_mean": scores.mean().detach()}
-
-    @property
     def _latent_cadences_align(self) -> bool:
         """Whether every diagnostics epoch is also a validation epoch.
 
@@ -802,11 +732,24 @@ class Trainer:
             f"run dir       : {self.run_dir}",
         ]
         if self.head is not None:
-            lines.insert(
-                2,
-                "head          : STAGE 3 SCAFFOLD -- placeholder objective, no scoring "
-                "target, no best.pt",
-            )
+            # Describe the objective ACTUALLY IN USE. This banner is written into
+            # config.resolved.yaml and the run log, both of which the report cites, so a
+            # stale line here becomes a false claim in the write-up. It was stale once
+            # already -- and, worse, it was *correct* at the time, because a duplicate
+            # method definition had silently shadowed the real objective.
+            counts = self.head.parameter_counts()
+            head_config = self.config.head
+            lines[2:2] = [
+                f"head objective: Huber(delta={head_config.huber_delta}) regression onto "
+                "soft-consensus Dice",
+                f"head candidates: {head_config.train_samples} train / "
+                f"{head_config.eval_samples} eval (prior), eval seed {head_config.eval_seed}"
+                + ("  [MEAN-CENTERED targets]" if head_config.mean_centered_targets else ""),
+                f"head parameters: {counts['scorer']:,} scorer + "
+                f"{counts['area_baseline']:,} area control "
+                f"= {counts['scorer'] + counts['area_baseline']:,} trainable",
+                f"frozen base    : {counts['base']:,} parameters",
+            ]
 
         if estimate_runtime:
             seconds_per_epoch = self.estimate_seconds_per_epoch()

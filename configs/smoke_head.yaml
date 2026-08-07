@@ -1,25 +1,23 @@
 # HEAD SMOKE TEST -- run this on the TRAINING MACHINE before the real head run.
 #
-#   python scripts/train.py --config configs/smoke_head.yaml \
-#       --base-checkpoint runs/baseline/checkpoints/best.pt
+# Run it through the GATE SCRIPT, which prints PASS/FAIL per criterion and exits non-zero:
+#
+#   python scripts/head_smoke_gate.py --base-checkpoint runs/baseline/checkpoints/best.pt
+#
+# (Running scripts/train.py --config configs/smoke_head.yaml also works, but then the
+# criteria have to be read off the log by eye, which is how a failure gets skimmed past.)
 #
 # WHY THIS EXISTS AS A SEPARATE GATE. Passing on macOS/MPS says nothing about CUDA: the
 # head's paths differ by backend, and two MPS-only bugs in the Spearman path were found by
 # running it rather than by the CPU test suite (float64 ranks are unavailable on MPS, and
 # the bucket selector then has to follow the ranks to the CPU). CUDA has its own kernel
-# coverage, so the same class of failure can appear there and nowhere else. A few seconds
-# here beats discovering it at the end of epoch 1 of a real run.
+# coverage, so the same class of failure can appear there and nowhere else.
 #
-# WHAT A PASS LOOKS LIKE -- check all five, they are cheap:
-#   1. It completes without raising.
-#   2. "froze base ... 0 trainable" appears, and no best.pt problem is logged.
-#   3. train/total DECREASES across the four epochs. If it is unstable, drop optim.lr to
-#      3e-4 and RECORD that (configs/extension.yaml says so too).
-#   4. val/selected_consensus_dice, val/oracle_consensus_dice and val/ceiling are all
-#      FINITE and satisfy selected <= oracle <= ceiling.
-#   5. val/spearman is finite, and val/spearman_excluded_fraction is < 1.0 -- if it is
-#      exactly 1.0 the Spearman path never ran on a non-degenerate image and this gate
-#      proved nothing about it.
+# THE CHECK THAT MATTERS MOST IS SPEARMAN, NOT THE LOSS. A collapsing training loss is
+# consistent with the head learning, and equally consistent with it predicting each image's
+# MEAN target -- which gives a near-zero Huber loss and zero ranking ability. That is the
+# image-only shortcut (FINDINGS 4.4) and the loss curve cannot tell the two apart. The gate
+# also prints the area-only control beside the head for the same reason.
 #
 # It uses the REAL architecture and the REAL dataset on a handful of batches; only the
 # batch counts are small. Everything else matches configs/extension.yaml.

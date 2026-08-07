@@ -5,13 +5,29 @@
 # four graders, and regress the head's prediction onto that score.
 #
 #   python scripts/train.py --config configs/extension.yaml \
-#       --base-checkpoint runs/modernized/checkpoints/best.pt
+#       --base-checkpoint runs/baseline/checkpoints/best.pt
 #
 # The base must be frozen because the claim is "distribution metrics unchanged,
 # single-sample quality improved". A base that kept training would change GED too, and
 # the result would look like the extension working when it was just more training.
 #
-# Per CLAUDE.md the head attaches to the MODERNIZED model, not the raw baseline.
+# WHICH BASE -- CHANGED, and the reason is on record. CLAUDE.md originally specified the
+# MODERNIZED (Phase 2) model. The reported head run uses the **Phase 1 baseline** instead,
+# because Phase 1 is the checkpoint whose consensus headroom was actually measured:
+# aggregate 0.2895, random 0.2349 -> oracle 0.5244 (FINDINGS 4.4). Fitting the head to a
+# base whose headroom is known is what makes "the head captured X% of the gap" a statement
+# about the head rather than about an unmeasured base.
+#
+# There is a second reason, from FINDINGS 2.11: Phase 2 SHARPENED the sample distribution
+# rather than broadening it, and its per-bucket GED regressed on over half the dataset
+# (2.12). A selection head has less to select between on a more concentrated sample set, so
+# the Phase 1 base is also the more informative one to demonstrate the head on.
+#
+# Head-on-Phase2 becomes a LATER ABLATION, run with identical settings and compared through
+# scripts/compare.py, which REFUSES mismatched arms (probunet/extension/ablation.py).
+#
+# BEFORE THE REAL RUN, on the training machine:
+#   python scripts/head_smoke_gate.py --base-checkpoint runs/baseline/checkpoints/best.pt
 #
 # SCORING TARGET -- DECIDED (2026-08-06): SOFT CONSENSUS.
 #   c = (1/4) * sum_k m_k, each pixel in {0, 0.25, 0.5, 0.75, 1.0} = the fraction of
