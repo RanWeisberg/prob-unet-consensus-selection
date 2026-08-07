@@ -68,6 +68,7 @@ from probunet.evaluation.headroom import (  # noqa: E402
     render,
     render_selection,
 )
+from probunet.extension.ablation import assert_not_a_smoke_run  # noqa: E402
 from probunet.extension.head import SelectionHead  # noqa: E402
 from probunet.evaluation.sampling import DEFAULT_EVAL_SEED  # noqa: E402
 from probunet.model.prob_unet import ProbUNet  # noqa: E402
@@ -129,6 +130,8 @@ def main() -> None:
     state = None
     if arguments.head_checkpoint is not None:
         state = load_checkpoint(arguments.head_checkpoint)
+        # A smoke/gate checkpoint must never reach a results table.
+        assert_not_a_smoke_run(state.config, arguments.head_checkpoint)
         config = ExperimentConfig.from_dict(state.config)
     elif arguments.config is not None:
         config = ExperimentConfig.from_yaml(arguments.config)

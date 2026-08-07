@@ -34,6 +34,7 @@ from probunet.extension.ablation import (  # noqa: E402
     VARYING_FIELD,
     ablation_signature,
     assert_comparable,
+    assert_not_a_smoke_run,
 )
 from probunet.training.checkpoint import load_checkpoint  # noqa: E402
 from probunet.evaluation.sampling import (  # noqa: E402
@@ -186,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
     covariance = {}
     for name, path in args.checkpoint:
         config = load_checkpoint(path).config
+        assert_not_a_smoke_run(config, path)
         if config.get("train", {}).get("mode") == "selection_head":
             signatures[name] = ablation_signature(config)
             covariance[name] = config.get("model", {}).get("latent_covariance")

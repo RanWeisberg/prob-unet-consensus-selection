@@ -54,6 +54,36 @@ VARYING_FIELD = "model.latent_covariance"
 """The one field the ablation is about, reported rather than enforced."""
 
 
+SMOKE_RUN_PREFIXES: tuple[str, ...] = ("smoke",)
+"""Run-name prefixes that mark a gate or plumbing run, never a reportable result."""
+
+
+def assert_not_a_smoke_run(config: dict[str, Any], path: object) -> None:
+    """Refuse a checkpoint produced by a smoke or gate run.
+
+    A smoke run writes a ``best.pt`` under a legitimate-looking monitor name, and once it
+    is sitting in ``runs/`` there is nothing about the file itself that says it came from
+    four epochs on eight batches. One such checkpoint was produced by the Stage 3
+    placeholder objective before that bug was found, which is exactly the artifact this
+    stops being quoted.
+
+    Args:
+        config: The checkpoint's resolved config mapping.
+        path: The checkpoint path, for the error message.
+
+    Raises:
+        ValueError: If the run name marks it as a smoke run.
+    """
+    name = str(config.get("run", {}).get("name", ""))
+    if name.startswith(SMOKE_RUN_PREFIXES):
+        raise ValueError(
+            f"REFUSING to use {path}: it was produced by run '{name}', a smoke/gate run. "
+            "Those train for a few epochs on a handful of batches and exist only to "
+            "exercise the plumbing; their best.pt is not a result. Delete it or point at "
+            "a real run's checkpoint."
+        )
+
+
 def _lookup(config: dict[str, Any], path: str) -> Any:
     """Read a dotted path out of a config dict.
 

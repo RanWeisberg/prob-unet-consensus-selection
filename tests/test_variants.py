@@ -1378,3 +1378,53 @@ def test_no_method_is_defined_twice_in_the_trainer() -> None:
         ]
         duplicates = {name for name in names if names.count(name) > 1}
         assert not duplicates, f"{node.name} defines {sorted(duplicates)} more than once"
+
+
+def test_smoke_checkpoints_are_refused_as_results() -> None:
+    """A gate run's best.pt must never reach a results table.
+
+    It is written under a legitimate-looking monitor name, and once it sits in ``runs/``
+    nothing about the file says it came from four epochs on eight batches. One such
+    checkpoint was produced by the Stage 3 placeholder objective before that bug was found.
+    """
+    from probunet.extension.ablation import assert_not_a_smoke_run
+
+    for name in ("smoke", "smoke_head", "smoke_full_cov"):
+        with pytest.raises(ValueError, match="REFUSING"):
+            assert_not_a_smoke_run({"run": {"name": name}}, "runs/x/best.pt")
+    for name in ("baseline", "modernized", "extension", "baseline-short"):
+        assert_not_a_smoke_run({"run": {"name": name}}, "runs/x/best.pt")
+
+
+def test_the_gate_refuses_a_missing_base_rather_than_substituting_one() -> None:
+    """A gate that invented its own base could not detect what it exists to detect."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "head_smoke_gate", REPO_ROOT / "scripts" / "head_smoke_gate.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    with pytest.raises(FileNotFoundError, match="REFUSING to run"):
+        module.run_gate(Path("runs/definitely/not/here.pt"), None, None)
+
+
+def test_the_gate_reports_skips_not_passes_when_behavioural_criteria_are_absent() -> None:
+    """PLUMBING ONLY must be unmistakable, and must not read as a pass."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "head_smoke_gate", REPO_ROOT / "scripts" / "head_smoke_gate.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    verdict = module.Verdict()
+    verdict.check(True, "1 completes", "ok")
+    verdict.skip("4 scores in band", "stand-in base")
+    text = verdict.render(behavioural=False)
+
+    assert "PLUMBING ONLY - BEHAVIOURAL CRITERIA SKIPPED" in text
+    assert "GATE PASSED" not in text, "a plumbing run must not read as a passing gate"
+    assert verdict.skipped and not verdict.failed

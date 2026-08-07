@@ -1,11 +1,19 @@
 # HEAD SMOKE TEST -- run this on the TRAINING MACHINE before the real head run.
 #
-# Run it through the GATE SCRIPT, which prints PASS/FAIL per criterion and exits non-zero:
+# ALWAYS run it through the GATE SCRIPT, which prints PASS/FAIL/SKIP per criterion, exits
+# non-zero on failure, and writes to a TEMP DIRECTORY so it leaves no checkpoint behind:
 #
-#   python scripts/head_smoke_gate.py --base-checkpoint runs/baseline/checkpoints/best.pt
+#   python scripts/head_smoke_gate.py \
+#       --base-checkpoint runs/baseline/checkpoints/best.pt --require-behavioural
 #
-# (Running scripts/train.py --config configs/smoke_head.yaml also works, but then the
-# criteria have to be read off the log by eye, which is how a failure gets skimmed past.)
+# DO NOT run this config through scripts/train.py. It works, but it writes
+# runs/smoke_head/checkpoints/best.pt under a legitimate-looking monitor name, and a
+# four-epoch eight-batch checkpoint sitting in runs/ can later be mistaken for a real head
+# result. If you already have one, DELETE IT. scripts/compare.py and the selection table
+# both refuse checkpoints whose run name starts with "smoke", but deleting is better.
+#
+# --require-behavioural exits 2 if the behavioural criteria were skipped, which is what you
+# want on the training machine: there, a PLUMBING ONLY result means the gate did not run.
 #
 # WHY THIS EXISTS AS A SEPARATE GATE. Passing on macOS/MPS says nothing about CUDA: the
 # head's paths differ by backend, and two MPS-only bugs in the Spearman path were found by
