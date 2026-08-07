@@ -30,7 +30,9 @@ want. A mask-area-only regressor is kept as a diagnostic baseline instead (Stage
 from __future__ import annotations
 
 import itertools
+import logging
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor, nn
@@ -38,6 +40,13 @@ from torch import Tensor, nn
 from probunet.model.prob_unet import ProbUNet
 from probunet.training.diagnostics import logits_to_mask, reparameterize
 from probunet.training.freeze import assert_frozen, freeze_module
+
+if TYPE_CHECKING:  # import-only: config imports model, so this would cycle at runtime
+    from pathlib import Path
+
+    from probunet.training.config import ExperimentConfig
+
+LOGGER = logging.getLogger(__name__)
 
 DEFAULT_SCORER_CHANNELS: tuple[int, ...] = (32, 64, 128)
 """Width of each strided convolution in the scorer tower.
@@ -410,3 +419,64 @@ class SelectionHead(nn.Module):
             "area_baseline": area,
             "total": base + scorer + area,
         }
+
+def load_selection_head(
+    checkpoint: "Path",
+    config: "ExperimentConfig",
+    device: torch.device,
+    log_provenance: bool = True,
+) -> SelectionHead:
+    """Build a :class:`SelectionHead` and fill it from a trained head checkpoint.
+
+    **The single construction path**, used by ``evaluation.runner.load_variant``, by
+    ``scripts/consensus_headroom.py`` and by anything else that needs a trained head. It is
+    one function rather than three call sites because two copies of a construction path is
+    precisely how a shadowed duplicate arose earlier in this phase.
+
+    The load is **strict**. A head checkpoint's keys are ``base.*`` plus ``scorer.*`` and
+    ``area_baseline.*``; loading it into a bare ``ProbUNet`` fails on every key, which is
+    how this gap was found. Relaxing strictness to make that "work" would be far worse:
+    a scorer weight quietly failing to load produces a plausible-looking but meaningless
+    selection number, which is the failure mode of the last several bugs in this phase.
+
+    Args:
+        checkpoint: Path to the head checkpoint.
+        config: The configuration recorded in that checkpoint.
+        device: Device to place the head on.
+        log_provenance: Log which frozen base produced this head. On by default: an
+            evaluation should state its base rather than leave it to be looked up.
+
+    Returns:
+        The loaded head, in ``eval()`` mode with its base asserted frozen.
+    """
+    from probunet.training.checkpoint import load_checkpoint
+
+    base = ProbUNet(config.model).to(device)
+    head = SelectionHead(base, channels=config.head.scorer_channels).to(device)
+    state = load_checkpoint(checkpoint, model=head, map_location=device, restore_rng=False)
+    head.eval()
+    # The freeze is a property of the artifact, so re-assert it on load rather than
+    # trusting that it held when the checkpoint was written.
+    head.assert_base_frozen()
+
+    if log_provenance:
+        provenance = state.base_provenance
+        if provenance:
+            LOGGER.info(
+                "head from %s | frozen base: %s (epoch %s, git %s, %s, torch %s), "
+                "base sha256 %s",
+                checkpoint,
+                provenance.get("checkpoint"),
+                provenance.get("epoch"),
+                provenance.get("git_revision"),
+                provenance.get("device"),
+                provenance.get("torch_version"),
+                str(provenance.get("parameter_sha256", ""))[:12],
+            )
+        else:
+            LOGGER.warning(
+                "head checkpoint %s carries no base_provenance: it predates that field, so "
+                "which base produced it cannot be verified from the artifact",
+                checkpoint,
+            )
+    return head

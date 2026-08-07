@@ -69,7 +69,7 @@ from probunet.evaluation.headroom import (  # noqa: E402
     render_selection,
 )
 from probunet.extension.ablation import assert_not_a_smoke_run  # noqa: E402
-from probunet.extension.head import SelectionHead  # noqa: E402
+from probunet.extension.head import load_selection_head  # noqa: E402
 from probunet.evaluation.sampling import DEFAULT_EVAL_SEED  # noqa: E402
 from probunet.model.prob_unet import ProbUNet  # noqa: E402
 from probunet.training.checkpoint import load_checkpoint  # noqa: E402
@@ -146,11 +146,8 @@ def main() -> None:
 
     freeze_record = None
     if arguments.head_checkpoint is not None:
-        base = ProbUNet(config.model).to(device)
-        head = SelectionHead(base, channels=config.head.scorer_channels).to(device)
-        load_checkpoint(arguments.head_checkpoint, model=head, map_location=device)
-        head.eval()
-        head.assert_base_frozen()
+        # The single construction path, shared with evaluation.runner.load_variant.
+        head = load_selection_head(arguments.head_checkpoint, config, device)
         freeze_record = dict(head.freeze_record)
         samples = arguments.samples or config.head.eval_samples
         seed = config.head.eval_seed

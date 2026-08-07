@@ -496,6 +496,42 @@ distribution; if the head overfits, this is the first thing to revisit.
 
 ---
 
+## 14. The head's headline number is the metric its checkpoint was selected on
+
+`configs/extension.yaml` monitors `val/selected_consensus_dice` and keeps the best
+checkpoint by it across 30 epochs. **That same metric is then the reported result.** The
+number is therefore the maximum of 30 draws of a noisy quantity, not an unbiased estimate of
+it -- classic selection-on-validation optimism.
+
+**Why it is set up this way, and why that is still right.** Monitoring the deliverable was a
+deliberate Stage 4 choice: a proxy metric can be gamed by a constant predictor, whereas the
+selected-sample score cannot (a constant score degenerates to a fixed arbitrary pick and
+lands near random). The alternative -- selecting on the Huber loss -- would have been worse,
+because a low loss is compatible with zero ranking ability (FINDINGS 4.5). So the setup
+stands; the *caveat* is what must be reported.
+
+**Size of the effect.** With validation over 3021 patches the per-epoch noise is small, so
+the optimism is expected to be a fraction of a percent -- far too small to explain the
+0.49404 result being 89.5% of measured headroom against a 30–36% expectation (FINDINGS 4.5).
+It is recorded because it is real and cheap to state, not because it explains anything.
+
+**The clean figure, and it must be run exactly once.** The **test** split (3019 patches) has
+never been touched by checkpoint selection, so the test-split
+`selected_consensus_dice` is the unbiased number. Run it **once**, at the end, and report it
+as the headline with the validation figure beside it:
+
+```
+python scripts/consensus_headroom.py \
+    --head-checkpoint runs/selection-head/checkpoints/best.pt --split test \
+    --out results/consensus_selection_test.json
+```
+
+CLAUDE.md's rule holds: test is touched once. Do not iterate against it, and do not re-run
+it after a change to the head -- that would convert it into a second validation split and
+lose the only clean number the project has.
+
+---
+
 ## Non-deviations worth recording
 
 Things that *look* like they could differ but were checked and match:

@@ -20,7 +20,12 @@ from probunet.model.prob_unet import ProbUNet
 from probunet.training.checkpoint import CheckpointState, load_checkpoint
 from probunet.training.config import ExperimentConfig
 from probunet.utils.runtime import git_revision
-from probunet.variants import ProbUNetVariant, SegmentationVariant
+from probunet.extension.head import load_selection_head
+from probunet.variants import (
+    ProbUNetVariant,
+    SegmentationVariant,
+    SelectionHeadVariant,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -45,7 +50,11 @@ def load_variant(
         seed: Seed for sampling noise; defaults to the run seed.
 
     Returns:
-        A ``(variant, config, state)`` triple.
+        A ``(variant, config, state)`` triple. For a ``selection_head`` checkpoint the
+        variant is a :class:`~probunet.variants.SelectionHeadVariant`, whose ``select``
+        returns an index; otherwise it is a plain
+        :class:`~probunet.variants.ProbUNetVariant`, whose ``select`` returns None. That is
+        the one variant-dependent branch evaluation needs.
     """
     state = load_checkpoint(checkpoint, restore_rng=False)
     config = ExperimentConfig.from_dict(state.config)
@@ -54,13 +63,25 @@ def load_variant(
             config, data=dataclasses.replace(config.data, batch_size=batch_size)
         )
 
-    model = ProbUNet(config.model).to(device)
-    load_checkpoint(checkpoint, model=model, map_location=device, restore_rng=False)
-    model.eval()
-
     generator = torch.Generator().manual_seed(
         config.run.seed if seed is None else seed
     )
+
+    # Dispatch on the RECORDED CONFIG, never by sniffing the state_dict for base.-prefixed
+    # keys. Key sniffing is the kind of heuristic that silently does the wrong thing on a
+    # near-miss -- a partially-renamed checkpoint, a future wrapper -- and "silently does
+    # the wrong thing" is the failure mode this phase has hit repeatedly. The config says
+    # what the run was; believe it.
+    if config.train.mode == "selection_head":
+        head = load_selection_head(checkpoint, config, device)
+        variant = SelectionHeadVariant(
+            head, name=name or config.run.name, generator=generator
+        )
+        return variant, config, state
+
+    model = ProbUNet(config.model).to(device)
+    load_checkpoint(checkpoint, model=model, map_location=device, restore_rng=False)
+    model.eval()
     variant = ProbUNetVariant(
         model, name=name or config.run.name, generator=generator
     )

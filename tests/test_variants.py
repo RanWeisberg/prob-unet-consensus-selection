@@ -1428,3 +1428,196 @@ def test_the_gate_reports_skips_not_passes_when_behavioural_criteria_are_absent(
     assert "PLUMBING ONLY - BEHAVIOURAL CRITERIA SKIPPED" in text
     assert "GATE PASSED" not in text, "a plumbing run must not read as a passing gate"
     assert verdict.skipped and not verdict.failed
+
+
+# --------------------------------------------------------------------------- #
+# Loading a trained head back, and the validation leak audit
+# --------------------------------------------------------------------------- #
+def test_a_trained_head_round_trips_through_the_evaluation_entry_point(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """END TO END: train a head, save it, load it the way evaluate.py does, select with it.
+
+    This is the test that was missing. ``load_variant`` built a bare ``ProbUNet`` and
+    strict-loaded, so a head checkpoint -- whose keys are ``base.*`` plus ``scorer.*`` and
+    ``area_baseline.*`` -- failed on every key. A key-presence test would not have caught
+    it, and neither would anything that stopped short of the real entry point: the head was
+    built, trained and saved correctly, and only the *reader* was missing.
+
+    So this goes through ``load_variant`` itself, and then asserts the loaded scorer weights
+    equal the saved ones -- because a strict load that silently dropped the scorer would
+    still produce a variant that selects, and would produce a plausible meaningless number.
+    """
+    from probunet.evaluation.runner import load_variant
+
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+    trainer.train_epoch(0)
+    trainer._checkpoint(0, {"val/selected_consensus_dice": 0.5})
+
+    head_path = trainer.checkpoint_dir / "last.pt"
+    saved_scorer = {
+        name: parameter.detach().clone()
+        for name, parameter in trainer.head.scorer.named_parameters()
+    }
+    saved_area = {
+        name: parameter.detach().clone()
+        for name, parameter in trainer.head.area_baseline.named_parameters()
+    }
+
+    variant, loaded_config, state = load_variant(head_path, torch.device("cpu"))
+
+    # Dispatched on the recorded config, and it is the selecting variant.
+    assert loaded_config.train.mode == "selection_head"
+    assert isinstance(variant, SelectionHeadVariant)
+    assert isinstance(variant, SegmentationVariant)
+
+    # The weights really arrived -- not merely "a model was constructed".
+    for name, parameter in variant.head.scorer.named_parameters():
+        assert torch.equal(parameter.detach(), saved_scorer[name]), f"scorer.{name} drifted"
+    for name, parameter in variant.head.area_baseline.named_parameters():
+        assert torch.equal(parameter.detach(), saved_area[name]), f"area.{name} drifted"
+
+    # And it can actually do the job.
+    image = torch.rand(2, 1, SIZE, SIZE)
+    samples = variant.sample(image, 4)
+    chosen = variant.select(samples, image)
+    assert chosen.shape == (2,)
+    assert bool(((chosen >= 0) & (chosen < 4)).all())
+
+    # The base it was frozen on is stated by the artifact.
+    assert state.base_provenance is not None
+    assert state.base_provenance["parameter_sha256"]
+
+
+def test_a_plain_checkpoint_still_loads_as_a_non_selecting_variant(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """The elbo branch is unchanged: dispatch must not capture ordinary checkpoints."""
+    from probunet.evaluation.runner import load_variant
+
+    checkpoint, _ = base_checkpoint_for(tiny_experiment, tmp_path)
+    variant, config, _ = load_variant(checkpoint, torch.device("cpu"))
+    assert config.train.mode == "elbo"
+    assert isinstance(variant, ProbUNetVariant)
+    assert not isinstance(variant, SelectionHeadVariant)
+    image = torch.rand(2, 1, SIZE, SIZE)
+    assert variant.select(variant.sample(image, 3), image) is None
+
+
+def test_validation_candidates_come_from_the_prior(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """LEAK AUDIT: the posterior must not be reachable during VALIDATION either.
+
+    Stage 4 asserted prior-only for training with a hooked posterior net. Validation is a
+    separate code path and was never covered by that assertion; this closes it. A posterior
+    candidate has seen the ground-truth mask, so a validation score computed from one would
+    be optimistic in a way no downstream check would reveal.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+
+    calls = {"n": 0}
+    handle = trainer.head.base.posterior_net.register_forward_hook(
+        lambda *_: calls.__setitem__("n", calls["n"] + 1)
+    )
+    try:
+        trainer.validate()
+    finally:
+        handle.remove()
+    assert calls["n"] == 0, "the posterior net was invoked during validation"
+
+
+def test_the_selected_sample_is_chosen_by_the_HEAD_not_by_the_truth(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """LEAK AUDIT: ``selected`` must come from PREDICTED scores, never the true ones.
+
+    If the argmax were taken over the true soft-consensus scores, ``selected`` would equal
+    ``oracle`` exactly and the reported number would be the oracle wearing the head's name.
+
+    Forced by construction: the candidates are replaced with a set whose true scores are
+    known and DISTINCT -- candidate 0 reproduces a grader mask exactly, the rest are empty
+    -- and the scorer is replaced with one that always ranks the last candidate first. The
+    truth then says "pick 0" and the head says "pick the last", so ``selected`` and
+    ``oracle`` must differ. Constructing the candidates matters: an untrained tiny model
+    emits all-empty candidates that score 0.0 alike, and the assertion would pass on a
+    degeneracy rather than on the property.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+
+    def staged(image, n_samples, generator=None):
+        """Candidate 0 is a perfect grader match; the rest are empty."""
+        batch = image.shape[0]
+        candidates = torch.zeros(
+            batch, n_samples, SIZE, SIZE, dtype=torch.uint8, device=image.device
+        )
+        # Grader 0's mask for each image, which scores well against the consensus.
+        graders = staged.graders
+        candidates[:, 0] = graders[:, 0]
+        return trainer.head.encode_base(image), candidates
+
+    class PrefersLast(torch.nn.Module):
+        """A scorer whose ranking is fixed, and deliberately wrong."""
+
+        def forward(self, features: torch.Tensor, candidate: torch.Tensor) -> torch.Tensor:
+            """Rank later candidates higher, regardless of content."""
+            self.calls = getattr(self, "calls", 0) + 1
+            return torch.full((features.shape[0],), float(self.calls))
+
+    # Capture the graders of each batch so the staged candidates can match them.
+    original_scores = trainer.validate
+    batch = next(iter(trainer.data.loaders["val"]))
+    staged.graders = batch["masks"].to(trainer.device)
+
+    trainer.head.sample_candidates = staged
+    trainer.head.scorer = PrefersLast()
+    trainer.config = dataclasses.replace(
+        config, train=dataclasses.replace(config.train, limit_val_batches=1)
+    )
+    metrics = trainer.validate()
+
+    # The oracle found candidate 0; the head was forced onto an empty one.
+    assert metrics["oracle_consensus_dice"] > 0.0, "the staged candidates are degenerate"
+    assert metrics["selected_consensus_dice"] < metrics["oracle_consensus_dice"], (
+        "selected tracked oracle: the choice is being made with the ground truth"
+    )
+    assert metrics["selected_consensus_dice"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_validation_uses_the_val_split_and_the_eval_candidate_count(
+    tiny_experiment: ExperimentConfig, tmp_path: Path
+) -> None:
+    """LEAK AUDIT: held-out split, and eval_samples rather than train_samples.
+
+    A different candidate count would change what the oracle should be compared against,
+    so the count the run actually used has to be the configured evaluation one.
+    """
+    checkpoint, config = base_checkpoint_for(tiny_experiment, tmp_path)
+    config = dataclasses.replace(
+        config,
+        head=dataclasses.replace(config.head, train_samples=2, eval_samples=5),
+        train=dataclasses.replace(config.train, limit_val_batches=None),
+    )
+    trainer = Trainer(config, base_checkpoint=checkpoint)
+
+    seen = {"n": 0, "counts": set()}
+    original = trainer.head.sample_candidates
+
+    def watched(image, n_samples, generator=None):
+        """Record the candidate count and image total each call."""
+        seen["counts"].add(n_samples)
+        seen["n"] += image.shape[0]
+        return original(image, n_samples, generator)
+
+    trainer.head.sample_candidates = watched
+    trainer.validate()
+
+    assert seen["counts"] == {5}, f"validation used {seen['counts']} candidates, not eval_samples"
+    assert seen["n"] == len(trainer.data.datasets["val"]), "not the whole held-out val split"
+    # And the val split is disjoint from what the head trained on.
+    train_indices = set(trainer.data.datasets["train"].indices.tolist())
+    val_indices = set(trainer.data.datasets["val"].indices.tolist())
+    assert train_indices.isdisjoint(val_indices)
