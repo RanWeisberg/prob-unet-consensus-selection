@@ -279,57 +279,122 @@ def _stat(row: dict[str, Any], key: str, field: str = "mean") -> float:
     return float("nan") if value is None else float(value)
 
 
-def render_selection(report: dict[str, Any]) -> str:
-    """Render the Stage 5 selection table.
+SELECTION_COLUMNS: tuple[tuple[str, str, str, str], ...] = (
+    # (header, report key, format, legend -- empty legend means self-explanatory)
+    ("random", "random", "8.4f", ""),
+    ("area", "area_only", "8.4f", "the size-prior control: sees candidate area, never the image"),
+    ("head", "head", "8.4f", ""),
+    ("oracle", "oracle", "8.4f", ""),
+    ("ceil", "ceiling", "7.4f", "best any binary mask could score; NEVER report against 1.0"),
+    ("edge", "head_edge_over_area", "+8.4f",
+     "head - area. THE HEADLINE: the head's contribution beyond a size prior"),
+    ("e/tot", "head_edge_frac_of_total_headroom", "7.1%",
+     "edge as a fraction of TOTAL headroom (oracle - random)"),
+    ("e/left", "head_edge_frac_of_headroom_area_left", "7.1%",
+     "edge as a fraction of the headroom the AREA CONTROL LEFT (oracle - area). e/tot and "
+     "e/left trend in OPPOSITE directions across buckets; report both, claim neither"),
+    ("allmt", "all_candidates_empty_fraction", "7.3f",
+     "fraction of images where EVERY candidate was empty. Those score 0 under every rule "
+     "and are a hard cap on any selector"),
+    ("orc|off", "oracle_where_offered", "8.4f",
+     "oracle over ONLY the images where the sampler offered a non-empty candidate -- "
+     "separates 'offered nothing' from 'offered something poorly located'"),
+    ("lrgst", "area_picks_largest", "7.3f",
+     "fraction of images where the area control picked the LARGEST-area candidate. 1.000 "
+     "means it reduced to that deterministic rule ON THIS CANDIDATE SET"),
+)
+"""Columns of the main selection table, with the legend text each one owns."""
 
-    The ``gap`` column -- the fraction of the oracle-minus-random headroom captured -- is
-    the one to lead with: it is scale-free across buckets whose ceilings run 0.40 to 0.89,
-    so it is the only column comparable between rows. ``area`` sits immediately beside
-    ``head`` on purpose: if the head barely beats its size-prior control, it learned area
-    rather than spatial agreement, and adjacency makes that impossible to miss.
+RANKING_COLUMNS: tuple[tuple[str, str, str, str], ...] = (
+    ("rho_h", "head_spearman", "8.3f", "head rank correlation with the true scores"),
+    ("rho_a", "area_spearman", "8.3f",
+     "the same for the area control. rho_h - rho_a is the head's incremental RANKING "
+     "ability; if rho_a is high, most of the ranking signal in this task is size"),
+    ("excl_h", "head_spearman_excluded_fraction", "8.3f",
+     "fraction of images excluded as degenerate (all candidates tied), counted not dropped"),
+    ("excl_a", "area_spearman_excluded_fraction", "8.3f", ""),
+    ("pr_mean", "pred_mean", "9.4f", "mean predicted score"),
+    ("pr_std", "pred_std_within_image", "8.4f",
+     "WITHIN-IMAGE spread of the head's predicted scores. Near zero means the scores are "
+     "nearly constant and candidate ORDER is doing the selection rather than the head"),
+    ("pr_rng", "pred_spread_within_image", "8.4f", "within-image max - min"),
+    ("pr_chos", "pred_of_chosen", "9.4f", "predicted score of the candidate actually chosen"),
+)
+"""Columns of the ranking / score-distribution table."""
+
+
+def _stat(row: dict[str, Any], key: str, field: str = "mean") -> float:
+    """Read a summary statistic, tolerating an absent column or an all-degenerate one.
+
+    ``summarize`` returns ``None`` for every statistic when no finite value survived --
+    which happens for a Spearman column whose images were all degenerate -- and ``None``
+    cannot be formatted as a float.
+
+    Args:
+        row: One bucket's report row.
+        key: Column name.
+        field: Statistic within that column's summary.
+
+    Returns:
+        The value, or NaN when absent or undefined.
+    """
+    value = row.get(key)
+    if isinstance(value, dict):
+        value = value.get(field)
+    return float("nan") if value is None else float(value)
+
+
+def _render_block(
+    report: dict[str, Any], columns: tuple[tuple[str, str, str, str], ...], title: str
+) -> list[str]:
+    """Render one table block plus the legend for the columns it actually prints.
+
+    The legend is generated **from the same tuple that generates the columns**, so a
+    legend can never describe output that is not produced. That mismatch happened once
+    here -- ``orc|off`` was documented after it had been dropped from the header -- and it
+    is the same class as a config documenting an invocation that could not work.
+
+    Args:
+        report: Output of :func:`per_bucket`.
+        columns: Column specifications.
+        title: Block heading.
+
+    Returns:
+        The block's lines.
+    """
+    header = f"{title:<11}{'n':>5}" + "".join(
+        f"{name:>{spec.lstrip('+').split('.')[0]}}" for name, _, spec, _ in columns
+    )
+    lines = [header, "-" * len(header)]
+    for label, row in report.items():
+        cells = []
+        for _, key, spec, _ in columns:
+            value = _stat(row, key)
+            if spec.endswith("%"):
+                width, precision = spec[:-1].split(".")
+                cells.append(f"{100 * value:>{width}.{precision}f}")
+            else:
+                cells.append(f"{value:>{spec}}")
+        lines.append(f"{label:<11}{row['n']:>5}" + "".join(cells))
+    legend = [f"  {name:<8}= {text}" for name, _, _, text in columns if text]
+    return lines + ([""] + legend if legend else [])
+
+
+def render_selection(report: dict[str, Any]) -> str:
+    """Render the Stage 5 selection table as two blocks.
+
+    Split in two because thirteen columns on one line is unreadable, and the two blocks
+    answer different questions: the first is *how well does each rule select*, the second
+    is *is the head actually ranking, or are its scores nearly constant*.
 
     Args:
         report: Output of :func:`per_bucket` over :func:`measure_selection`.
 
     Returns:
-        A plain-text table.
+        A plain-text report.
     """
-    header = (
-        f"{'bucket':<11}{'n':>5}{'random':>8}{'area':>8}{'head':>8}{'oracle':>8}"
-        f"{'ceil':>7}{'edge':>8}{'e/tot':>7}{'e/left':>7}"
-        f"{'rho_h':>7}{'rho_a':>7}{'allmt':>7}{'lrgst':>7}"
-    )
-    lines = [header, "-" * len(header)]
-    for label, row in report.items():
-        lines.append(
-            f"{label:<11}{row['n']:>5}"
-            f"{_stat(row, 'random'):>8.4f}{_stat(row, 'area_only'):>8.4f}"
-            f"{_stat(row, 'head'):>8.4f}{_stat(row, 'oracle'):>8.4f}"
-            f"{_stat(row, 'ceiling'):>7.4f}"
-            f"{_stat(row, 'head_edge_over_area'):>+8.4f}"
-            f"{100 * _stat(row, 'head_edge_frac_of_total_headroom'):>7.1f}"
-            f"{100 * _stat(row, 'head_edge_frac_of_headroom_area_left'):>7.1f}"
-            f"{_stat(row, 'head_spearman'):>7.3f}"
-            f"{_stat(row, 'area_spearman'):>7.3f}"
-            f"{_stat(row, 'all_candidates_empty_fraction'):>7.3f}"
-            f"{_stat(row, 'area_picks_largest'):>7.3f}"
-        )
-    lines += [
-        "",
-        "edge    = head - area. THE HEADLINE: the head's contribution beyond a size prior.",
-        "e/tot   = edge as a fraction of TOTAL headroom (oracle - random)",
-        "e/left  = edge as a fraction of the headroom the AREA CONTROL LEFT (oracle - area)",
-        "          These two trend in OPPOSITE directions across buckets. Report both; "
-        "neither is the finding alone.",
-        "rho_h   = head Spearman, rho_a = area-control Spearman (degenerate images excluded "
-        "and counted separately)",
-        "lrgst   = fraction of images where the area control picked the LARGEST-area "
-        "candidate. Near 1.0 means it reduces to that deterministic rule.",
-        "allmt   = fraction of images where EVERY candidate was empty; those score 0 under "
-        "every rule and cap any selector",
-        "orc|off = oracle over only the images where the sampler offered a non-empty "
-        "candidate -- separates 'offered nothing' from 'offered something poorly located'",
-    ]
+    lines = _render_block(report, SELECTION_COLUMNS, "bucket")
+    lines += ["", ""] + _render_block(report, RANKING_COLUMNS, "bucket")
     return "\n".join(lines)
 
 
