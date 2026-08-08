@@ -1634,3 +1634,66 @@ def test_validation_uses_the_val_split_and_the_eval_candidate_count(
     train_indices = set(trainer.data.datasets["train"].indices.tolist())
     val_indices = set(trainer.data.datasets["val"].indices.tolist())
     assert train_indices.isdisjoint(val_indices)
+
+
+def test_the_two_head_arms_compare_cleanly() -> None:
+    """The ablation pair differs in exactly the variable under test, and nothing else.
+
+    ``configs/extension_modernized.yaml`` exists only so the Phase 2 arm can load a
+    full-covariance base. If the 19-field refusal in ``extension/ablation.py`` rejected this
+    pair, the ablation could never be compared -- so that is asserted here rather than
+    discovered after two head runs have been spent.
+    """
+    from probunet.extension.ablation import (
+        VARYING_FIELD,
+        ablation_signature,
+        assert_comparable,
+    )
+
+    phase1 = ExperimentConfig.from_yaml(CONFIGS / "extension.yaml")
+    phase2 = ExperimentConfig.from_yaml(CONFIGS / "extension_modernized.yaml")
+
+    # Exactly one architectural difference, and it is the one under test.
+    differing = {
+        field.name
+        for field in dataclasses.fields(phase1.model)
+        if getattr(phase1.model, field.name) != getattr(phase2.model, field.name)
+    }
+    assert differing == {"latent_covariance"}
+    assert phase1.model.latent_covariance == "diagonal"
+    assert phase2.model.latent_covariance == "full"
+    assert VARYING_FIELD == "model.latent_covariance"
+
+    # Everything the head's own comparison depends on is identical.
+    assert phase1.head == phase2.head
+    assert phase1.optim == phase2.optim
+    assert phase1.train == phase2.train
+    assert phase1.data == phase2.data
+    assert phase1.schedule == phase2.schedule
+    assert phase1.checkpoint == phase2.checkpoint
+
+    # The run names differ, so the two arms cannot overwrite each other under runs/.
+    assert phase1.run.name != phase2.run.name
+
+    # And the refusal accepts the pair.
+    assert_comparable(
+        {
+            "head_on_phase1": ablation_signature(phase1.to_dict()),
+            "head_on_phase2": ablation_signature(phase2.to_dict()),
+        }
+    )
+
+
+def test_the_phase1_arm_still_defaults_to_diagonal() -> None:
+    """The Phase 2 flag must not have leaked into the Phase 1 arm.
+
+    Its headline result (+0.0589 edge over the largest-area rule) is recorded against a
+    diagonal base, so an override reaching ``extension.yaml`` would silently invalidate it.
+    """
+    phase1 = ExperimentConfig.from_yaml(CONFIGS / "extension.yaml")
+    assert phase1.model.latent_covariance == "diagonal"
+    raw = yaml.safe_load((CONFIGS / "extension.yaml").read_text())
+    assert "latent_covariance" not in raw.get("model", {}), (
+        "extension.yaml now sets latent_covariance explicitly; the Phase 1 arm is supposed "
+        "to take the default, and the ablation arm lives in extension_modernized.yaml"
+    )
