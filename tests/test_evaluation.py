@@ -10,9 +10,14 @@ Notation: ``A`` is a non-empty mask, ``E`` an empty one, ``P`` a single pixel.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 from probunet.evaluation.metrics import consensus_ceiling
 from probunet.evaluation.headroom import (
@@ -634,3 +639,81 @@ def test_measure_ceilings_needs_no_model() -> None:
     assert "ceiling" in report["1 grader"]
     assert "verdict" not in report["1 grader"]
     assert "ceiling" in render(report)
+
+
+def test_every_documented_column_is_actually_produced() -> None:
+    """A legend must never describe output the table does not print.
+
+    That mismatch happened here once -- ``orc|off`` stayed in the legend after it was
+    dropped from the header -- and it is the same class as a config documenting an
+    invocation that could not work. The legend is now generated from the same tuples that
+    generate the columns, so the two cannot drift; this asserts the other half, that every
+    documented column resolves to a key ``per_bucket`` really emits.
+    """
+    from probunet.evaluation.headroom import (
+        RANKING_COLUMNS,
+        SELECTION_COLUMNS,
+        per_bucket,
+        render_selection,
+    )
+
+    results = {
+        "head": np.array([0.4, 0.6]),
+        "area_only": np.array([0.3, 0.5]),
+        "random": np.array([0.2, 0.3]),
+        "oracle": np.array([0.5, 0.7]),
+        "emptiest": np.zeros(2),
+        "all_empty": np.zeros(2),
+        "ceiling": np.array([0.4, 1.0]),
+        "nonempty_frac": np.array([0.5, 1.0]),
+        "area_picks_largest": np.ones(2),
+        "head_spearman": np.array([0.9, 0.8]),
+        "area_spearman": np.array([0.7, 0.6]),
+        "pred_mean": np.array([0.1, 0.2]),
+        "pred_std_within_image": np.array([0.01, 0.02]),
+        "pred_spread_within_image": np.array([0.03, 0.04]),
+        "pred_of_chosen": np.array([0.15, 0.25]),
+        "n_nonempty": np.array([1, 4]),
+        "index": np.arange(2),
+    }
+    report = per_bucket(results)
+    row = report["all"]
+
+    for name, key, _, _ in (*SELECTION_COLUMNS, *RANKING_COLUMNS):
+        assert key in row, f"column {name!r} documents {key!r}, which per_bucket never emits"
+
+    text = render_selection(report)
+    for name, _, _, legend in (*SELECTION_COLUMNS, *RANKING_COLUMNS):
+        assert name in text, f"{name!r} is documented but not printed"
+        if legend:
+            assert legend.split(".")[0][:30] in text
+
+
+def test_the_area_control_reduced_to_the_largest_area_rule_on_the_measured_run() -> None:
+    """On the recorded run's candidate set, the area control picked the largest candidate.
+
+    **Scoped deliberately to the measurement, not to the architecture.**
+    ``AreaOnlyScorer`` is a ReLU MLP on ``log1p(area)`` and is *not* guaranteed monotone --
+    measured over five seeds it is monotone at initialization for only one, and 9-47 of 800
+    training steps show ``argmax != largest-area``. So this asserts what was observed on
+    this checkpoint and split, which is what licenses describing the control as the
+    deterministic rule **for this run**, and nothing stronger.
+
+    Skips when the tracked results file is absent, so it runs wherever the record is.
+    """
+    record = REPO_ROOT / "results" / "consensus_selection_val.json"
+    if not record.exists():
+        pytest.skip(f"no recorded selection table at {record}")
+
+    buckets = json.loads(record.read_text())["buckets"]
+    if "area_picks_largest" not in buckets["all"]:
+        pytest.skip(
+            f"{record.name} predates the area_picks_largest column; re-run "
+            "scripts/consensus_headroom.py --head-checkpoint to record it"
+        )
+    for label, row in buckets.items():
+        assert row["area_picks_largest"]["mean"] == pytest.approx(1.0, abs=1e-9), (
+            f"{label}: the area control no longer reduces to the largest-area rule "
+            f"({row['area_picks_largest']['mean']}). The report's wording depends on this, "
+            "so re-check FINDINGS 4.5 before changing the number."
+        )
