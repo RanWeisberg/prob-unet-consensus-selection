@@ -524,6 +524,17 @@ headroom -- real, small, and worth one sentence rather than a caveat paragraph. 
 explain why 0.4940 was far above the pre-registered 0.30-0.36 band; that turned out to be a
 miscalibrated band rather than an inflated result (FINDINGS 4.5).
 
+**The estimate was CONSERVATIVE -- the test split settled it.** The +0.0043 figure above is
+the optimism *estimated* from the validation curve (best minus plateau mean). The **measured**
+val-to-test movement is **0.0012** (0.4940 → 0.4928), roughly a third of it. So selecting the
+checkpoint on validation cost less than the within-run curve suggested it might, and the
+validation figure was a closer estimate of held-out performance than this entry originally
+implied.
+
+Report the **test** figure (0.4928) as the headline and this entry as the reason validation
+numbers are development record rather than results. The estimate erring on the pessimistic
+side is the right direction for a caveat to err in.
+
 **Budget was sufficient.** The monitor **plateaus by epoch 10** and thereafter oscillates in
 a band of roughly 0.008, so the 30-epoch budget was not the binding constraint.
 `extension.yaml` pre-registered the reading for exactly this outcome -- "if it plateaus by
