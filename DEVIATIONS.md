@@ -510,10 +510,26 @@ lands near random). The alternative -- selecting on the Huber loss -- would have
 because a low loss is compatible with zero ranking ability (FINDINGS 4.5). So the setup
 stands; the *caveat* is what must be reported.
 
-**Size of the effect.** With validation over 3021 patches the per-epoch noise is small, so
-the optimism is expected to be a fraction of a percent -- far too small to explain the
-0.49404 result being 89.5% of measured headroom against a 30–36% expectation (FINDINGS 4.5).
-It is recorded because it is real and cheap to state, not because it explains anything.
+**Size of the effect -- MEASURED, no longer estimated.**
+
+| quantity | value |
+|---|---|
+| plateau mean, epochs 10-29 | 0.4897 |
+| reported figure (`best.pt`, epoch 28) | 0.4940 |
+| **optimism** | **+0.0043** |
+| as a fraction of the 0.2895 headroom | **1.5%** |
+
+So the reported number sits **at the top of the noise band**, and the bias is 1.5% of
+headroom -- real, small, and worth one sentence rather than a caveat paragraph. It does not
+explain why 0.4940 was far above the pre-registered 0.30-0.36 band; that turned out to be a
+miscalibrated band rather than an inflated result (FINDINGS 4.5).
+
+**Budget was sufficient.** The monitor **plateaus by epoch 10** and thereafter oscillates in
+a band of roughly 0.008, so the 30-epoch budget was not the binding constraint.
+`extension.yaml` pre-registered the reading for exactly this outcome -- "if it plateaus by
+15, that is a legitimate finding about how little capacity this task needs". It plateaued by
+10, and `best.pt` came from epoch 28, i.e. from within the plateau rather than from a still-
+rising curve.
 
 **The clean figure, and it must be run exactly once.** The **test** split (3019 patches) has
 never been touched by checkpoint selection, so the test-split

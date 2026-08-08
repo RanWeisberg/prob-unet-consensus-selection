@@ -1198,8 +1198,21 @@ def test_selection_table_carries_every_requested_column(
     assert row["area_only"]["mean"] <= row["oracle"]["mean"] + 1e-6
     assert row["oracle"]["mean"] <= row["ceiling"]["mean"] + 1e-6
 
+    # The head's edge over its size-prior control, reported against BOTH denominators,
+    # because the bucket trend reverses depending on which is used (FINDINGS 4.5).
+    assert "head_edge_over_area" in row
+    assert "head_edge_frac_of_total_headroom" in row
+    assert "head_edge_frac_of_headroom_area_left" in row
+    # The two diagnostics that separate "ranks non-empty above empty" from
+    # "discriminates among non-empty".
+    assert "area_spearman" in row and "head_spearman" in row
+    assert "pred_spread_within_image" in row and "pred_std_within_image" in row
+    # Whether the control collapses to the deterministic largest-area rule -- measured,
+    # never assumed: the scorer is a ReLU MLP and is not guaranteed monotone.
+    assert 0.0 <= row["area_picks_largest"]["mean"] <= 1.0
+
     text = render_selection(report)
-    for token in ("head", "area", "gap%", "allmt", "orc|off"):
+    for token in ("head", "area", "edge", "e/tot", "e/left", "rho_h", "rho_a", "lrgst"):
         assert token in text
 
 

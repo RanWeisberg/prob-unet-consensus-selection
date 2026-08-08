@@ -35,7 +35,7 @@ from probunet.evaluation.metrics import (
     emptiest_sample_index,
     summarize,
 )
-from probunet.evaluation.metrics import consensus_scores
+from probunet.evaluation.metrics import consensus_scores, spearman_per_image
 from probunet.evaluation.sampling import draw_prior_samples
 from probunet.model.prob_unet import ProbUNet
 
@@ -201,8 +201,21 @@ def measure_selection(
 
         features, candidates = head.sample_candidates(image, n_samples, generator)
         scores = consensus_scores(candidates, graders)
-        chosen = head.select(features, candidates)
-        by_area = head.select_by_area(candidates)
+        predicted = head.score_candidates(features, candidates)
+        area_scores = head.score_by_area(candidates)
+        chosen = predicted.argmax(dim=1)
+        by_area = area_scores.argmax(dim=1)
+
+        # Does the area control reduce to "pick the largest-area candidate"? Measured per
+        # image rather than assumed: the scorer is a ReLU MLP on log1p(area), which is NOT
+        # guaranteed monotone -- measured inversions occur on synthetic data -- so whether
+        # it collapses to that deterministic rule is a property of the data and has to be
+        # reported per run.
+        areas = (candidates != 0).flatten(start_dim=2).sum(dim=2)
+        picks_largest = (by_area == areas.argmax(dim=1)).to(torch.float32)
+
+        head_rho, head_valid = spearman_per_image(predicted, scores)
+        area_rho, area_valid = spearman_per_image(area_scores, scores)
 
         values = {
             "head": consensus_selected(candidates, graders, chosen),
@@ -220,11 +233,50 @@ def measure_selection(
             .mean(dim=1),
             "n_nonempty": (graders.flatten(start_dim=2).sum(dim=2) > 0).sum(dim=1),
             "index": batch["index"],
+            "area_picks_largest": picks_largest,
+            # The head's predicted-score distribution. A head emitting near-constant scores
+            # that merely rank non-empty above empty is a different finding from one that
+            # discriminates WITHIN the non-empty candidates, and the within-image spread is
+            # what separates them.
+            "pred_spread_within_image": predicted.amax(dim=1) - predicted.amin(dim=1),
+            "pred_std_within_image": predicted.std(dim=1),
+            "pred_mean": predicted.mean(dim=1),
+            "pred_of_chosen": predicted.gather(1, chosen.unsqueeze(1)).squeeze(1),
         }
         for key, value in values.items():
             columns.setdefault(key, []).append(value.detach().cpu().numpy())
+        # Rank correlations come back on the CPU already (float64 ranks; see
+        # metrics.spearman_per_image), and carry a validity mask rather than a NaN average.
+        for key, (rho, valid) in (
+            ("head_spearman", (head_rho, head_valid)),
+            ("area_spearman", (area_rho, area_valid)),
+        ):
+            masked = rho.numpy().astype(np.float64).copy()
+            masked[~valid.numpy()] = np.nan
+            columns.setdefault(key, []).append(masked)
 
     return {key: np.concatenate(parts) for key, parts in columns.items()}
+
+
+def _stat(row: dict[str, Any], key: str, field: str = "mean") -> float:
+    """Read a summary statistic, tolerating an absent column or an all-degenerate one.
+
+    ``summarize`` returns ``None`` for every statistic when no finite value survived --
+    which happens for a Spearman column whose images were all degenerate -- and ``None``
+    cannot be formatted as a float.
+
+    Args:
+        row: One bucket's report row.
+        key: Column name.
+        field: Statistic within that column's summary.
+
+    Returns:
+        The value, or NaN when absent or undefined.
+    """
+    value = row.get(key)
+    if isinstance(value, dict):
+        value = value.get(field)
+    return float("nan") if value is None else float(value)
 
 
 def render_selection(report: dict[str, Any]) -> str:
@@ -243,27 +295,36 @@ def render_selection(report: dict[str, Any]) -> str:
         A plain-text table.
     """
     header = (
-        f"{'bucket':<11}{'n':>5}{'random':>8}{'head':>8}{'area':>8}{'oracle':>8}"
-        f"{'ceil':>7}{'gap%':>7}{'area%':>7}{'allmt':>7}{'orc|off':>8}"
+        f"{'bucket':<11}{'n':>5}{'random':>8}{'area':>8}{'head':>8}{'oracle':>8}"
+        f"{'ceil':>7}{'edge':>8}{'e/tot':>7}{'e/left':>7}"
+        f"{'rho_h':>7}{'rho_a':>7}{'allmt':>7}{'lrgst':>7}"
     )
     lines = [header, "-" * len(header)]
     for label, row in report.items():
         lines.append(
             f"{label:<11}{row['n']:>5}"
-            f"{row['random']['mean']:>8.4f}{row['head']['mean']:>8.4f}"
-            f"{row['area_only']['mean']:>8.4f}{row['oracle']['mean']:>8.4f}"
-            f"{row['ceiling']['mean']:>7.4f}"
-            f"{100 * row['gap_captured_head']:>7.1f}"
-            f"{100 * row['gap_captured_area_only']:>7.1f}"
-            f"{row['all_candidates_empty_fraction']:>7.3f}"
-            f"{row.get('oracle_where_offered', float('nan')):>8.4f}"
+            f"{_stat(row, 'random'):>8.4f}{_stat(row, 'area_only'):>8.4f}"
+            f"{_stat(row, 'head'):>8.4f}{_stat(row, 'oracle'):>8.4f}"
+            f"{_stat(row, 'ceiling'):>7.4f}"
+            f"{_stat(row, 'head_edge_over_area'):>+8.4f}"
+            f"{100 * _stat(row, 'head_edge_frac_of_total_headroom'):>7.1f}"
+            f"{100 * _stat(row, 'head_edge_frac_of_headroom_area_left'):>7.1f}"
+            f"{_stat(row, 'head_spearman'):>7.3f}"
+            f"{_stat(row, 'area_spearman'):>7.3f}"
+            f"{_stat(row, 'all_candidates_empty_fraction'):>7.3f}"
+            f"{_stat(row, 'area_picks_largest'):>7.3f}"
         )
     lines += [
         "",
-        "gap%    = fraction of the oracle-minus-random headroom the HEAD captured "
-        "(lead with this: scale-free across buckets)",
-        "area%   = the same for the size-prior CONTROL. If gap% is not well above it, the "
-        "head learned area, not overlap.",
+        "edge    = head - area. THE HEADLINE: the head's contribution beyond a size prior.",
+        "e/tot   = edge as a fraction of TOTAL headroom (oracle - random)",
+        "e/left  = edge as a fraction of the headroom the AREA CONTROL LEFT (oracle - area)",
+        "          These two trend in OPPOSITE directions across buckets. Report both; "
+        "neither is the finding alone.",
+        "rho_h   = head Spearman, rho_a = area-control Spearman (degenerate images excluded "
+        "and counted separately)",
+        "lrgst   = fraction of images where the area control picked the LARGEST-area "
+        "candidate. Near 1.0 means it reduces to that deterministic rule.",
         "allmt   = fraction of images where EVERY candidate was empty; those score 0 under "
         "every rule and cap any selector",
         "orc|off = oracle over only the images where the sampler offered a non-empty "
@@ -335,6 +396,23 @@ def per_bucket(results: dict[str, np.ndarray]) -> dict[str, Any]:
                 oracle / max(group["ceiling"].mean(), 1e-12)
             ),
         }
+        for key in ("head_spearman", "area_spearman"):
+            if key in group:
+                finite = np.isfinite(group[key])
+                report[label][f"{key}_excluded_fraction"] = float((~finite).mean())
+        if "head" in group and "area_only" in group:
+            # The denominator question (FINDINGS 4.5). Reported BOTH ways, because the
+            # bucket trend reverses depending on which is used and neither direction is
+            # the finding on its own.
+            head_mean, area_mean = group["head"].mean(), group["area_only"].mean()
+            report[label]["head_edge_over_area"] = float(head_mean - area_mean)
+            report[label]["head_edge_frac_of_total_headroom"] = float(
+                (head_mean - area_mean) / gap
+            )
+            remaining = max(float(oracle - area_mean), 1e-12)
+            report[label]["head_edge_frac_of_headroom_area_left"] = float(
+                (head_mean - area_mean) / remaining
+            )
         if "nonempty_frac" in group:
             # Images where EVERY candidate is empty. They score exactly 0 under every
             # rule, so they cap what any selector could achieve and belong in the table
