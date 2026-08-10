@@ -82,12 +82,16 @@ def test_no_large_artifact_is_tracked() -> None:
     if listing.returncode != 0:
         pytest.skip("not a git repository")
     tracked = listing.stdout.split()
+    # The only .npz files allowed in the index are the two small, deliberately tracked
+    # exports: the panel subset and the notebook's showcase arrays. Both are a few MB and
+    # both exist so a fresh clone can render without the 450 MB dataset.
+    allowed_npz = {str(paths.SUBSET_NPZ), str(paths.SHOWCASE_NPZ)}
     offenders = [
         name
         for name in tracked
         if name.endswith((".pt", ".pth", ".pickle", ".pkl"))
         or "tfevents" in name
-        or (name.endswith(".npz") and "subset" not in name)
+        or (name.endswith(".npz") and name not in allowed_npz)
     ]
     assert not offenders, f"large artifacts are tracked: {offenders}"
 

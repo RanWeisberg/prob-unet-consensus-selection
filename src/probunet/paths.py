@@ -17,6 +17,7 @@ path                        git         contents
 ``data/processed/*``        ignored     the full converted ``.npz`` (~450 MB)
 ``data/processed/lidc.json``       TRACKED  conversion provenance (a few KB)
 ``data/processed/lidc_subset.npz`` TRACKED  panel/diversity patches only (a few MB)
+``data/processed/showcase.npz``    TRACKED  the notebook's figure arrays (a few MB)
 ``data/splits/``            TRACKED     the frozen split, plus its notes
 ``results/``                TRACKED     evaluation and comparison JSON/CSV
 ``configs/``                TRACKED     the three variant configs
@@ -44,6 +45,17 @@ SUBSET_NPZ = DATA_PROCESSED_DIR / "lidc_subset.npz"
 """The stratified panel/diversity patches only. Tracked, so the notebook can draw
 qualitative samples on Colab without the full dataset."""
 
+SHOWCASE_NPZ = DATA_PROCESSED_DIR / "showcase.npz"
+"""Everything the submission notebook's figures need, produced by
+``scripts/export_showcase.py`` on the machine holding the checkpoints.
+
+Tracked for the same reason ``SUBSET_NPZ`` is, and one step further: the notebook must run
+start to finish on CPU without training, so it loads **no checkpoint and runs no model**.
+Every array a figure needs -- the qualitative cases, their samples and candidates, and the
+aggregate scatter arrays -- is therefore in this file or it is not available at all. It
+carries its own provenance manifest, so the notebook can print which checkpoints, split,
+seed and git revision produced it without guessing."""
+
 CONVERSION_SIDECAR = DATA_PROCESSED_DIR / "lidc.json"
 
 # --- tracked: small, portable, the things a reader needs ------------------------
@@ -59,6 +71,7 @@ TRACKED_PATHS: tuple[Path, ...] = (
     SPLIT_PATH,
     CONVERSION_SIDECAR,
     SUBSET_NPZ,
+    SHOWCASE_NPZ,
     RESULTS_DIR / "comparison.json",
     CONFIGS_DIR / "baseline.yaml",
 )

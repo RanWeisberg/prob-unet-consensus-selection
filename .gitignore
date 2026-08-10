@@ -9,6 +9,9 @@ data/raw/
 data/processed/*
 !data/processed/lidc.json
 !data/processed/lidc_subset.npz
+# ...and neither is showcase.npz: the notebook loads no checkpoint and runs no model, so
+# every array its figures need lives in that one tracked file.
+!data/processed/showcase.npz
 
 # ...but data/splits/split.json MUST be tracked: every baseline comparison in the
 # report depends on the split being identical across machines and Colab runs.
