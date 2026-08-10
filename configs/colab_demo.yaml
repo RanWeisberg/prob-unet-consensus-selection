@@ -1,0 +1,203 @@
+# Colab Tier 2 demo: train the real model, from scratch, on CPU, in a few minutes.
+#
+#   python scripts/train.py --config configs/colab_demo.yaml
+#
+# WHAT THIS IS FOR, and what it is not for. Tier 2 of the submission notebook demonstrates
+# that the training code runs end to end -- forward, ELBO, backward, LR schedule,
+# validation over all four graders, the checkpoint monitor, the diagnostics and the
+# TensorBoard panel -- on a machine a grader actually has. A grader may get a CPU-only
+# Colab allocation, so CPU is the design target, not a fallback.
+#
+# NO NUMBER IN THE REPORT COMES FROM THIS CONFIG. 128 steps is 0.053% of the paper's
+# 240,000-iteration budget on 288 of 15,096 patches. It shows the machinery working; it
+# says nothing about the model's quality, and the notebook must caption it that way.
+#
+# WHAT DIFFERS FROM baseline.yaml, and why -- every value below is either identical to the
+# baseline or changed for a stated reason. The model block is BYTE-IDENTICAL to
+# baseline.yaml: this is the real 27,499,098-parameter architecture, not a toy.
+
+run:
+  name: colab_demo
+  seed: 2018            # baseline seed; the SPLIT seed is a different, frozen 1806
+  device: auto          # cuda -> mps -> cpu. On Colab this lands on cpu unless a GPU
+                        # was allocated, and the demo is sized for the cpu case.
+  out_dir: runs
+  deterministic: true
+
+# IDENTICAL to baseline.yaml. base_channels and num_downs are left at the real values
+# because the measured step cost allows it: 0.636 s/step at batch 4 with torch limited to
+# 2 threads (Colab's usual free CPU width), measured on this project's development Mac.
+# Shrinking the architecture would have made the demo faster and meaningless -- a grader
+# watching a 4-channel U-Net train learns nothing about the submitted model.
+model:
+  latent_dim: 6
+  latent_covariance: diagonal
+  base_channels: 32
+  num_downs: 4
+  convs_per_scale: 3
+  num_classes: 2
+  image_channels: 1
+  mask_channels: 1
+  fcomb_convs: 3
+  fcomb_channels: null
+  max_channels: null
+  align_corners: false
+  bias_init_std: 0.001
+
+loss:
+  beta: 1.0             # baseline value, unchanged
+
+data:
+  # THE TWO PATHS THAT MAKE THIS THE DEMO. Both are tracked, so a fresh clone -- or a
+  # Colab session that only ran `git clone` -- has everything it needs.
+  #
+  # colab_demo_split.json is NOT split.json and the two are not interchangeable:
+  # split.json's indices address the full 15,096-patch array and are legal-but-wrong
+  # integers against this 288-row file. Written together by scripts/make_colab_subset.py.
+  npz_path: data/processed/lidc_colab_demo.npz
+  split_path: data/splits/colab_demo_split.json
+
+  # 4, not the paper's 32. Two reasons, both measured. (a) Step cost is linear in batch
+  # size on CPU -- 0.349 / 0.636 / 1.273 s at batch 2 / 4 / 8 -- so batch 32 would be
+  # ~5 s/step and 128 steps would take eleven minutes before validation. (b) 32 would be
+  # 8 steps per epoch over a 256-patch train split, which is too few steps to show a
+  # loss curve. Batch 4 is the point where both constraints are comfortable.
+  batch_size: 4
+
+  num_workers: 0        # standing constraint: spawn platforms copy the arrays per worker,
+                        # and Colab's 2 vCPU has nothing to gain from a worker anyway
+  pin_memory: false     # CUDA-only optimization
+  normalization: none   # images are already in [0, 1]
+
+  # AUGMENTATION STAYS ON, identical to baseline.yaml, because it is effectively free:
+  # measured at 2.2 ms per sample, which is 8.8 ms on a batch of 4 against a 636 ms step
+  # -- 1.4%. Turning it off would have saved nothing and would have made the demo exercise
+  # a path the reported model never used.
+  augmentation:
+    enabled: true
+    seed: 5034
+    pad_to_px: 180
+    random_crop: true
+    rotation_degrees: 22.5
+    scale_range: [0.8, 1.2]
+    shear: 0.1
+    elastic_alpha_px: 5.0
+    elastic_sigma_px: 10.0
+    max_redraws: 3
+
+optim:
+  name: adam
+  lr: 1.0e-4            # THE PAPER'S RATE, unchanged. A demo-only 1e-3 would have given a
+  weight_decay: 1.0e-5  # steeper curve at the cost of the demo no longer running the
+  betas: [0.9, 0.999]   # reported recipe, which is not a trade worth making for a figure
+  eps: 1.0e-8           # nobody measures anything from.
+
+schedule:
+  # CONSTANT, and this is the one place the demo cannot follow the baseline. The paper's
+  # schedule is five decay steps at fractions of the TOTAL budget, so over 128 steps the
+  # first milestone would land at step 21 and the model would spend most of the demo at
+  # 1e-6 -- a schedule shape that exists to anneal 240,000 steps says nothing over 128.
+  # A constant rate is the honest reduction: it runs the same scheduler code path with
+  # nothing to mislead. The real schedule is in baseline.yaml and is what the report uses.
+  name: constant
+  milestones: []
+  values: []
+
+train:
+  mode: elbo
+
+  # THE HARD GUARD. Trainer derives epochs from iterations and steps_per_epoch and then
+  # runs exactly epochs x steps_per_epoch, so this bounds the run: it cannot overrun even
+  # if the split size changes. 128 / 16 = 8 epochs, 128 steps, full stop.
+  #
+  # MEASURED END TO END, not estimated: 102 s wall clock for the whole run on this
+  # project's development Mac with torch limited to 2 threads (Colab's usual free CPU
+  # width) -- model construction, data load, 128 training steps, 8 validation passes, 2
+  # diagnostics passes and 9 checkpoint writes included. Applying a 2x safety factor for a
+  # slower Colab vCPU gives about 3.5 minutes. If that turns out too slow on a real
+  # allocation, halve this to 64; the arithmetic is linear and nothing else has to move.
+  iterations: 128
+  epochs: null          # exactly one of iterations/epochs may be set
+
+  amp: false            # CUDA only; raises on MPS/CPU rather than silently doing nothing
+  grad_clip: null
+
+  val_every_n_epochs: 1
+
+  # 16 steps per epoch instead of the 64 the 256-patch split would give. This does NOT
+  # change the total step count -- 128 iterations / 16 = 8 epochs either way -- it changes
+  # how those steps are grouped, and 8 short epochs rather than 2 long ones is what gives
+  # the demo 8 validation points, 8 monitor decisions and a visible best-checkpoint
+  # update. The loader reshuffles each epoch, so the capped epochs still walk the whole
+  # train split rather than replaying the same 64 patches.
+  limit_train_batches: 16
+
+  # 4 batches x 4 = 16 of the 32 val patches per pass. Validation runs one encode plus
+  # four posterior passes per batch (all four graders), so it is roughly as expensive as
+  # training per batch; uncapped it would have cost about as much as the training itself.
+  limit_val_batches: 4
+
+log:
+  # FALSE, and NOT because TensorBoard is unwanted -- because of a pre-existing bug this
+  # config is the first thing in the project to hit. REPORTED, NOT PATCHED.
+  #
+  # Trainer._log_panel calls data.lidc.panel_batch(arrays, self.diagnostic_sets.panel).
+  # panel_batch documents its argument as "patch indices in the FULL dataset's numbering"
+  # and resolves it through LidcArrays.resolve_indices. But diagnostic_sets.panel comes
+  # from build_diagnostic_sets(data.datasets["val"], ...), whose indices are rows of the
+  # loaded arrays. On the full dataset those two numberings coincide and resolve_indices
+  # is the identity, so the mismatch has never shown. On a SUBSET export they are
+  # different numberings, resolve_indices maps rows through source_index as if they were
+  # global, and the run dies:
+  #
+  #   KeyError: 'patches [262, 264, 273] are not in this subset export'
+  #
+  # _log_panel only runs `if self.writer`, so tensorboard: false avoids it. Everything
+  # else still runs -- run_diagnostics computes ce_posterior_z, ce_prior_z_mean,
+  # sample_diversity_iou and nonempty_sample_fraction as usual, and they appear in the
+  # epoch log and in summary.json. Only the TensorBoard panel image and the scalar writer
+  # are given up.
+  #
+  # THE FIX IS ONE LINE in Trainer._log_panel, and it is a no-op on every existing run
+  # (resolve_indices returns its input unchanged when source_index is None):
+  #
+  #     panel = self.diagnostic_sets.panel
+  #     if self.data.arrays.is_subset:
+  #         panel = self.data.arrays.source_index[panel]
+  #     panel_images, panel_masks = panel_batch(self.data.arrays, panel)
+  #
+  # It is not applied here because it changes shared training code that Phase 1, Phase 2
+  # and the head all run through, and that is not a call a demo config gets to make.
+  # Once it is applied, flip this back to true -- nothing else in this file changes.
+  #
+  # Related, same root cause and also not fixed here: a subset-based run writes
+  # runs/<name>/diagnostic_indices.json holding SUBSET rows under a schema that
+  # scripts/export_subset.py reads as global indices. Harmless for the demo (nothing
+  # consumes the demo's copy) but the same numbering confusion.
+  tensorboard: false
+
+  log_every_n_steps: 4  # 20 would log twice in a 128-step run
+
+  # 4, so two diagnostics passes land in the 8 epochs. Must be a multiple of
+  # val_every_n_epochs or Trainer warns.
+  diagnostics_every_n_epochs: 4
+
+  # All four shrunk for the CPU budget. The diagnostics pass costs
+  # diversity_images x (4 posterior passes + prior_samples_for_ce reconstructions +
+  # diversity_samples draws), so the baseline's 64 x (4 + 4 + 16) would dominate the whole
+  # demo. These values keep the pass under a few seconds while still exercising every
+  # diagnostic code path and producing a real panel image.
+  #
+  # diversity_images must not exceed the demo's val split (32), since the diagnostic sets
+  # are drawn from it.
+  prior_samples_for_ce: 2
+  diversity_samples: 4
+  diversity_images: 8
+  panel_images: 4
+  panel_samples: 4
+
+checkpoint:
+  save_best: true
+  save_last: true
+  monitor: val/total    # never a test metric -- and here there is no test split at all
+  mode: min

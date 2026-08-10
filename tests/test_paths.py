@@ -82,10 +82,15 @@ def test_no_large_artifact_is_tracked() -> None:
     if listing.returncode != 0:
         pytest.skip("not a git repository")
     tracked = listing.stdout.split()
-    # The only .npz files allowed in the index are the two small, deliberately tracked
-    # exports: the panel subset and the notebook's showcase arrays. Both are a few MB and
-    # both exist so a fresh clone can render without the 450 MB dataset.
-    allowed_npz = {str(paths.SUBSET_NPZ), str(paths.SHOWCASE_NPZ)}
+    # The only .npz files allowed in the index are the three small, deliberately tracked
+    # exports: the panel subset, the notebook's showcase arrays and the Colab demo
+    # patches. All are a few MB and all exist so a fresh clone can render -- and, for the
+    # last one, train a demo -- without the 450 MB dataset.
+    allowed_npz = {
+        str(paths.SUBSET_NPZ),
+        str(paths.SHOWCASE_NPZ),
+        str(paths.COLAB_DEMO_NPZ),
+    }
     offenders = [
         name
         for name in tracked

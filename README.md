@@ -120,6 +120,8 @@ results are tracked.**
 | `data/splits/split.json` | **tracked** | the frozen split (+ `SPLIT_NOTES.md`) |
 | `data/processed/lidc.json` | **tracked** | conversion provenance |
 | `data/processed/lidc_subset.npz` | **tracked** | ~2 MB, panel patches for the notebook |
+| `data/processed/lidc_colab_demo.npz` | **tracked** | ~8 MB, train patches so the notebook's Tier 2 can train on Colab |
+| `data/splits/colab_demo_split.json` | **tracked** | the demo's own split — its indices address the file above, **not** `lidc.npz` |
 | `notebooks/` | tracked | thin narrative layer, no logic |
 | `DEVIATIONS.md` | tracked | every departure from the paper/reference |
 | `runs/`, `experiments/` | **ignored** | checkpoints (~315 MB each), TensorBoard events |
@@ -136,6 +138,7 @@ Large artifacts are shared out of band:
 ```bash
 python scripts/export_weights.py runs/baseline/checkpoints/best.pt   # ~315 MB -> ~105 MB
 python scripts/export_subset.py                                      # -> lidc_subset.npz
+python scripts/make_colab_subset.py                                  # -> lidc_colab_demo.npz + colab_demo_split.json
 ```
 
 A weights-only export drops the optimizer state (Adam keeps two moment buffers per

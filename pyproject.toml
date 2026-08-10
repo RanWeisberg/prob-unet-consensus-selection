@@ -39,3 +39,6 @@ where = ["src"]
 testpaths = ["tests"]
 # Keeps `pytest` working from a bare checkout even before `pip install -e .`.
 pythonpath = ["src"]
+markers = [
+    "version_sensitive: pins bitwise loss/latent values, so it depends on the exact NumPy and torch build and will fail on a different one. Deselect with -m 'not version_sensitive' when running the suite somewhere the build is not controlled, e.g. inside the submission notebook on Colab.",
+]

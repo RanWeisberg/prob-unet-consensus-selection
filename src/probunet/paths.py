@@ -18,6 +18,7 @@ path                        git         contents
 ``data/processed/lidc.json``       TRACKED  conversion provenance (a few KB)
 ``data/processed/lidc_subset.npz`` TRACKED  panel/diversity patches only (a few MB)
 ``data/processed/showcase.npz``    TRACKED  the notebook's figure arrays (a few MB)
+``data/processed/lidc_colab_demo.npz`` TRACKED  Colab Tier 2 training patches (~8 MB)
 ``data/splits/``            TRACKED     the frozen split, plus its notes
 ``results/``                TRACKED     evaluation and comparison JSON/CSV
 ``configs/``                TRACKED     the three variant configs
@@ -56,6 +57,17 @@ aggregate scatter arrays -- is therefore in this file or it is not available at 
 carries its own provenance manifest, so the notebook can print which checkpoints, split,
 seed and git revision produced it without guessing."""
 
+COLAB_DEMO_NPZ = DATA_PROCESSED_DIR / "lidc_colab_demo.npz"
+"""A few hundred TRAIN patches, so the notebook's Tier 2 can train from scratch on Colab.
+
+Deliberately **not** ``SUBSET_NPZ``: that file holds val-split panel patches and the
+notebook's qualitative cell already loads it, so reusing the name would have destroyed one
+artifact to make another. The two hold different rows drawn from different splits and have
+different jobs.
+
+Its rows are addressed by :data:`COLAB_DEMO_SPLIT`, never by ``split.json`` -- see that
+constant."""
+
 CONVERSION_SIDECAR = DATA_PROCESSED_DIR / "lidc.json"
 
 # --- tracked: small, portable, the things a reader needs ------------------------
@@ -63,6 +75,15 @@ SPLITS_DIR = Path("data/splits")
 SPLIT_PATH = SPLITS_DIR / "split.json"
 RESULTS_DIR = Path("results")
 CONFIGS_DIR = Path("configs")
+
+COLAB_DEMO_SPLIT = SPLITS_DIR / "colab_demo_split.json"
+"""The demo's own split, whose indices address :data:`COLAB_DEMO_NPZ`.
+
+``split.json`` indices address the full 15,096-patch array, so they are **invalid** for the
+subset -- and invalid in the worst way, because they remain legal integers that address
+some other patch. The demo therefore gets its own file rather than reusing the main one,
+and its ``test`` list is empty by construction: no test patch is ever drawn into the
+subset. ``scripts/make_colab_subset.py`` writes both files together."""
 
 COMPARISON_JSON = RESULTS_DIR / "comparison.json"
 COMPARISON_CSV = RESULTS_DIR / "comparison.csv"
@@ -72,6 +93,8 @@ TRACKED_PATHS: tuple[Path, ...] = (
     CONVERSION_SIDECAR,
     SUBSET_NPZ,
     SHOWCASE_NPZ,
+    COLAB_DEMO_NPZ,
+    COLAB_DEMO_SPLIT,
     RESULTS_DIR / "comparison.json",
     CONFIGS_DIR / "baseline.yaml",
 )

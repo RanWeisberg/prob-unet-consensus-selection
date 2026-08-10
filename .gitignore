@@ -12,6 +12,9 @@ data/processed/*
 # ...and neither is showcase.npz: the notebook loads no checkpoint and runs no model, so
 # every array its figures need lives in that one tracked file.
 !data/processed/showcase.npz
+# ...nor lidc_colab_demo.npz: the notebook's Tier 2 trains a tiny model from scratch on
+# Colab, and it must have patches to train on without downloading the 450 MB dataset.
+!data/processed/lidc_colab_demo.npz
 
 # ...but data/splits/split.json MUST be tracked: every baseline comparison in the
 # report depends on the split being identical across machines and Colab runs.
