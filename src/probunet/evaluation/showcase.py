@@ -58,6 +58,74 @@ MAX_SHOWCASE_BYTES = 20 * 1024**2
 EMPTY_CANDIDATE_AREA = 0
 """Foreground pixel count that marks a candidate as empty."""
 
+SET_A_MIN_CONSENSUS_FOOTPRINT_PX = 25
+"""Smallest grader-union footprint a Set A case may have, in pixels.
+
+**This is a LEGIBILITY guard, and it was added after the fact.** See
+:data:`SET_A_GUARD_PROVENANCE`.
+
+The quantity is the **union** of the four grader masks -- exactly the set of pixels the
+soft-consensus tile paints -- rather than their sum. The sum double-counts overlap and so
+overstates how much there is to see: a patch where four graders agree on the same 20 pixels
+sums to 80 but paints a 20-pixel region.
+
+25 px is a 5x5-equivalent region. At the figures' display scale a panel is cropped to at
+least 40 image pixels a side and drawn about 110 screen pixels wide, so one image pixel is
+roughly 2.75 screen pixels: a 25-pixel footprint spans about 14x14 screen pixels and reads
+as a shape, while the 4-pixel footprint that made case ``a1`` unreadable spans about 5x5
+and reads as a speck.
+
+Chosen as the *mildest* threshold that clears that failure by a wide margin. Measured on
+the test split it retains **2406 of 3019 patches (79.7%)** and leaves every ambiguity
+bucket populated (bucket 1: 543 of 992, bucket 4: 933 of 951). A 6x6 threshold would have
+retained 67.6% and cut bucket 1 to 38%, biasing the eligible pool toward high-agreement
+patches for a modest gain in legibility.
+
+**Consequence to state wherever Set A appears:** the percentiles are now computed over the
+*legible* subpopulation, not over the whole test split.
+"""
+
+SET_A_MIN_NONEMPTY_SAMPLES = 2
+"""Non-empty samples each arm must offer for a Set A case to be eligible.
+
+Symmetric between the arms by construction -- the same threshold is applied to each -- so it
+cannot prefer one. The originally specified value was 1; see :data:`SET_A_GUARD_PROVENANCE`
+for why that was the wrong target and why this is not the guard doing the real work.
+"""
+
+SET_A_GUARD_PROVENANCE: dict[str, Any] = {
+    "added": "after case a1 was rendered and found illegible, NOT before the export run",
+    "why_the_order_is_disclosed": (
+        "The guard is about LEGIBILITY, not about which arm looks better: both arms are "
+        "scored against the same grader masks, the thresholds are applied symmetrically to "
+        "each arm, and neither threshold reads any model output. So it cannot favour an "
+        "arm. But it was added after seeing a rendered case, and a guard declared after "
+        "the fact is indistinguishable from a cherry-pick unless the order is stated. It "
+        "is stated here, in the manifest, and in the notebook."
+    ),
+    "what_the_specified_guard_missed": (
+        "The originally specified guard was 'at least one non-empty sample from each "
+        "variant'. Case a1 SATISFIED it -- both arms had a non-empty sample, which is why "
+        "its criterion was not exactly zero -- and was still unreadable. The specified "
+        "guard was aimed at the wrong failure mode: the real one is 'the target is too "
+        "small to see', not 'both arms are empty'. The footprint threshold is what "
+        "addresses it; the sample-count threshold is retained for completeness."
+    ),
+    "a1_for_the_record": {
+        "patch_index": 6561,
+        "bucket": 1,
+        "grader_union_footprint_px": 4,
+        "nonempty_samples_baseline_short": 4,
+        "nonempty_samples_modernized_short": 1,
+    },
+    "effect_on_the_population": (
+        "Set A percentiles are now computed over the LEGIBLE subpopulation rather than the "
+        "whole test split. The retained count and its per-bucket breakdown are recorded "
+        "beside this note."
+    ),
+}
+"""The disclosure that travels with the export, so the sequence cannot be lost."""
+
 
 # ---------------------------------------------------------------------------------
 # Case selection
@@ -373,6 +441,81 @@ def ged_eligibility(per_variant_ged: dict[str, np.ndarray]) -> EligibilityReport
         finite = np.isfinite(np.asarray(values, dtype=np.float64))
         counts[f"n_ged_undefined_{name}"] = int((~finite).sum())
         eligible &= finite
+    return EligibilityReport(eligible=eligible, counts=counts)
+
+
+def set_a_eligibility(
+    per_variant_ged: dict[str, np.ndarray],
+    per_variant_nonempty_samples: dict[str, np.ndarray],
+    consensus_footprint: np.ndarray,
+    min_footprint: int = SET_A_MIN_CONSENSUS_FOOTPRINT_PX,
+    min_nonempty_samples: int = SET_A_MIN_NONEMPTY_SAMPLES,
+) -> EligibilityReport:
+    """Every Set A guard: GED defined, both arms offered samples, the target is visible.
+
+    Three guards, and only the first was in the original specification:
+
+    1. **GED defined in both arms** -- the correctness guard.
+    2. **At least ``min_nonempty_samples`` non-empty samples per arm**, applied
+       symmetrically. The specification asked for 1; case ``a1`` passed that and was still
+       unreadable.
+    3. **A grader-union footprint of at least ``min_footprint`` pixels** -- the guard that
+       actually addresses the observed failure, added after the fact and disclosed as such
+       in :data:`SET_A_GUARD_PROVENANCE`.
+
+    Guards 2 and 3 are **display** guards: they read the grader masks and the sample
+    emptiness, never a score, and they are applied identically to both arms, so no
+    threshold here can prefer one arm over the other. What they *do* change is the
+    population the percentiles describe, which is why the retained counts are recorded.
+
+    Args:
+        per_variant_ged: Arm name to its per-image GED array.
+        per_variant_nonempty_samples: Arm name to its per-image count of non-empty samples.
+        consensus_footprint: Per-image union area of the four grader masks, in pixels.
+        min_footprint: Threshold for guard 3.
+        min_nonempty_samples: Threshold for guard 2.
+
+    Returns:
+        The combined mask and one count per guard.
+
+    Raises:
+        ValueError: If the arrays disagree in length, or an arm is missing from either
+            mapping -- a guard silently skipped for one arm would break the symmetry the
+            disclosure rests on.
+    """
+    base = ged_eligibility(per_variant_ged)
+    if set(per_variant_nonempty_samples) != set(per_variant_ged):
+        raise ValueError(
+            f"arms differ between the GED mapping {sorted(per_variant_ged)} and the "
+            f"sample-count mapping {sorted(per_variant_nonempty_samples)}; the display "
+            "guards must be applied to every arm or they are not symmetric"
+        )
+
+    eligible = base.eligible.copy()
+    counts = dict(base.counts)
+
+    for name, values in sorted(per_variant_nonempty_samples.items()):
+        values = np.asarray(values)
+        if values.shape != eligible.shape:
+            raise ValueError(
+                f"{name}: sample counts have shape {values.shape}, expected {eligible.shape}"
+            )
+        enough = values >= min_nonempty_samples
+        counts[f"n_too_few_nonempty_samples_{name}"] = int((~enough).sum())
+        eligible &= enough
+
+    footprint = np.asarray(consensus_footprint)
+    if footprint.shape != base.eligible.shape:
+        raise ValueError(
+            f"consensus_footprint has shape {footprint.shape}, expected "
+            f"{base.eligible.shape}"
+        )
+    visible = footprint >= min_footprint
+    counts["n_target_too_small_to_see"] = int((~visible).sum())
+    eligible &= visible
+
+    counts["min_nonempty_samples_per_arm"] = int(min_nonempty_samples)
+    counts["min_consensus_footprint_px"] = int(min_footprint)
     return EligibilityReport(eligible=eligible, counts=counts)
 
 

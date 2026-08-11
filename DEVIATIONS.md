@@ -559,6 +559,85 @@ lose the only clean number the project has.
 
 ---
 
+## 15. Diagnostic panel indices are array rows, but `panel_batch` wants global indices
+
+**A real bug, found by the Colab demo config, and the first configuration in the project
+ever to train on a subset export.** Not a deviation from the paper — a deviation between
+what a function documents and what its only caller passes it.
+
+`Trainer._log_panel` calls `data.lidc.panel_batch(self.data.arrays,
+self.diagnostic_sets.panel)`. `panel_batch` documents its argument as *"patch indices in
+the full dataset's numbering"* and resolves it through `LidcArrays.resolve_indices`. But
+`diagnostic_sets.panel` comes from `build_diagnostic_sets(data.datasets["val"], ...)`,
+whose indices are **rows of the loaded arrays**.
+
+On the full dataset those two numberings are the same and `resolve_indices` is the
+identity, so the mismatch was invisible for the whole of Phases 1–3. On a **subset export**
+they are different numberings, `resolve_indices` maps rows through `source_index` as though
+they were global, and the run dies:
+
+```
+KeyError: 'patches [262, 264, 273] are not in this subset export'
+```
+
+**Why it is latent rather than rare.** `resolve_indices` returns its input unchanged when
+`source_index is None`. That is a correct and useful behaviour, and it is exactly what hid
+the bug: the identity path made a wrong argument indistinguishable from a right one on
+every configuration anyone had run. This is the same class as the shadowed
+`_selection_head_step` and the shape-only assertions of FINDINGS 2.13 — a check that cannot
+fail on the data you have is not a check.
+
+**Status: REPORTED, NOT FIXED.** `configs/colab_demo.yaml` sets `log.tensorboard: false`,
+which avoids it — `_log_panel` runs only `if self.writer` — at the cost of the TensorBoard
+writer and its panel image. `run_diagnostics` itself still runs and still logs every
+scalar. The one-line fix is written out in that config:
+
+```python
+panel = self.diagnostic_sets.panel
+if self.data.arrays.is_subset:
+    panel = self.data.arrays.source_index[panel]
+panel_images, panel_masks = panel_batch(self.data.arrays, panel)
+```
+
+It is a **no-op on every existing run** (`resolve_indices` is already the identity when
+`source_index is None`), so it cannot move a reported number. It is unapplied only because
+it changes shared training code that Phase 1, Phase 2 and the head all run through, and
+that is not a change a demo config gets to make unilaterally. Apply it and flip
+`log.tensorboard` back to `true`; nothing else moves.
+
+**Impact on reported results: none.** Every reported run trained on the full dataset, where
+the two numberings coincide.
+
+---
+
+## 16. `diagnostic_indices.json` from a subset run holds subset rows under a global schema
+
+The unfixed sibling of entry 15, same root cause, recorded so it is not rediscovered.
+
+`Trainer.__init__` writes `save_diagnostic_sets(self.diagnostic_sets, run_dir /
+"diagnostic_indices.json")`. Those indices are **rows of whatever arrays the run loaded**.
+`scripts/export_subset.py` reads that same file with `--indices` and treats its contents as
+**full-dataset** indices (`arrays.images[rows]` against the full `.npz`).
+
+On a full-dataset run the two readings agree, which is why the file has always been
+correct. A run on a subset export writes subset rows into a file whose one consumer will
+read them as global — and, unlike entry 15, this fails **silently**: the indices are legal
+integers that address *some* patch, so a panel exported from them would be a panel of the
+wrong patches rather than a `KeyError`.
+
+**Status: UNFIXED, and currently harmless.** The only subset-trained run in the project is
+the Tier 2 Colab demo, whose `diagnostic_indices.json` nothing consumes and whose run
+directory the notebook deletes. It becomes a real hazard the moment anything else trains on
+a subset and someone points `export_subset.py --indices` at the result.
+
+The proper fix is to make the numbering explicit rather than positional — write the file
+with the global indices (mapping through `source_index` when the arrays are a subset) and
+record which numbering it used, so a reader and `export_subset.py` cannot disagree about
+what the integers mean. Deliberately left for a change that can be made and tested against
+the full pipeline rather than folded into the packaging work that found it.
+
+---
+
 ## Non-deviations worth recording
 
 Things that *look* like they could differ but were checked and match:

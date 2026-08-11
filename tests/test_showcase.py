@@ -24,6 +24,8 @@ import pytest
 
 from probunet.evaluation.showcase import (
     CASE_PERCENTILES,
+    SET_A_GUARD_PROVENANCE,
+    SET_A_MIN_CONSENSUS_FOOTPRINT_PX,
     MANIFEST_KEY,
     MANIFEST_REQUIRED_KEYS,
     MANIFEST_REQUIRED_VARIANT_KEYS,
@@ -40,6 +42,7 @@ from probunet.evaluation.showcase import (
     render_case_table,
     select_cases,
     selection_eligibility,
+    set_a_eligibility,
     write_showcase,
 )
 
@@ -259,6 +262,114 @@ def test_ged_guard_rejects_ragged_input() -> None:
         ged_eligibility({"a": np.zeros(3), "b": np.zeros(4)})
     with pytest.raises(ValueError, match="at least one variant"):
         ged_eligibility({})
+
+
+def test_set_a_display_guards_exclude_exactly_the_intended_rows() -> None:
+    """PLUMBING-ONLY. Five hand-built images, one per case the three guards separate.
+
+    Row 3 is the ``a1`` shape: GED defined, both arms non-empty, and a target far too small
+    to see. It passes the originally specified guard and must still be excluded -- that is
+    the whole reason the footprint guard exists.
+    """
+    report = set_a_eligibility(
+        per_variant_ged={
+            "baseline_short": np.array([0.1, np.nan, 0.3, 0.4, 0.5]),
+            "modernized_short": np.array([0.2, 0.2, 0.3, 0.4, 0.5]),
+        },
+        per_variant_nonempty_samples={
+            "baseline_short": np.array([6, 6, 0, 4, 6]),
+            "modernized_short": np.array([6, 6, 6, 1, 6]),
+        },
+        consensus_footprint=np.array([100, 100, 100, 4, 100]),
+        min_footprint=25,
+        min_nonempty_samples=2,
+    )
+
+    assert report.eligible.tolist() == [True, False, False, False, True]
+    assert report.counts["n_ged_undefined_baseline_short"] == 1
+    assert report.counts["n_too_few_nonempty_samples_baseline_short"] == 1
+    assert report.counts["n_too_few_nonempty_samples_modernized_short"] == 1
+    assert report.counts["n_target_too_small_to_see"] == 1
+    assert report.counts["min_consensus_footprint_px"] == 25
+    assert report.counts["min_nonempty_samples_per_arm"] == 2
+    assert report.as_dict()["n_eligible"] == 2
+
+
+def test_the_originally_specified_guard_would_not_have_caught_a1() -> None:
+    """PLUMBING-ONLY. The claim the disclosure rests on, asserted rather than asserted-in-prose.
+
+    ``a1``'s real shape: both arms offered a non-empty sample, so "at least one non-empty
+    sample per arm" passes it. Only the footprint threshold removes it.
+    """
+    a1 = dict(
+        per_variant_ged={"baseline_short": np.array([0.1]),
+                         "modernized_short": np.array([0.09])},
+        per_variant_nonempty_samples={"baseline_short": np.array([4]),
+                                      "modernized_short": np.array([1])},
+        consensus_footprint=np.array([4]),
+    )
+    # The guard as originally specified: >= 1 non-empty per arm, no footprint threshold.
+    as_specified = set_a_eligibility(**a1, min_footprint=0, min_nonempty_samples=1)
+    assert as_specified.eligible.tolist() == [True], (
+        "the originally specified guard passes a1, which is exactly why it was the wrong "
+        "guard -- it targeted 'both arms empty', not 'the target is too small to see'"
+    )
+    # The footprint guard alone is what removes it.
+    with_footprint = set_a_eligibility(**a1, min_footprint=25, min_nonempty_samples=1)
+    assert with_footprint.eligible.tolist() == [False]
+    assert with_footprint.counts["n_target_too_small_to_see"] == 1
+
+
+def test_set_a_guards_are_symmetric_between_the_arms() -> None:
+    """PLUMBING-ONLY. Swapping the arms cannot change who is eligible.
+
+    The disclosure's central claim is that a guard added after the fact still cannot favour
+    an arm. That is only true if the thresholds are applied identically to each, so it is
+    asserted rather than argued.
+    """
+    ged = {"baseline_short": np.array([0.1, 0.2, 0.3]),
+           "modernized_short": np.array([0.4, 0.5, 0.6])}
+    samples = {"baseline_short": np.array([5, 1, 9]),
+               "modernized_short": np.array([1, 7, 9])}
+    footprint = np.array([100, 100, 100])
+
+    forward = set_a_eligibility(ged, samples, footprint)
+    swapped = set_a_eligibility(
+        {"baseline_short": ged["modernized_short"],
+         "modernized_short": ged["baseline_short"]},
+        {"baseline_short": samples["modernized_short"],
+         "modernized_short": samples["baseline_short"]},
+        footprint,
+    )
+    assert forward.eligible.tolist() == swapped.eligible.tolist() == [False, False, True]
+
+
+def test_set_a_guards_refuse_an_arm_missing_from_either_mapping() -> None:
+    """PLUMBING-ONLY. A guard skipped for one arm is a guard that is no longer symmetric."""
+    with pytest.raises(ValueError, match="not symmetric"):
+        set_a_eligibility(
+            per_variant_ged={"a": np.zeros(2), "b": np.zeros(2)},
+            per_variant_nonempty_samples={"a": np.zeros(2)},
+            consensus_footprint=np.zeros(2),
+        )
+    with pytest.raises(ValueError, match="consensus_footprint has shape"):
+        set_a_eligibility(
+            per_variant_ged={"a": np.zeros(2)},
+            per_variant_nonempty_samples={"a": np.zeros(2)},
+            consensus_footprint=np.zeros(3),
+        )
+
+
+def test_the_guard_disclosure_records_the_order_and_the_missed_failure_mode() -> None:
+    """PLUMBING-ONLY. The disclosure travels with the export, so it cannot be lost."""
+    assert "after case a1" in SET_A_GUARD_PROVENANCE["added"]
+    assert "NOT before" in SET_A_GUARD_PROVENANCE["added"]
+    assert "cherry-pick" in SET_A_GUARD_PROVENANCE["why_the_order_is_disclosed"]
+    assert "wrong failure mode" in SET_A_GUARD_PROVENANCE["what_the_specified_guard_missed"]
+    assert SET_A_GUARD_PROVENANCE["a1_for_the_record"]["grader_union_footprint_px"] == 4
+    assert SET_A_MIN_CONSENSUS_FOOTPRINT_PX > 4, (
+        "the threshold must actually exclude the case that motivated it"
+    )
 
 
 # ---------------------------------------------------------------------------------

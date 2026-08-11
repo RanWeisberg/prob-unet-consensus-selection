@@ -51,6 +51,25 @@ per-image difference -- percentile-nearest, never ``argmin``/``argmax``, because
 single-pixel lesions make the extremes unstable. Set B's 5th percentile is a **failure**
 case where the head loses to the largest-candidate rule; it is exported deliberately.
 
+THE SET A DISPLAY GUARDS WERE ADDED AFTER THE FACT, AND THAT IS DISCLOSED
+------------------------------------------------------------------------
+The first export's Set A median, case ``a1``, was rendered and found **illegible**: a
+bucket-1 patch whose only non-empty grader marked 4 pixels, so the soft-consensus tile it
+is judged against was invisible. Two display guards were added *in response*
+(``--min-consensus-footprint``, ``--min-nonempty-samples``), and the order is recorded in
+the manifest under ``set_a_display_guard`` rather than presented as a pre-registration.
+
+The guards read the grader masks and sample emptiness, never a score, and apply the same
+threshold to both arms, so neither can prefer an arm. But a guard declared after seeing a
+rendered case is indistinguishable from a cherry-pick unless the sequence is stated, so it
+is stated -- here, in the manifest, and in the notebook. Recorded alongside: the originally
+specified guard ("at least one non-empty sample per arm") would **not** have caught ``a1``,
+because it was aimed at the wrong failure mode. The real one is *the target is too small to
+see*, not *both arms are empty*.
+
+Consequence, also recorded: Set A percentiles are now computed over the **legible
+subpopulation**, not over the whole test split.
+
 Usage (PowerShell, one line -- see the report command at the bottom of this docstring)::
 
     python scripts/export_showcase.py --split test
@@ -102,14 +121,17 @@ from probunet.evaluation.showcase import (  # noqa: E402
     CASE_PERCENTILES,
     MAX_SHOWCASE_BYTES,
     SCHEMA_VERSION,
+    SET_A_GUARD_PROVENANCE,
+    SET_A_MIN_CONSENSUS_FOOTPRINT_PX,
+    SET_A_MIN_NONEMPTY_SAMPLES,
     assert_arrays_identical,
     check_published_figures,
     check_published_ged,
     duplicate_case_positions,
-    ged_eligibility,
     render_case_table,
     select_cases,
     selection_eligibility,
+    set_a_eligibility,
     write_showcase,
 )
 from probunet.extension.ablation import (  # noqa: E402
@@ -196,6 +218,10 @@ SET_B_CRITERION = (
 GED_SAMPLE_COUNT = 16
 """Sample count the Set A criterion is read at. The paper's largest, and the one the
 follow-up literature reports."""
+
+MIN_ELIGIBLE_FOR_PERCENTILES = 200
+"""Floor on the Set A eligible pool. Below this a percentile describes nothing, so the
+export refuses rather than quietly reporting one."""
 
 
 # ---------------------------------------------------------------------------------
@@ -512,14 +538,22 @@ def replay_ged(
             .cpu()
             .numpy()
         )
+        nonempty = (samples.flatten(start_dim=2) != 0).any(dim=2)
         parts.setdefault("nonempty_frac", []).append(
-            (samples.flatten(start_dim=2) != 0)
-            .any(dim=2)
-            .to(torch.float32)
-            .mean(dim=1)
-            .detach()
-            .cpu()
-            .numpy()
+            nonempty.to(torch.float32).mean(dim=1).detach().cpu().numpy()
+        )
+        # Per-image COUNT, not just the fraction: the Set A display guard is expressed as
+        # "at least N non-empty samples per arm", and a fraction would hide the count
+        # behind the sample size.
+        parts.setdefault("nonempty_samples", []).append(
+            nonempty.sum(dim=1).detach().cpu().numpy()
+        )
+        # The soft-consensus map's footprint -- the pixels the consensus tile actually
+        # paints. This is what the legibility guard thresholds; see
+        # showcase.SET_A_MIN_CONSENSUS_FOOTPRINT_PX.
+        parts.setdefault("consensus_footprint", []).append(
+            (graders != 0).any(dim=1).flatten(start_dim=1).sum(dim=1)
+            .detach().cpu().numpy()
         )
 
         present = [
@@ -585,6 +619,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint-modernized-short", type=Path,
         default=DEFAULT_CHECKPOINTS["modernized_short"],
         help="Phase 2 short run, the second arm of the Set A GED comparison",
+    )
+    parser.add_argument(
+        "--min-consensus-footprint", type=int,
+        default=SET_A_MIN_CONSENSUS_FOOTPRINT_PX,
+        help=(
+            "SET A LEGIBILITY GUARD, ADDED AFTER case a1 was rendered and found "
+            "illegible. Minimum union area of the four grader masks -- the footprint the "
+            "soft-consensus tile actually paints -- for a Set A case to be eligible. The "
+            "default is a 5x5-equivalent region, the mildest threshold that clears a1's "
+            "4 px by a wide margin; measured on test it retains 79.7%% of patches with "
+            "every bucket populated. Applied identically to both arms and reading no "
+            "model output, so it cannot favour an arm"
+        ),
+    )
+    parser.add_argument(
+        "--min-nonempty-samples", type=int, default=SET_A_MIN_NONEMPTY_SAMPLES,
+        help=(
+            "Set A display guard: non-empty samples each arm must offer. The originally "
+            "specified value was 1, which case a1 SATISFIED while still being unreadable "
+            "-- that guard was aimed at the wrong failure mode. Symmetric between arms"
+        ),
     )
     parser.add_argument("--device", default=None, help="override device selection")
     parser.add_argument("--log-level", default="INFO", help="Python logging level")
@@ -867,14 +922,61 @@ def main(argv: list[str] | None = None) -> int:
             "the two Phase 2 arms did not traverse the split in the same order, so a "
             "per-image difference between them would pair the wrong patches"
         )
-    ged_guards = ged_eligibility(
-        {arm: per_patch[arm][ged_key] for arm in ("baseline_short", "modernized_short")}
+
+    # ---- Set A display guards need per-image sample counts and the consensus footprint,
+    # neither of which collect_per_patch_metrics returns. So the Set A arms follow the same
+    # three-pass shape the selection arm already does: verify, replay to recover what the
+    # guards need, then replay again to keep the chosen cases. Each replay is checked
+    # bit-for-bit against the verified pass.
+    replayed: dict[str, dict[str, np.ndarray]] = {}
+    for arm in ("baseline_short", "modernized_short"):
+        with cudnn_flags(False, False):
+            variant, config, _ = load_variant(checkpoints[arm], device, seed=sampling.seed)
+            loader = data_cache.get(config).loaders[arguments.split]
+            LOGGER.info("%s: replaying to recover sample counts and grader footprints", arm)
+            replayed[arm], _ = replay_ged(
+                variant, loader, device, sampling.max_samples, wanted=set()
+            )
+        assert_arrays_identical(
+            {"ged": replayed[arm]["ged"], "index": replayed[arm]["index"]},
+            {"ged": per_patch[arm][ged_key], "index": per_patch[arm]["index"]},
+            context=f"{arm} guard replay",
+        )
+
+    ged_guards = set_a_eligibility(
+        per_variant_ged={
+            arm: per_patch[arm][ged_key] for arm in ("baseline_short", "modernized_short")
+        },
+        per_variant_nonempty_samples={
+            arm: replayed[arm]["nonempty_samples"]
+            for arm in ("baseline_short", "modernized_short")
+        },
+        # Identical across arms by construction -- it is a property of the grader masks --
+        # so either arm's copy will do. Asserted rather than assumed.
+        consensus_footprint=replayed["baseline_short"]["consensus_footprint"],
+        min_footprint=arguments.min_consensus_footprint,
+        min_nonempty_samples=arguments.min_nonempty_samples,
     )
-    # Recorded, not excluded: two variants that both emitted only empty samples still have
-    # a meaningful, comparable GED. See showcase.ged_eligibility. Filled by the capture
-    # replays below, which are the only pass that sees the samples themselves.
-    diagnostics: dict[str, int] = {}
-    LOGGER.info("Set A eligibility: %s", ged_guards.as_dict())
+    if not np.array_equal(replayed["baseline_short"]["consensus_footprint"],
+                          replayed["modernized_short"]["consensus_footprint"]):
+        raise ValueError(
+            "the grader-union footprint differs between the two arms; it depends on the "
+            "grader masks alone and must be identical, so the loaders are not aligned"
+        )
+    # Recorded, not excluded: the all-samples-empty counts remain informative in their own
+    # right even though the display guard now removes those patches from SELECTION.
+    diagnostics: dict[str, int] = {
+        f"n_all_samples_empty_{arm}": int((replayed[arm]["nonempty_frac"] == 0).sum())
+        for arm in ("baseline_short", "modernized_short")
+    }
+    LOGGER.info("Set A eligibility (with the display guards): %s", ged_guards.as_dict())
+    if ged_guards.n_eligible < MIN_ELIGIBLE_FOR_PERCENTILES:
+        raise ValueError(
+            f"only {ged_guards.n_eligible} Set A patches survived the display guards, "
+            f"below the floor of {MIN_ELIGIBLE_FOR_PERCENTILES}. A percentile over that "
+            "few patches describes nothing. Lower --min-consensus-footprint or "
+            "--min-nonempty-samples and record that you did."
+        )
 
     set_a_criterion = (
         per_patch["baseline_short"][ged_key] - per_patch["modernized_short"][ged_key]
@@ -895,18 +997,17 @@ def main(argv: list[str] | None = None) -> int:
             # Freshly loaded, so its generator starts where the verified pass started.
             variant, config, _ = load_variant(checkpoints[arm], device, seed=sampling.seed)
             loader = data_cache.get(config).loaders[arguments.split]
-            replayed, captured = replay_ged(
+            recaptured, captured = replay_ged(
                 variant, loader, device, sampling.max_samples, wanted=wanted_a
             )
         assert_arrays_identical(
-            {"ged": replayed["ged"], "index": replayed["index"],
-             "n_nonempty": replayed["n_nonempty"]},
+            {"ged": recaptured["ged"], "index": recaptured["index"],
+             "n_nonempty": recaptured["n_nonempty"],
+             "nonempty_samples": recaptured["nonempty_samples"]},
             {"ged": per_patch[arm][ged_key], "index": per_patch[arm]["index"],
-             "n_nonempty": per_patch[arm]["nonempty_count"]},
+             "n_nonempty": per_patch[arm]["nonempty_count"],
+             "nonempty_samples": replayed[arm]["nonempty_samples"]},
             context=f"{arm} GED capture",
-        )
-        diagnostics[f"n_all_samples_empty_{arm}"] = int(
-            (replayed["nonempty_frac"] == 0).sum()
         )
         captured_a[arm] = captured
         LOGGER.info("%s: GED replay reproduced the verified pass bit-for-bit", arm)
@@ -1034,10 +1135,33 @@ def main(argv: list[str] | None = None) -> int:
         "selection_record": [case.as_dict() for case in all_cases],
         "duplicate_case_positions": duplicates,
         "guards": {
-            "set_a": {**ged_guards.as_dict(), **diagnostics,
-                      "note": "only the GED-undefined guard applies to Set A; the "
-                              "all-samples-empty counts are recorded, not excluded"},
+            "set_a": {
+                **ged_guards.as_dict(), **diagnostics,
+                "per_bucket_eligible": {
+                    str(bucket): int(
+                        ((per_patch["baseline_short"]["nonempty_count"] == bucket)
+                         & ged_guards.eligible).sum()
+                    )
+                    for bucket in (1, 2, 3, 4)
+                },
+                "note": (
+                    "Three guards: GED defined in both arms (the correctness guard), at "
+                    "least min_nonempty_samples_per_arm non-empty samples per arm, and a "
+                    "grader-union footprint of at least min_consensus_footprint_px. The "
+                    "last two are DISPLAY guards added after the fact -- see "
+                    "set_a_display_guard below. Percentiles are therefore computed over "
+                    "the legible subpopulation, not the whole split."
+                ),
+            },
             "set_b_and_c": selection_guards.as_dict(),
+        },
+        # THE DISCLOSURE. Travels with the export so the sequence cannot be lost.
+        "set_a_display_guard": {
+            **SET_A_GUARD_PROVENANCE,
+            "min_consensus_footprint_px": int(arguments.min_consensus_footprint),
+            "min_nonempty_samples_per_arm": int(arguments.min_nonempty_samples),
+            "n_eligible_after": int(ged_guards.n_eligible),
+            "n_total": int(ged_guards.eligible.size),
         },
         "assertions": assertions,
         "keys": keys,
