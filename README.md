@@ -1,153 +1,137 @@
-# Probabilistic U-Net with a post-hoc consensus selection head
+# A Probabilistic U-Net with a post-hoc consensus-selection head
 
-A PyTorch reimplementation of the **Probabilistic U-Net** (Kohl et al., *A
-Probabilistic U-Net for Segmentation of Ambiguous Images*, NeurIPS 2018,
-[arXiv:1806.05034](https://arxiv.org/abs/1806.05034)), extended with a post-hoc
-**consensus selection head** that scores sampled masks by how well they agree with
-the set of expert graders, so a single mask can be chosen at inference time without
-ground truth.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/RanWeisberg/prob-unet-consensus-selection/blob/main/notebooks/submission.ipynb)
 
-Course project for *Medical Images Processing with Deep Learning (336033)*.
-See `CLAUDE.md` for the full project specification.
+A PyTorch reimplementation of the Probabilistic U-Net (Kohl et al., *A Probabilistic U-Net
+for Segmentation of Ambiguous Images*, NeurIPS 2018,
+[arXiv:1806.05034](https://arxiv.org/abs/1806.05034)), trained on LIDC-IDRI and extended in
+two independent directions: a **full-covariance latent Gaussian** in place of the paper's
+axis-aligned one, and a **post-hoc consensus-selection head** that scores sampled masks by
+how well they agree with the four expert graders, so one mask can be chosen at inference
+time without ground truth. Both extensions are one config flag away from the reproduction —
+there is a single model implementation, selected by config, so every comparison changes
+exactly one setting. Course project for *Medical Images Processing with Deep Learning
+(336033)*; repository at
+[RanWeisberg/prob-unet-consensus-selection](https://github.com/RanWeisberg/prob-unet-consensus-selection).
+
+## The notebook
+
+`notebooks/submission.ipynb` is the guided tour of the method and its results, and it needs
+nothing installed: Colab ships torch, numpy, matplotlib and scipy, and sections 0–6 render
+recorded predictions and published tables from files tracked in this repository. Section 7
+trains an undersized model from scratch on a 288-patch subset — the part that executes
+inside a session — and section 8 runs the test suite.
 
 ## Install
 
-Python 3.12.
+Python 3.12. Needed to run the pipeline below, not to read the notebook.
 
 ```bash
 pip install -e ".[dev]"
 pytest
 ```
 
-## Data pipeline
+## Dataset
 
-The preprocessed LIDC-IDRI data ships as a Python pickle. `pickle.load` executes
-arbitrary code, so the pickle is read **exactly once**, by an isolated script under
-`scratch/` that uses a restricted unpickler (numpy and plain containers only; every
-other class is replaced by an inert stand-in, so `pydicom` is never imported). The
-package itself only ever reads the resulting `.npz`.
+**LIDC-IDRI is not included here.** The images come from the
+[TCIA LIDC-IDRI collection](https://www.cancerimagingarchive.net/collection/lidc-idri); this
+project uses the preprocessed release distributed with the public reimplementation
+[stefanknegt/Probabilistic-Unet-Pytorch](https://github.com/stefanknegt/Probabilistic-Unet-Pytorch),
+which is the version the follow-up literature trains on: `data_lidc.pickle`, 3.4 GB,
+sha256 `327025e97c296a9e02841bb7e9968521147039e9c5474ba3b214c1f8056c177e`, holding 15,096
+crops of 128×128 with four independent grader masks each, drawn from 875 CT series. Place it
+at `data/raw/data_lidc.pickle` and run, in order:
 
 ```bash
-python scratch/inspect_data.py            # audit + structural report
-python scratch/convert_data.py            # -> data/processed/lidc.npz + lidc.json
-python -m probunet.data.splits            # -> data/splits/split.json
+python scratch/inspect_data.py      # audit the pickle without importing its classes
+python scratch/convert_data.py      # -> data/processed/lidc.npz + lidc.json provenance
+python -m probunet.data.splits      # -> data/splits/split.json, seed 1806
 ```
 
-## Train and evaluate
+`pickle.load` executes arbitrary code, so the pickle is read exactly once by an isolated
+script under `scratch/` with a restricted unpickler; the package itself only ever reads the
+`.npz`. The split is grouped by `series_uid`, so no CT series spans two splits, and
+stratified over the number of non-empty grader masks; it is generated once with **seed
+1806**, committed as `data/splits/split.json`, and `load_split()` never regenerates it. The
+committed split is what the reported runs used, so step three reproduces rather than
+replaces it. `scratch/` is not part of the installable package and is gitignored; its
+scripts live in the repository linked above.
+
+## Reproducing the pipeline
 
 ```bash
-python scripts/train.py --config configs/smoke.yaml       # verify the loop, <1 min
-python scripts/train.py --config configs/baseline.yaml    # the real run
-python scripts/evaluate.py --checkpoint runs/baseline/checkpoints/best.pt --split val
-```
-
-`--split` is required and has no default: development happens on `val`, and `test` is
-evaluated once for the final report numbers. Metrics are GED at 1/4/8/16 samples,
-oracle / random / Hungarian-matched single-sample quality, and two degenerate baselines
-(all-empty predictor, emptiest-sample selection) — all reported aggregate and per
-ambiguity bucket, because an all-empty predictor scores Dice 0.75 on the 33% of patches
-where three of four graders are empty.
-
-15,096 patches of 128x128, four independent grader masks each, drawn from 875 CT
-series. The split is grouped by `series_uid` so no series spans two splits, and
-stratified over the number of non-empty grader masks per patch so the splits are
-comparable in ambiguity. It is generated **once**, seeded, and committed to the
-repository; `load_split()` never regenerates. Known limitations of the split —
-uneven series density and lesion size across splits — are recorded in
-`data/splits/SPLIT_NOTES.md`.
-
-Training pairs each image with **one randomly chosen** grader mask, redrawn every
-epoch and reproducible from the run seed; evaluation keeps all four masks. Empty
-masks are never filtered: they are a grader's judgment that no lesion is present.
-No normalization is applied — the images are already in [0, 1].
-
-## Train and evaluate
-
-Three variants, **one model implementation**, selected by config:
-
-```bash
-python scripts/train.py --config configs/smoke.yaml        # verify the loop, <1 min
-python scripts/train.py --config configs/baseline.yaml     # phase 1
-python scripts/train.py --config configs/modernized.yaml   # phase 2
+# 1. train: Phase 1 reproduction, Phase 2 (one flag), Phase 3 head on a frozen base
+python scripts/train.py --config configs/baseline.yaml
+python scripts/train.py --config configs/modernized.yaml
 python scripts/train.py --config configs/extension.yaml \
-    --base-checkpoint runs/modernized/checkpoints/best.pt  # phase 3 (scaffold)
+    --base-checkpoint runs/baseline/checkpoints/best.pt
 
-python scripts/evaluate.py --checkpoint runs/baseline/checkpoints/best.pt --split val
-python scripts/compare.py --split val \
-    --checkpoint baseline=runs/baseline/checkpoints/best.pt \
-    --checkpoint modernized=runs/modernized/checkpoints/best.pt
+# 2. evaluate one checkpoint: GED at 1/4/8/16 samples, oracle / random /
+#    Hungarian-matched single-sample quality, aggregate and per ambiguity bucket
+python scripts/evaluate.py --checkpoint runs/baseline/checkpoints/best.pt --split test
+
+# 3. compare arms under identical data, split, seed and budget
+python scripts/compare.py --split test \
+    --checkpoint baseline-short=runs/baseline-short/checkpoints/best.pt \
+    --checkpoint modernized-short=runs/modernized-short/checkpoints/best.pt \
+    --json results/comparison_test.json --csv results/comparison_test.csv
+
+# 4. the selection table: head, size-prior control, random, oracle and ceiling per bucket
+python scripts/consensus_headroom.py --split test \
+    --head-checkpoint runs/selection-head/checkpoints/best.pt \
+    --out results/consensus_selection_test.json
+
+# 5. export what the notebook renders
+python scripts/export_showcase.py      # -> data/processed/showcase.npz
+python scripts/make_colab_subset.py    # -> lidc_colab_demo.npz + colab_demo_split.json
 ```
 
-`configs/modernized.yaml` is live: it sets `model.latent_covariance: full`, a
-full-covariance latent Gaussian parameterized by its Cholesky factor, and that one line is
-its only difference from `baseline.yaml` besides the run name. Diff the configs — the only
-lines that differ between variants are the flags under test.
+`--split` has no default anywhere: development happens on `val`, and `test` is evaluated
+once, at the end.
 
-`configs/extension.yaml` is still a scaffold: it loads and freezes its base model, logs the
-freeze record, and then raises, because the head is phase 3. Its **scoring target is
-decided** — a candidate mask is scored by soft Dice against the *soft consensus*
-`c = mean of the four grader masks`, so each pixel of `c` says what fraction of graders
-included it, and the head regresses onto that score. Consensus is the **selection target
-only**: GED and every other distribution metric keep using the four separate grader masks,
-because collapsing them into one average would discard exactly the grader spread phase 1
-measures. Note that soft-consensus scores are bounded well below 1 by construction — a
-perfect mask on an image where only one of four graders saw a lesion scores 0.40, not 1.0 —
-so they are reported against the per-bucket ceiling, never against 1.0.
+## Repository layout
 
-`--split` is required and has no default: development happens on `val`, and `test` is
-evaluated once for the final numbers. Metrics are GED at 1/4/8/16 samples, oracle /
-random / Hungarian-matched single-sample quality, and two degenerate baselines
-(all-empty predictor, emptiest-sample selection) — reported aggregate and per ambiguity
-bucket, because an all-empty predictor scores Dice 0.75 on the 33% of patches where
-three of four graders are empty.
+| path | contents |
+|---|---|
+| `src/probunet/` | the package — model, data, training, evaluation, extension, notebook helpers |
+| `scripts/` | command-line entry points, one per stage above |
+| `configs/` | one YAML per variant; a diff between two is the record of what that comparison changed |
+| `tests/` | pytest suite, CPU-only, skipping cleanly without the full dataset |
+| `results/` | tracked evaluation and comparison JSON/CSV — every reported number |
+| `notebooks/` | `submission.ipynb`, a narrative layer whose logic lives in the package |
+| `data/splits/` | the frozen split and its notes |
+| `data/processed/` | tracked exports (`showcase.npz`, `lidc_colab_demo.npz`); the 450 MB dataset is not committed |
+| `runs/` | checkpoints and TensorBoard events — gitignored, never needed to read a result |
+| `scratch/` | one-off conversion and analysis scripts — gitignored, never imported by the package |
 
-Device selection is automatic (cuda → mps → cpu) and logged at startup. Seeds do not
-reproduce across backends, so every run in one comparison must come from the same
-device; checkpoints and results both record the device, torch version and git SHA.
+## Where the numbers live
 
-## Where everything lives
+| claim | file |
+|---|---|
+| Phase 1 GED table and single-sample quality | `results/evaluation_test_baseline.json` |
+| Phase 2 matched pair, aggregate and per bucket | `results/comparison_test.json`, `.csv` |
+| each Phase 2 arm on its own | `results/evaluation_test_baseline-short.json`, `evaluation_test_modernized-short.json` |
+| Phase 2's refuted mechanism — effective latent rank, validation | `results/latent_geometry_baseline_short.json`, `latent_geometry_modernized_short.json` |
+| the selection head on each frozen base | `results/consensus_selection_test.json`, `consensus_selection_modernized_test.json` |
+| distribution metrics unchanged by the head | `results/evaluation_test_selection-head.json` against `evaluation_test_baseline.json` |
+| the headroom and ceiling pass that preceded the head | `results/consensus_headroom_baseline.json`, `consensus_ceilings_val.json` |
 
-The distinction that trips people up on a fresh clone: **training output is ignored,
-results are tracked.**
+Validation counterparts (`*_val.json`) are the development record and are labelled as such
+wherever they appear. Every file carries its own provenance: checkpoint, epoch, device,
+torch version, sampling seed and the git revision of both the run and the evaluation.
 
-| path | git | contents |
-|---|---|---|
-| `src/probunet/` | tracked | the package — all real logic |
-| `configs/` | tracked | the three variant configs + smoke |
-| `scripts/` | tracked | CLI entry points |
-| `tests/` | tracked | pytest suite |
-| `results/` | **tracked** | evaluation + comparison JSON/CSV — what the notebook reads |
-| `data/splits/split.json` | **tracked** | the frozen split (+ `SPLIT_NOTES.md`) |
-| `data/processed/lidc.json` | **tracked** | conversion provenance |
-| `data/processed/lidc_subset.npz` | **tracked** | ~2 MB, panel patches for the notebook |
-| `data/processed/lidc_colab_demo.npz` | **tracked** | ~8 MB, train patches so the notebook's Tier 2 can train on Colab |
-| `data/splits/colab_demo_split.json` | **tracked** | the demo's own split — its indices address the file above, **not** `lidc.npz` |
-| `notebooks/` | tracked | thin narrative layer, no logic |
-| `DEVIATIONS.md` | tracked | every departure from the paper/reference |
-| `runs/`, `experiments/` | **ignored** | checkpoints (~315 MB each), TensorBoard events |
-| `data/raw/` | **ignored** | the source pickle (3.2 GiB) |
-| `data/processed/lidc.npz` | **ignored** | the full converted dataset (~450 MB) |
-| `scratch/` | **ignored** | one-off scripts, never imported |
+## Hardware
 
-`src/probunet/paths.py` is the single source of truth for that table, and
-`tests/test_paths.py` asserts it against `git check-ignore` — so a stray `.gitignore`
-edit cannot silently make `results/` unreachable from Colab.
+Full-length training ran on a single RTX 3070 Ti (8 GiB). The Phase 1 budget is the paper's
+240,000 iterations at batch 32 and takes days, so it does not fit in a hosted session;
+section 7 of the notebook is the path that executes in one. Device selection is automatic
+(cuda → mps → cpu) and logged at startup. Seeds do not reproduce across backends, so every
+run in a single comparison comes from the same device, and both checkpoints and results
+records name it.
 
-Large artifacts are shared out of band:
+## Further reading
 
-```bash
-python scripts/export_weights.py runs/baseline/checkpoints/best.pt   # ~315 MB -> ~105 MB
-python scripts/export_subset.py                                      # -> lidc_subset.npz
-python scripts/make_colab_subset.py                                  # -> lidc_colab_demo.npz + colab_demo_split.json
-```
-
-A weights-only export drops the optimizer state (Adam keeps two moment buffers per
-parameter) but keeps the config, epoch and git SHA, so it stays traceable. Full
-checkpoints remain the authoritative resumable artifact.
-
-## The notebook
-
-`notebooks/submission.ipynb` runs **on CPU, without training and without the full
-dataset**: it needs only the repo (tracked `comparison.json` + `lidc_subset.npz`) plus
-three weights-only files. Three training runs exceed a Colab session, and a different
-device would produce numbers that are not comparable with the reported ones.
+- `DEVIATIONS.md` — every departure from the paper and the reference implementations, with
+  what it costs.
+- `configs/` — the flags under test; a two-line diff is the whole of Phase 2.
+- `data/splits/SPLIT_NOTES.md` — known limitations of the split.

@@ -1,10 +1,9 @@
 # results/
 
-> **The `comparison.json` and `comparison.csv` currently committed here are
-> PLACEHOLDERS from a 2-epoch smoke run, not results.** They exist so that
-> `notebooks/submission.ipynb` runs on a fresh clone before any real training has
-> happened. The `note` field in the JSON says so too. Regenerate them from real
-> baseline / modernized / extension runs before writing the report.
+`comparison.json` is the Phase 2 matched pair on the **validation** split and
+`comparison_test.json` the same pair on **test**; the `*_val.json` files are the
+development record and the `*_test.json` files carry the reported numbers. The root
+`README.md` maps each file to the claim it backs.
 
 Small, **tracked** evaluation summaries. This directory is the counterpart to `runs/`:
 
