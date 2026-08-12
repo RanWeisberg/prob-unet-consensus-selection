@@ -1073,7 +1073,7 @@ def test_extension_config_uses_selection_head_mode() -> None:
 
 def _notebook_code() -> str:
     """Every code cell of the submission notebook, concatenated."""
-    notebook = json.loads((REPO_ROOT / "notebooks" / "submission.ipynb").read_text())
+    notebook = json.loads((REPO_ROOT / "submission.ipynb").read_text())
     assert notebook["nbformat"] == 4
     return "\n".join(
         "".join(cell["source"])

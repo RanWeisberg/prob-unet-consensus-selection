@@ -26,7 +26,7 @@ python scripts/compare.py --split val \
 ```
 
 `comparison.json` and `comparison.csv` hold every metric — aggregate and per ambiguity
-bucket — for every variant plus the degenerate baselines. `notebooks/submission.ipynb`
+bucket — for every variant plus the degenerate baselines. `submission.ipynb`
 reads `comparison.json`.
 
 Each file records its own provenance: checkpoint path, checkpoint epoch, the git

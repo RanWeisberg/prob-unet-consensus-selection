@@ -35,8 +35,8 @@ from typing import Iterator, Sequence
 
 from probunet.paths import COLAB_DEMO_NPZ, FULL_NPZ, SHOWCASE_NPZ, SUBSET_NPZ
 
-NOTEBOOK = Path("notebooks/submission.ipynb")
-"""The one notebook that ships. Others, if any, stay in the repository."""
+NOTEBOOK = Path("submission.ipynb")
+"""The notebook, at the repository root: the first thing a reader opens."""
 
 CONVERSION_SCRIPTS: tuple[Path, ...] = (
     Path("scratch/inspect_data.py"),

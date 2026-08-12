@@ -1,6 +1,6 @@
 # A Probabilistic U-Net with a post-hoc consensus-selection head
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/RanWeisberg/prob-unet-consensus-selection/blob/main/notebooks/submission.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/RanWeisberg/prob-unet-consensus-selection/blob/main/submission.ipynb)
 
 A PyTorch reimplementation of the Probabilistic U-Net (Kohl et al., *A Probabilistic U-Net
 for Segmentation of Ambiguous Images*, NeurIPS 2018,
@@ -16,11 +16,16 @@ exactly one setting. Course project for *Medical Images Processing with Deep Lea
 
 ## The notebook
 
-`notebooks/submission.ipynb` is the guided tour of the method and its results, and it needs
-nothing installed: Colab ships torch, numpy, matplotlib and scipy, and sections 0–6 render
-recorded predictions and published tables from files tracked in this repository. Section 7
-trains an undersized model from scratch on a 288-patch subset — the part that executes
-inside a session — and section 8 runs the test suite.
+`submission.ipynb` is the guided tour of the method and its results, and it needs nothing
+installed: Colab ships torch, numpy, matplotlib and scipy, and sections 0–6 render recorded
+predictions and published tables from files tracked in this repository. Section 7 trains an
+undersized model from scratch on a 288-patch subset — the part that executes inside a
+session — and section 8 runs the test suite.
+
+It opens two ways. Upload `submission.ipynb` on its own, or follow the badge above, and the
+first cell finds no repository beside it and clones this one before doing anything else;
+unzip the whole archive into the session instead and that cell finds the files already
+there, uses them, and clones nothing.
 
 ## Install
 
@@ -98,7 +103,7 @@ once, at the end.
 | `configs/` | one YAML per variant; a diff between two is the record of what that comparison changed |
 | `tests/` | pytest suite, CPU-only, skipping cleanly without the full dataset |
 | `results/` | tracked evaluation and comparison JSON/CSV — every reported number |
-| `notebooks/` | `submission.ipynb`, a narrative layer whose logic lives in the package |
+| `submission.ipynb` | the notebook, at the root; a narrative layer whose logic lives in the package |
 | `data/splits/` | the frozen split and its notes |
 | `data/processed/` | tracked exports (`showcase.npz`, `lidc_colab_demo.npz`); the 450 MB dataset is not committed |
 | `runs/` | checkpoints and TensorBoard events — gitignored, never needed to read a result |

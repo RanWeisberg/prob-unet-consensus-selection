@@ -70,7 +70,7 @@ def fake_repo(tmp_path: Path) -> Path:
         "README.md": "# readme",
         "pyproject.toml": "[project]",
         "DEVIATIONS.md": "# deviations",
-        "notebooks/submission.ipynb": notebook_source(with_outputs=True),
+        "submission.ipynb": notebook_source(with_outputs=True),
         "data/processed/showcase.npz": "arrays",
         "data/processed/lidc_colab_demo.npz": "patches",
         "src/probunet/__init__.py": "",
@@ -92,7 +92,7 @@ def fake_repo(tmp_path: Path) -> Path:
         "runs/baseline/checkpoints/best.pt": "weights",
         "src/probunet/__pycache__/prob_unet.pyc": "bytecode",
         "src/probunet_consensus_selection.egg-info/PKG-INFO": "metadata",
-        "notebooks/scratch_notes.ipynb": "{}",
+        "notes.ipynb": "a second notebook, not on the allowlist",
         ".git/config": "",
         ".pytest_cache/v/cache/lastfailed": "{}",
         "dist/previous.zip": "",
@@ -129,7 +129,7 @@ def test_included_paths_are_archived(fake_repo: Path) -> None:
         "README.md",
         "pyproject.toml",
         "DEVIATIONS.md",
-        "notebooks/submission.ipynb",
+        "submission.ipynb",
         "data/processed/showcase.npz",
         "data/processed/lidc_colab_demo.npz",
         "src/probunet/__init__.py",
@@ -164,7 +164,7 @@ def test_excluded_paths_are_not_archived(fake_repo: Path) -> None:
         "runs/baseline/checkpoints/best.pt",
         "src/probunet/__pycache__/prob_unet.pyc",
         "src/probunet_consensus_selection.egg-info/PKG-INFO",
-        "notebooks/scratch_notes.ipynb",
+        "notes.ipynb",
         ".git/config",
         ".pytest_cache/v/cache/lastfailed",
         "dist/previous.zip",
@@ -215,10 +215,10 @@ def test_a_missing_conversion_script_warns_but_still_builds(fake_repo: Path) -> 
 # --------------------------------------------------------------------------- #
 def test_build_refuses_a_notebook_with_no_saved_outputs(fake_repo: Path) -> None:
     """An unexecuted notebook opens blank for anyone without the training hardware."""
-    (fake_repo / "notebooks" / "submission.ipynb").write_text(
+    (fake_repo / "submission.ipynb").write_text(
         notebook_source(with_outputs=False)
     )
-    assert not notebook_has_outputs(fake_repo / "notebooks" / "submission.ipynb")
+    assert not notebook_has_outputs(fake_repo / "submission.ipynb")
     with pytest.raises(SubmissionError, match="no saved outputs"):
         build_archive(fake_repo, IDS)
 
@@ -262,7 +262,7 @@ def test_archive_extracts_to_the_expected_tree(fake_repo: Path, tmp_path: Path) 
 
     for marker in (
         "README.md",
-        "notebooks/submission.ipynb",
+        "submission.ipynb",
         "data/processed/showcase.npz",
         "data/processed/lidc_colab_demo.npz",
         "data/splits/split.json",
@@ -277,7 +277,7 @@ def test_archive_extracts_to_the_expected_tree(fake_repo: Path, tmp_path: Path) 
     assert archive.file_count == len(archived_names(fake_repo))
     assert archive.counts["src"] == 2
     assert archive.counts["scratch"] == 2      # the two conversion scripts, not the rest
-    assert archive.counts["(root)"] == 3          # README, pyproject, DEVIATIONS
+    assert archive.counts["(root)"] == 4      # README, pyproject, DEVIATIONS, the notebook
 
 
 def test_a_report_is_placed_at_the_archive_root(fake_repo: Path) -> None:

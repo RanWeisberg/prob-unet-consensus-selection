@@ -1,4 +1,4 @@
-"""Display helpers for ``notebooks/submission.ipynb``.
+"""Display helpers for ``submission.ipynb``.
 
 The notebook is a **thin narrative layer**: markdown, a call, a figure. Everything it
 needs beyond that lives here, because CLAUDE.md's rule for the notebook is that logic

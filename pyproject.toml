@@ -22,7 +22,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
-# The package never plots; only notebooks/submission.ipynb does. Colab ships
+# The package never plots; only submission.ipynb does. Colab ships
 # matplotlib preinstalled, so this extra is only needed for a local notebook run.
 notebook = [
     "matplotlib>=3.8",
