@@ -54,8 +54,8 @@ script under `scratch/` with a restricted unpickler; the package itself only eve
 stratified over the number of non-empty grader masks; it is generated once with **seed
 1806**, committed as `data/splits/split.json`, and `load_split()` never regenerates it. The
 committed split is what the reported runs used, so step three reproduces rather than
-replaces it. `scratch/` is not part of the installable package and is gitignored; its
-scripts live in the repository linked above.
+replaces it. The two conversion scripts are the only part of `scratch/` that ships; the
+rest of that directory is one-off analysis and is not part of the installable package.
 
 ## Reproducing the pipeline
 

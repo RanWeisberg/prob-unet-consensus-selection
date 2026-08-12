@@ -38,6 +38,17 @@ from probunet.paths import COLAB_DEMO_NPZ, FULL_NPZ, SHOWCASE_NPZ, SUBSET_NPZ
 NOTEBOOK = Path("notebooks/submission.ipynb")
 """The one notebook that ships. Others, if any, stay in the repository."""
 
+CONVERSION_SCRIPTS: tuple[Path, ...] = (
+    Path("scratch/inspect_data.py"),
+    Path("scratch/convert_data.py"),
+)
+"""The two scripts the README's dataset section tells the reader to run.
+
+They are the only part of ``scratch/`` that ships. The rest of that directory is one-off
+analysis. ``scratch/`` is gitignored, so these two files can be absent from a fresh clone --
+:func:`build_archive` warns in that case rather than refusing, because an archive without
+them is still worth building and the warning says exactly what it lacks."""
+
 INCLUDED_FILES: tuple[Path, ...] = (
     Path("README.md"),
     Path("pyproject.toml"),
@@ -45,6 +56,7 @@ INCLUDED_FILES: tuple[Path, ...] = (
     NOTEBOOK,
     SHOWCASE_NPZ,
     COLAB_DEMO_NPZ,
+    *CONVERSION_SCRIPTS,
 )
 """Individual files to archive, each at its repository-relative path."""
 
@@ -286,6 +298,13 @@ def build_archive(
         )
 
     warnings: list[str] = []
+    absent = [s.as_posix() for s in CONVERSION_SCRIPTS if not (root / s).is_file()]
+    if absent:
+        warnings.append(
+            "the dataset instructions in README.md point at " + ", ".join(absent)
+            + ", which this working tree does not have (scratch/ is gitignored), so the "
+              "archive will not contain them"
+        )
     if report is None:
         warnings.append(
             "NO REPORT PDF. The archive is missing the required report; pass --report PATH."

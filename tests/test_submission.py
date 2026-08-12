@@ -16,6 +16,7 @@ import pytest
 
 from probunet import submission
 from probunet.submission import (
+    CONVERSION_SCRIPTS,
     INCLUDED_DIRS,
     INCLUDED_FILES,
     SubmissionError,
@@ -80,7 +81,10 @@ def fake_repo(tmp_path: Path) -> Path:
         "scripts/train.py": "",
         "results/comparison_test.json": "{}",
         "data/splits/split.json": "{}",
+        "scratch/inspect_data.py": "",
+        "scratch/convert_data.py": "",
         # excluded
+        "scratch/seed_sweep.py": "a one-off analysis, not part of the instructions",
         "FINDINGS.md": "the working record",
         "CLAUDE.md": "the project spec",
         "data/processed/lidc.npz": "450 MB in real life",
@@ -136,6 +140,10 @@ def test_included_paths_are_archived(fake_repo: Path) -> None:
         "scripts/train.py",
         "results/comparison_test.json",
         "data/splits/split.json",
+        # the two conversion scripts: the README's dataset section tells the reader to run
+        # them, so an archive without them has instructions it cannot satisfy
+        "scratch/inspect_data.py",
+        "scratch/convert_data.py",
     ):
         assert expected in names, f"{expected} is missing from the archive"
 
@@ -162,6 +170,7 @@ def test_excluded_paths_are_not_archived(fake_repo: Path) -> None:
         "dist/previous.zip",
         "scripts/__pycache__/train.pyc",
         "src/.DS_Store",
+        "scratch/seed_sweep.py",
     ):
         assert forbidden not in names, f"{forbidden} must not be archived"
 
@@ -179,11 +188,26 @@ def test_exclusions_hold_inside_an_allowlisted_directory(fake_repo: Path) -> Non
 
 
 def test_the_real_repository_matches_the_allowlist() -> None:
-    """The allowlist names paths that exist, so a rename cannot silently empty the archive."""
+    """The allowlist names paths that exist, so a rename cannot silently empty the archive.
+
+    The two conversion scripts are exempt: ``scratch/`` is gitignored, so they are present
+    on the machine that converted the data and absent from a fresh clone. Their absence is
+    a build-time warning, covered below, not a test failure here.
+    """
     for relative in INCLUDED_FILES:
+        if relative in CONVERSION_SCRIPTS and not (REPO_ROOT / relative).exists():
+            continue
         assert (REPO_ROOT / relative).is_file(), f"{relative} is on the allowlist but absent"
     for relative in INCLUDED_DIRS:
         assert (REPO_ROOT / relative).is_dir(), f"{relative} is on the allowlist but absent"
+
+
+def test_a_missing_conversion_script_warns_but_still_builds(fake_repo: Path) -> None:
+    """A clone without ``scratch/`` still builds, and is told what its instructions lack."""
+    (fake_repo / "scratch" / "convert_data.py").unlink()
+    archive = build_archive(fake_repo, IDS)
+    assert archive.path.is_file()
+    assert any("convert_data.py" in warning for warning in archive.warnings)
 
 
 # --------------------------------------------------------------------------- #
@@ -252,6 +276,7 @@ def test_archive_extracts_to_the_expected_tree(fake_repo: Path, tmp_path: Path) 
 
     assert archive.file_count == len(archived_names(fake_repo))
     assert archive.counts["src"] == 2
+    assert archive.counts["scratch"] == 2      # the two conversion scripts, not the rest
     assert archive.counts["(root)"] == 3          # README, pyproject, DEVIATIONS
 
 
