@@ -14,7 +14,7 @@ into a cell.
 
 **numpy and matplotlib only.** The notebook must run in a fresh Colab with no
 ``pip install``, so nothing here may reach for pandas, seaborn, or anything else whose
-version could differ from the grader's.
+version could differ between machines.
 """
 
 from __future__ import annotations
@@ -51,6 +51,17 @@ RC_PARAMS: dict[str, Any] = {
     "axes.spines.right": False,
 }
 """Figure defaults, applied once by the notebook's library cell."""
+
+FIGSIZE: dict[str, tuple[float, float]] = {
+    "tile_row": (12.2, 2.5),
+    "tile_grid": (12.2, 3.4),
+    "chart": (7.8, 3.2),
+    "chart_pair": (11.4, 3.4),
+    "case": (12.6, 4.2),
+    "arms": (12.2, 3.2),
+    "demo_row": (13.0, 1.8),
+}
+"""Figure sizes by role, so every section's figures line up at the same widths."""
 
 
 # ---------------------------------------------------------------------------------
@@ -315,7 +326,7 @@ def phase2_case_figure(showcase: Mapping[str, Any], prefix: str) -> dict[str, in
     box = crop_box([c["masks"], base, modern], margin=10)
     areas = {"baseline-short": mask_areas(base), "modernized-short": mask_areas(modern)}
 
-    fig = plt.figure(figsize=(12.2, 3.2))
+    fig = plt.figure(figsize=FIGSIZE["arms"])
     grid = fig.add_gridspec(
         2, 11, width_ratios=[1.3, 0.3] + [1] * 4 + [0.3] + [1] * 4,
         hspace=0.30, wspace=0.06, left=0.03, right=0.99, top=0.83, bottom=0.06,
@@ -333,15 +344,17 @@ def phase2_case_figure(showcase: Mapping[str, Any], prefix: str) -> dict[str, in
             if k == 0:
                 ax.set_ylabel(name, fontsize=7, color=colour)
 
+    nonempty = {name: int((a > 0).sum()) for name, a in areas.items()}
     r0, r1, c0, c1 = box
     fig.suptitle(
         f"TEST — patch {int(c['patch_index'])}, bucket {int(c['bucket'])}   |   "
         f"GED {float(c['ged_baseline_short']):.3f} -> "
         f"{float(c['ged_modernized_short']):.3f}  (criterion "
-        f"{float(c['criterion']):+.4f})   |   first 8 of 16 samples per arm   |   "
-        f"crop {r0}:{r1}, {c0}:{c1}", fontsize=8.5)
+        f"{float(c['criterion']):+.4f})   |   first 8 of 16 samples per arm, non-empty "
+        + " vs ".join(f"{v}/16" for v in nonempty.values())
+        + f"   |   crop {r0}:{r1}, {c0}:{c1}", fontsize=8.5)
     plt.show()
-    return {name: int((a > 0).sum()) for name, a in areas.items()}
+    return nonempty
 
 
 def selection_case_figure(
@@ -370,7 +383,7 @@ def selection_case_figure(
 
     # Taller than it looks like it needs: the top row's tiles carry an xlabel naming the
     # rule that picked them, and it collides with the second row's titles otherwise.
-    fig, axes = plt.subplots(2, 9, figsize=(12.6, 4.2))
+    fig, axes = plt.subplots(2, 9, figsize=FIGSIZE["case"])
     panel(axes[0, 0], c["image"], box=box, title="CT patch")
     consensus_panel(axes[1, 0], c["consensus"], box)
 
@@ -403,5 +416,313 @@ def selection_case_figure(
            for name, index in picks.items()]
           + [["ceiling", "—", f"{float(c['ceiling']):.4f}", "—"],
              ["mean over all 16", "—", f"{float(c['mean_score']):.4f}",
-              "<- this is the published 'random' quantity"]])
+              "the published 'random' column"]])
     return picks
+
+
+# ---------------------------------------------------------------------------------
+# Provenance printers
+# ---------------------------------------------------------------------------------
+
+
+def print_export_verification(manifest: Mapping[str, Any]) -> None:
+    """Print one confirmation line per results file the export re-derived.
+
+    ``scripts/export_showcase.py`` recomputes the published aggregate tables through the
+    same code path that wrote them and records, per file, whether every figure matched
+    exactly. This renders that record.
+
+    Args:
+        manifest: The showcase manifest.
+    """
+    for a in manifest["assertions"]:
+        what = (f"{len(a['figures'])} figures x {len(a['buckets'])} buckets"
+                if "figures" in a else
+                "GED @ " + ", ".join(str(n) for n in a["sample_counts"])
+                + f" ({', '.join(a['statistics'])})")
+        name = Path(a["source"].replace("\\", "/")).name
+        print(f"  {'MATCHED' if a['matched'] else 'FAILED':7s}  {name:46s}  {what}")
+    print(f"  export {manifest['export_git_revision']}, "
+          f"{manifest['generated_at'][:19]} UTC, no tolerance")
+
+
+def set_a_guard_line(manifest: Mapping[str, Any]) -> str:
+    """One line describing the Set A legibility guard and what it retained.
+
+    Args:
+        manifest: The showcase manifest.
+
+    Returns:
+        A single sentence, or a note if the export predates the guard.
+    """
+    guard = manifest.get("set_a_display_guard")
+    if guard is None:
+        return "This export predates the Set A legibility guard."
+    per_bucket = manifest["guards"]["set_a"].get("per_bucket_eligible", {})
+    retained = ", ".join(f"{k}:{v}" for k, v in per_bucket.items())
+    return (f"Set A legibility guard (set after the first export was inspected): grader-union "
+            f"footprint >= {guard['min_consensus_footprint_px']} px and "
+            f">= {guard['min_nonempty_samples_per_arm']} non-empty samples per arm, applied "
+            f"symmetrically to both arms. Eligible {guard['n_eligible_after']:,} of "
+            f"{guard['n_total']:,} test patches "
+            f"({100 * guard['n_eligible_after'] / guard['n_total']:.1f}%)"
+            + (f"; per bucket {retained}." if retained else "."))
+
+
+# ---------------------------------------------------------------------------------
+# Figures built from tracked arrays
+# ---------------------------------------------------------------------------------
+
+
+def graders_figure(showcase: Mapping[str, Any], prefix: str) -> None:
+    """One patch: the CT crop, its four grader masks, and the soft consensus.
+
+    Args:
+        showcase: The loaded ``showcase.npz``.
+        prefix: Case key prefix, e.g. ``"b2"``.
+    """
+    c = case_arrays(showcase, prefix)
+    box = crop_box([c["masks"]], margin=16)
+    fig, axes = plt.subplots(1, 6, figsize=FIGSIZE["tile_row"])
+    panel(axes[0], c["image"], box=box, title="CT patch (128x128)")
+    for i in range(4):
+        panel(axes[i + 1], c["image"], c["masks"][i], box=box, colour=PALETTE["grader"],
+              title=f"grader {i + 1} — {int(c['masks'][i].sum())} px")
+    bar = fig.colorbar(consensus_panel(axes[5], c["consensus"], box), ax=axes[5],
+                       fraction=0.046, ticks=[0, .25, .5, .75, 1])
+    bar.ax.tick_params(labelsize=6)
+    fig.suptitle(f"TEST — patch {int(c['patch_index'])}, ambiguity bucket "
+                 f"{int(c['bucket'])} of 4, achievable ceiling {float(c['ceiling']):.3f}",
+                 fontsize=9)
+    fig.tight_layout()
+    plt.show()
+
+
+def samples_figure(showcase: Mapping[str, Any], prefix: str, title: str,
+                   key: str = "candidates", colour: str = PALETTE["head"]) -> None:
+    """A 2x8 grid of one patch's prior samples, areas in the tile titles.
+
+    Args:
+        showcase: The loaded ``showcase.npz``.
+        prefix: Case key prefix.
+        title: Leading text of the figure title.
+        key: Which stack to draw, un-prefixed.
+        colour: Overlay colour.
+    """
+    c = case_arrays(showcase, prefix)
+    stack = c[key]
+    box = crop_box([c["masks"], stack], margin=10)
+    areas = mask_areas(stack)
+    fig, axes = plt.subplots(2, 8, figsize=FIGSIZE["tile_grid"])
+    for i, ax in enumerate(axes.ravel()):
+        panel(ax, c["image"], stack[i], box=box, colour=colour,
+              title=f"#{i}   {int(areas[i])} px")
+    fig.suptitle(
+        f"{title}   |   patch {int(c['patch_index'])}, bucket {int(c['bucket'])}, "
+        f"{int((areas > 0).sum())} of {len(areas)} samples non-empty   |   grader areas "
+        f"{[int(m.sum()) for m in c['masks']]} px", fontsize=8.5)
+    fig.tight_layout()
+    plt.show()
+
+
+def bucket_ged_figure(
+    buckets: Sequence[str],
+    base: Sequence[float],
+    modern: Sequence[float],
+    n_patches: Sequence[int],
+    labels: Sequence[str],
+    sample_count: int,
+) -> list[float]:
+    """Per-bucket GED for two arms, beside the percentage change per bucket.
+
+    Args:
+        buckets: Bucket names in order.
+        base: First arm's GED per bucket.
+        modern: Second arm's GED per bucket.
+        n_patches: Patch count per bucket.
+        labels: The two arm names.
+        sample_count: Sample count the GED was measured at.
+
+    Returns:
+        The percentage change per bucket, for the caller's table.
+    """
+    pct = [100.0 * (y - x) / x for x, y in zip(base, modern)]
+    fig, axes = plt.subplots(1, 2, figsize=FIGSIZE["chart_pair"])
+    x = np.arange(len(buckets))
+
+    axes[0].bar(x - 0.2, base, 0.4, label=labels[0], color=PALETTE["baseline"])
+    axes[0].bar(x + 0.2, modern, 0.4, label=labels[1], color=PALETTE["modernized"])
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels([f"{k}\n(n={n:,})" for k, n in zip(buckets, n_patches)])
+    axes[0].set_ylabel(f"GED^2 @{sample_count}")
+    axes[0].set_title("TEST — GED per ambiguity bucket")
+    axes[0].legend(fontsize=7.5)
+
+    axes[1].bar(x, pct, 0.55,
+                color=[PALETTE["modernized"] if p > 0 else PALETTE["oracle"] for p in pct])
+    axes[1].axhline(0, color="k", lw=0.8)
+    for xi, p in zip(x, pct):
+        axes[1].annotate(f"{p:+.1f}%", (xi, p), ha="center",
+                         va="bottom" if p > 0 else "top", fontsize=8)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(buckets)
+    axes[1].set_ylabel("change in GED^2 (%), negative is better")
+    axes[1].set_title("worse where existence is in doubt, better where graders agree")
+
+    fig.supxlabel("non-empty grader masks", fontsize=8.5)
+    fig.tight_layout()
+    plt.show()
+    return pct
+
+
+def score_bars(labels: Sequence[str], values: Sequence[float], title: str) -> None:
+    """One bar per selection rule, annotated with its score.
+
+    Args:
+        labels: Rule names; each must have an entry in :data:`PALETTE`.
+        values: Soft-consensus Dice per rule.
+        title: Figure title.
+    """
+    fig, ax = plt.subplots(figsize=FIGSIZE["chart"])
+    bars = ax.bar(list(labels), list(values), color=[PALETTE[k] for k in labels], width=0.62)
+    for rect, value in zip(bars, values):
+        ax.annotate(f"{value:.4f}", (rect.get_x() + rect.get_width() / 2, rect.get_height()),
+                    ha="center", va="bottom", fontsize=8.5)
+    ax.set_ylabel("soft-consensus Dice")
+    ax.set_ylim(0, max(values) * 1.18)
+    ax.set_title(title)
+    fig.tight_layout()
+    plt.show()
+
+
+def denominator_figure(buckets: Sequence[str], e_tot: Sequence[float],
+                       e_left: Sequence[float]) -> None:
+    """The head's edge as a fraction of each of the two correct denominators.
+
+    Args:
+        buckets: Bucket names in order.
+        e_tot: Edge as a percentage of total headroom.
+        e_left: Edge as a percentage of the headroom the area control leaves.
+    """
+    fig, ax = plt.subplots(figsize=FIGSIZE["chart"])
+    x = np.arange(len(buckets))
+    ax.plot(x, e_tot, "o-", color=PALETTE["area"], label="of total headroom (oracle - random)")
+    ax.plot(x, e_left, "s-", color=PALETTE["head"], label="of headroom the area rule leaves")
+    ax.set_xticks(x)
+    ax.set_xticklabels(buckets)
+    ax.set_xlabel("non-empty grader masks")
+    ax.set_ylabel("head's edge (%)")
+    ax.set_title("TEST — the two denominators trend in opposite directions")
+    ax.legend(fontsize=7.5)
+    fig.tight_layout()
+    plt.show()
+
+
+def score_agreement_figure(showcase: Mapping[str, Any]) -> float:
+    """Predicted against true score for every candidate, and the outcome per rule.
+
+    Args:
+        showcase: The loaded ``showcase.npz``, carrying the Set C arrays.
+
+    Returns:
+        The Pearson correlation between predicted and true candidate scores.
+    """
+    pred, true = showcase["c_pred_scores"], showcase["c_true_scores"]
+    per_candidate_bucket = np.repeat(showcase["c_buckets"], int(showcase["c_n_candidates"]))
+
+    fig, axes = plt.subplots(1, 2, figsize=FIGSIZE["chart_pair"])
+    for bucket in np.unique(showcase["c_buckets"]):
+        keep = per_candidate_bucket == bucket
+        axes[0].scatter(true[keep], pred[keep], s=2.5, alpha=0.18, label=f"bucket {bucket}")
+    limits = [min(true.min(), pred.min()), max(true.max(), pred.max())]
+    axes[0].plot(limits, limits, "k--", lw=0.9, label="perfect prediction")
+    axes[0].set_xlabel("true soft-consensus Dice")
+    axes[0].set_ylabel("predicted score")
+    axes[0].set_title(f"TEST — {len(pred):,} candidates over "
+                      f"{len(showcase['c_buckets']):,} patches")
+    legend = axes[0].legend(fontsize=7, markerscale=4)
+    for handle in legend.legend_handles:
+        handle.set_alpha(1)
+
+    axes[1].hist([showcase["c_random_scores"], showcase["c_area_scores"],
+                  showcase["c_head_scores"], showcase["c_oracle_scores"]],
+                 bins=28, histtype="step", lw=1.4,
+                 color=[PALETTE[k] for k in ("random", "area", "head", "oracle")],
+                 label=["random", "area", "head", "oracle"])
+    axes[1].set_xlabel("soft-consensus Dice of the selected sample")
+    axes[1].set_ylabel("patches")
+    axes[1].set_title("TEST — per-patch outcome by rule")
+    axes[1].legend(fontsize=7.5)
+
+    fig.tight_layout()
+    plt.show()
+    return float(np.corrcoef(true, pred)[0, 1])
+
+
+def composition_figure(labels: Sequence[str], first: Sequence[float],
+                       second: Sequence[float], arms: Sequence[str], title: str) -> None:
+    """The same four selection rules under two frozen bases, deltas annotated.
+
+    Args:
+        labels: Rule names for the x axis.
+        first: Scores on the first base.
+        second: Scores on the second base.
+        arms: The two base names, for the legend.
+        title: Figure title.
+    """
+    fig, ax = plt.subplots(figsize=FIGSIZE["chart"])
+    x = np.arange(len(labels))
+    ax.bar(x - 0.2, first, 0.4, label=arms[0], color=PALETTE["baseline"])
+    ax.bar(x + 0.2, second, 0.4, label=arms[1], color=PALETTE["modernized"])
+    for xi, (a, b) in enumerate(zip(first, second)):
+        ax.annotate(f"{b - a:+.4f}", (xi, max(a, b)), ha="center", va="bottom", fontsize=8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("soft-consensus Dice")
+    ax.set_title(title)
+    ax.legend(fontsize=7.5)
+    fig.tight_layout()
+    plt.show()
+
+
+def demo_loss_figure(history: Sequence[Mapping[str, Any]]) -> None:
+    """The demo run's ELBO curve on a log axis, so the first drop and the tail both read.
+
+    Args:
+        history: The per-epoch records from the demo run's ``summary.json``.
+    """
+    epochs = [h["epoch"] + 1 for h in history]
+    fig, ax = plt.subplots(figsize=FIGSIZE["chart"])
+    ax.plot(epochs, [h["train/total"] for h in history], "o-", color=PALETTE["baseline"],
+            label="train")
+    ax.plot(epochs, [h.get("val/total") for h in history], "s--", color=PALETTE["area"],
+            label="validation")
+    ax.set_yscale("log")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("ELBO total (log scale)")
+    ax.set_title("demo run — not a reported result")
+    ax.legend(fontsize=7.5)
+    fig.tight_layout()
+    plt.show()
+
+
+def demo_samples_figure(image: np.ndarray, masks: np.ndarray, samples: np.ndarray,
+                        title: str) -> None:
+    """The demo model's prior samples beside the four graders of one patch.
+
+    Args:
+        image: ``(H, W)`` CT patch.
+        masks: ``(4, H, W)`` grader masks.
+        samples: ``(n, H, W)`` prior samples from the demo model.
+        title: Figure title.
+    """
+    fig, axes = plt.subplots(1, 1 + len(masks) + len(samples), figsize=FIGSIZE["demo_row"])
+    panel(axes[0], image, title="CT patch")
+    for i, mask in enumerate(masks):
+        panel(axes[1 + i], image, mask, colour=PALETTE["grader"], title=f"grader {i + 1}")
+    for i, sample in enumerate(samples):
+        panel(axes[1 + len(masks) + i], image, sample, colour=PALETTE["head"],
+              title=f"sample {i + 1}")
+    fig.suptitle(title, fontsize=8.5)
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
+    plt.show()
