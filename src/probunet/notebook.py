@@ -368,7 +368,14 @@ def selection_case_figure(
         headline: Sentence appended to the figure title.
 
     Returns:
-        The index each rule picked, including the arbitrary unselected draw.
+        The index each selection rule picked.
+
+    Note:
+        The export also carries ``<prefix>_arbitrary_unselected``, candidate index 0, which
+        earlier versions drew as a contrast tile. It is no longer rendered: on case ``b2``
+        that index is also the head's pick and the oracle, so a tile labelled as an
+        unselected draw was in fact the best candidate in the set. The published random
+        quantity is the mean over all 16, printed as the last row of the table below.
     """
     c = case_arrays(showcase, prefix)
     candidates, true_scores = c["candidates"], c["true_scores"]
@@ -376,7 +383,6 @@ def selection_case_figure(
         "head": int(c["pick_head"]),
         "area": int(c["pick_area"]),
         "oracle": int(c["pick_oracle"]),
-        "arbitrary": int(c["arbitrary_unselected"]),
     }
     box = crop_box([c["masks"], candidates], margin=10)
     areas = mask_areas(candidates)
@@ -400,9 +406,7 @@ def selection_case_figure(
                 spine.set_visible(True)
                 spine.set_linewidth(2.4)
                 spine.set_color(colour)
-            ax.set_xlabel(
-                " / ".join("arbitrary (#0)" if t == "arbitrary" else t for t in tags),
-                fontsize=6.8, color=colour, labelpad=1)
+            ax.set_xlabel(" / ".join(tags), fontsize=6.8, color=colour, labelpad=1)
 
     r0, r1, c0, c1 = box
     fig.suptitle(

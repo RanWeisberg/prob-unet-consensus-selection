@@ -1057,16 +1057,15 @@ def main(argv: list[str] | None = None) -> int:
             f"{case.key_prefix}_pick_oracle": np.asarray(
                 columns["pick_oracle"][position], dtype=np.int64
             ),
-            # NOT called "random", deliberately. The published `random` column is
-            # E[score] over all 16 candidates; a single index is not that quantity, and a
-            # figure label conflating the two would contradict the reported table. This is
-            # candidate index 0 -- an arbitrary sample that no selection rule chose,
-            # exported for visual contrast only. A separately seeded uniform draw was
-            # rejected: it would add a fourth RNG stream to a script whose whole point is
-            # reusing the published one, and one lucky draw could outscore the head and
-            # visually contradict the aggregate table for no reason. All 16 candidates and
-            # their true scores are exported, so this key is a convenience, not
-            # load-bearing.
+            # EXPORTED BUT NO LONGER RENDERED. Candidate index 0 was drawn as a contrast
+            # tile in an earlier version of the notebook figure. On case b2 that index is
+            # also the head's pick and the oracle, so a tile labelled as an unselected draw
+            # was in fact the best candidate in the set -- the opposite of its purpose. The
+            # figure now shows only the three selection rules, and the honest random
+            # quantity is the published `random` column, which is E[score] over all 16
+            # candidates (exported as `_mean_score`), never a single index. The key is kept
+            # so this writer still matches the tracked showcase.npz and its schema test;
+            # nothing reads it.
             f"{case.key_prefix}_arbitrary_unselected": np.asarray(0, dtype=np.int64),
             f"{case.key_prefix}_mean_score": np.asarray(
                 columns["random"][position], dtype=np.float32
