@@ -10,7 +10,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.26",
-    "torch>=2.2",
+    # 2.4 is the floor, not 2.2: the trainer constructs the device-agnostic
+    # torch.amp.GradScaler, which only exists from 2.4.0 onwards.
+    "torch>=2.4",
     # Required at runtime: training logs to TensorBoard, configs are YAML,
     # and Hungarian matching in evaluation uses scipy.optimize.
     "tensorboard>=2.16",

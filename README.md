@@ -36,6 +36,17 @@ pip install -e ".[dev]"
 pytest
 ```
 
+### What to expect from that `pytest`
+
+The provenance tests in `tests/test_paths.py` shell out to `git check-ignore` and
+`git ls-files`, and skip themselves when there is no repository to ask. Opening the
+notebook through the Colab badge produces a real clone, so they run there; running the
+suite inside an extracted `.zip` has no `.git`, so they skip. Skips in that setting are
+expected, not failures.
+
+On Windows, importing `torch` may additionally need the Microsoft Visual C++ 2015-2022
+x64 Redistributable.
+
 ## Dataset
 
 **LIDC-IDRI is not included here.** The images come from the
