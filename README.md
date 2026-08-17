@@ -170,22 +170,4 @@ section 7 of the notebook is the path that executes in one. Device selection is 
 run in a single comparison comes from the same device, and both checkpoints and results
 records name it.
 
-## Further reading
-
-- `DEVIATIONS.md` — every departure from the paper and the reference implementations, with
-  what it costs.
-- `configs/` — the flags under test; a two-line diff is the whole of Phase 2.
-- `data/splits/SPLIT_NOTES.md` — known limitations of the split.
-
-## Citing this work
-
-```bibtex
-@misc{liu_weisberg_2026_probunet_consensus,
-  author       = {Liu, Chenxi and Weisberg, Ran},
-  title        = {Full-Covariance Latents and a Consensus-Selection Head
-                  for the Probabilistic U-Net},
-  year         = {2026},
-  note         = {Course project, Medical Images Processing with Deep Learning (336033)},
-  howpublished = {\url{https://github.com/RanWeisberg/prob-unet-consensus-selection}}
-}
 ```
