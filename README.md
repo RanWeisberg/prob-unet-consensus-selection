@@ -2,17 +2,17 @@
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/RanWeisberg/prob-unet-consensus-selection/blob/main/submission.ipynb)
 
-A PyTorch reimplementation of the Probabilistic U-Net (Kohl et al., *A Probabilistic U-Net
-for Segmentation of Ambiguous Images*, NeurIPS 2018,
-[arXiv:1806.05034](https://arxiv.org/abs/1806.05034)), trained on LIDC-IDRI and extended in
-two independent directions: a **full-covariance latent Gaussian** in place of the paper's
-axis-aligned one, and a **post-hoc consensus-selection head** that scores sampled masks by
-how well they agree with the four expert graders, so one mask can be chosen at inference
-time without ground truth. Both extensions are one config flag away from the reproduction —
-there is a single model implementation, selected by config, so every comparison changes
-exactly one setting. Course project for *Medical Images Processing with Deep Learning
-(336033)*; repository at
-[RanWeisberg/prob-unet-consensus-selection](https://github.com/RanWeisberg/prob-unet-consensus-selection).
+A PyTorch reimplementation of the Probabilistic U-Net [[1]](#references), trained on
+LIDC-IDRI [[3]](#references) and extended in two independent directions: a
+**full-covariance latent Gaussian** in place of the paper's axis-aligned one, and a
+**post-hoc consensus-selection head** that scores sampled masks by how well they agree with
+the four expert graders, so one mask can be chosen at inference time without ground truth.
+Both extensions are one config flag away from the reproduction — there is a single model
+implementation, selected by config, so every comparison changes exactly one setting.
+
+Course project for *Medical Images Processing with Deep Learning* (336033), by Chenxi Liu
+and Ran Weisberg. The 6-page report carries the argumentation; this repository carries the
+implementation and every number the report cites.
 
 ## The notebook
 
@@ -27,9 +27,26 @@ first cell finds no repository beside it and clones this one before doing anythi
 unzip the whole archive into the session instead and that cell finds the files already
 there, uses them, and clones nothing.
 
+## Results at a glance
+
+Every figure below is on the held-out test split (3,019 patches), which was evaluated once
+after all decisions were frozen. The files named in [Where the numbers live](#where-the-numbers-live)
+are the record; nothing here is recomputed.
+
+| finding | measurement |
+|---|---|
+| **Full covariance improves GED²@16 by 9.0%** (0.3244 → 0.2951), matching the figure published for the same change on near-identical data [[4]](#references) | but by the opposite mechanism to the one we pre-registered: the distribution *sharpened* rather than broadened, and two-thirds of the fidelity gain was paid back in lost sample diversity |
+| **The selection head beats a size-only control by +0.0571 soft-consensus Dice**, about two-thirds of the headroom that control leaves | while leaving every distribution metric bit-identical, since the base is frozen |
+| **The two extensions do not compose** | full covariance raised the floor without raising the ceiling, shrinking selectable headroom by 15.8%, so the 9% GED gain never reaches a selected output |
+
+Soft-consensus Dice is bounded by its own construction — the aggregate test ceiling is
+0.645, not 1.0 — so each row is read against the oracle rather than against 1. One seed per
+arm, so these are patterns replicated across two splits, not significance claims.
+
 ## Install
 
-Python 3.12. Needed to run the pipeline below, not to read the notebook.
+Python 3.12 and torch ≥ 2.4 (`torch.amp.GradScaler` does not exist before 2.4; every
+reported run used 2.11). Needed to run the pipeline below, not to read the notebook.
 
 ```bash
 pip install -e ".[dev]"
@@ -44,15 +61,19 @@ notebook through the Colab badge produces a real clone, so they run there; runni
 suite inside an extracted `.zip` has no `.git`, so they skip. Skips in that setting are
 expected, not failures.
 
+Tests marked `version_sensitive` pin bitwise loss and latent values and therefore depend on
+the exact NumPy and torch build. Deselect them with `-m 'not version_sensitive'` wherever
+the build is not controlled; section 8 of the notebook does this.
+
 On Windows, importing `torch` may additionally need the Microsoft Visual C++ 2015-2022
 x64 Redistributable.
 
 ## Dataset
 
 **LIDC-IDRI is not included here.** The images come from the
-[TCIA LIDC-IDRI collection](https://www.cancerimagingarchive.net/collection/lidc-idri); this
-project uses the preprocessed release distributed with the public reimplementation
-[stefanknegt/Probabilistic-Unet-Pytorch](https://github.com/stefanknegt/Probabilistic-Unet-Pytorch),
+[TCIA LIDC-IDRI collection](https://www.cancerimagingarchive.net/collection/lidc-idri) [[3]](#references);
+this project uses the preprocessed release distributed with the public reimplementation
+[stefanknegt/Probabilistic-Unet-Pytorch](https://github.com/stefanknegt/Probabilistic-Unet-Pytorch) [[9]](#references),
 which is the version the follow-up literature trains on: `data_lidc.pickle`, 3.4 GB,
 sha256 `327025e97c296a9e02841bb7e9968521147039e9c5474ba3b214c1f8056c177e`, holding 15,096
 crops of 128×128 with four independent grader masks each, drawn from 875 CT series. Place it
@@ -72,6 +93,10 @@ stratified over the number of non-empty grader masks; it is generated once with 
 committed split is what the reported runs used, so step three reproduces rather than
 replaces it. The two conversion scripts are the only part of `scratch/` that ships; the
 rest of that directory is one-off analysis and is not part of the installable package.
+
+Up to three of an image's four masks may be empty. Empty masks are signal, not noise, and
+are never filtered; the number of non-empty graders is the image's **ambiguity bucket**, and
+every result is broken down by it.
 
 ## Reproducing the pipeline
 
@@ -151,3 +176,16 @@ records name it.
   what it costs.
 - `configs/` — the flags under test; a two-line diff is the whole of Phase 2.
 - `data/splits/SPLIT_NOTES.md` — known limitations of the split.
+
+## Citing this work
+
+```bibtex
+@misc{liu_weisberg_2026_probunet_consensus,
+  author       = {Liu, Chenxi and Weisberg, Ran},
+  title        = {Full-Covariance Latents and a Consensus-Selection Head
+                  for the Probabilistic U-Net},
+  year         = {2026},
+  note         = {Course project, Medical Images Processing with Deep Learning (336033)},
+  howpublished = {\url{https://github.com/RanWeisberg/prob-unet-consensus-selection}}
+}
+```
